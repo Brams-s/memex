@@ -28,9 +28,9 @@ pub fn classify_path(path: &str) -> Option<SourceKind> {
         || path.contains(".codex\\sessions")
         || path.contains(".codex/archived_sessions")
         || path.contains(".codex\\archived_sessions")
+        || path.contains(".codex/history.jsonl")
+        || path.contains(".codex\\history.jsonl")
     {
-        Some(SourceKind::Codex)
-    } else if path.contains(".codex/history.jsonl") || path.contains(".codex\\history.jsonl") {
         Some(SourceKind::Codex)
     } else {
         None
