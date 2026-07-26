@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -80,17 +81,13 @@ impl ScanCache {
             return Ok(Self::default());
         }
         let data = fs::read_to_string(path)?;
-        let cache = serde_json::from_str(&data)?;
+        let cache = serde_json::from_str(&data).unwrap_or_default();
         Ok(cache)
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let data = serde_json::to_string(self)?;
-        fs::write(path, data)?;
-        Ok(())
+        atomic_write(path, data.as_bytes())
     }
 
     /// Check if the cache is still valid (within TTL seconds)
@@ -139,11 +136,76 @@ impl IngestState {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let data = serde_json::to_string_pretty(self)?;
-        fs::write(path, data)?;
-        Ok(())
+        atomic_write(path, data.as_bytes())
+    }
+}
+
+fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("state path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(data)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_saves_replace_existing_files_atomically() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ingest.json");
+        fs::write(&path, "old state").expect("seed state");
+
+        let state = IngestState {
+            next_doc_id: 42,
+            files: HashMap::new(),
+        };
+        state.save(&path).expect("save state");
+
+        assert_eq!(
+            IngestState::load(&path).expect("load state").next_doc_id,
+            42
+        );
+        assert!(
+            fs::read_dir(temp.path())
+                .expect("read tempdir")
+                .all(|entry| entry.expect("directory entry").path() == path)
+        );
+    }
+
+    #[test]
+    fn scan_cache_saves_replace_existing_files_atomically() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("scan_cache.json");
+        fs::write(&path, "old cache").expect("seed cache");
+
+        let cache = ScanCache {
+            last_scan_ts: 12,
+            file_count: 3,
+            total_bytes: 99,
+        };
+        cache.save(&path).expect("save cache");
+
+        assert_eq!(ScanCache::load(&path).expect("load cache").file_count, 3);
+    }
+
+    #[test]
+    fn malformed_scan_cache_loads_as_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("scan_cache.json");
+        fs::write(&path, "{\"last_scan_ts\":").expect("seed malformed cache");
+
+        let cache = ScanCache::load(&path).expect("load malformed cache");
+
+        assert_eq!(cache.last_scan_ts, 0);
+        assert_eq!(cache.file_count, 0);
+        assert_eq!(cache.total_bytes, 0);
     }
 }

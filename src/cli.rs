@@ -3,6 +3,7 @@ use crate::config::{Paths, UserConfig, default_claude_source};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_if_stale};
+use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt, LeaseHolder};
 use crate::transfer::{
     TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
     transfer_session,
@@ -690,6 +691,8 @@ fn run_index(
         no_embeddings,
         "embeddings",
     )?;
+    let operation = if reindex { "reindex" } else { "index" };
+    let lease = IngestLease::acquire(&paths, operation, INGEST_LEASE_TIMEOUT)?;
     if reindex && paths.root.exists() {
         std::fs::remove_dir_all(&paths.root)?;
     }
@@ -713,7 +716,7 @@ fn run_index(
         tool_content_limits,
     };
 
-    let report = ingest_all(&paths, &index, &opts)?;
+    let report = ingest_all(&paths, &index, &opts, &lease)?;
     if report.records_embedded > 0 {
         println!(
             "indexed {} records, embedded {} across {} files (skipped {})",
@@ -742,6 +745,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
 
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+    let _lease = IngestLease::acquire(&paths, "embed", INGEST_LEASE_TIMEOUT)?;
 
     // Model priority: CLI flag > config file > env var > default
     let model_choice = config.resolve_model(model)?;
@@ -873,11 +877,9 @@ fn run_search(
     let auto_index_on_search = config.auto_index_on_search_default();
     let embeddings_default = config.embeddings_default();
     let scan_cache_ttl = config.scan_cache_ttl();
-    if auto_index_on_search {
+    let auto_index_options = auto_index_on_search.then(|| {
         let tool_content_limits = config.indexed_tool_content_limits()?;
-        paths.ensure_dirs()?;
-        let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
-        let opts = IngestOptions {
+        Ok::<_, anyhow::Error>(IngestOptions {
             claude_source: default_claude_source(),
             include_agents: false,
             include_reasoning: config.include_reasoning_default(),
@@ -892,11 +894,35 @@ fn run_search(
             model: model_choice,
             embed_runtime: embed_runtime.clone(),
             tool_content_limits,
-        };
-        // Skip indexing if we recently scanned (within TTL)
-        let _ = ingest_if_stale(&paths, &index, &opts, scan_cache_ttl)?;
+        })
+    });
+    let auto_index_options = auto_index_options.transpose()?;
+    let mut refresh_contended = false;
+    let mut refresh_holder = None;
+    if let Some(options) = auto_index_options.as_ref() {
+        paths.ensure_dirs()?;
+        match IngestLease::try_acquire(&paths, "search auto-index")? {
+            LeaseAttempt::Acquired(lease) => {
+                let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+                let _ = ingest_if_stale(&paths, &index, options, scan_cache_ttl, &lease)?;
+            }
+            LeaseAttempt::Busy(holder) => {
+                refresh_contended = true;
+                refresh_holder = holder;
+            }
+        }
     }
-    let index = SearchIndex::open_or_create(&paths.index)?;
+    let index = if refresh_contended {
+        open_index_during_contended_refresh(
+            &paths,
+            auto_index_options.as_ref().expect("auto-index options"),
+            scan_cache_ttl,
+            refresh_holder.as_ref(),
+            semantic || hybrid,
+        )?
+    } else {
+        SearchIndex::open_or_create(&paths.index)?
+    };
 
     let options = QueryOptions {
         query,
@@ -970,6 +996,32 @@ fn run_search(
         recency_weight,
         recency_half_life_days,
     )
+}
+
+fn open_index_during_contended_refresh(
+    paths: &Paths,
+    options: &IngestOptions,
+    scan_cache_ttl: u64,
+    holder: Option<&LeaseHolder>,
+    require_stable_vectors: bool,
+) -> Result<SearchIndex> {
+    let can_read_committed_index =
+        !require_stable_vectors && holder.is_some_and(|holder| holder.operation != "reindex");
+    if can_read_committed_index
+        && paths.index.join("meta.json").exists()
+        && let Ok(index) = SearchIndex::open_or_create(&paths.index)
+    {
+        return Ok(index);
+    }
+
+    let lease = IngestLease::acquire(
+        paths,
+        "search waiting for index initialization",
+        INGEST_LEASE_TIMEOUT,
+    )?;
+    let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+    let _ = ingest_if_stale(paths, &index, options, scan_cache_ttl, &lease)?;
+    Ok(index)
 }
 
 struct SearchContext<'a> {
@@ -1698,6 +1750,7 @@ fn format_usd(value: f64) -> String {
 
 fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
     let paths = Paths::new(root)?;
+    let _lease = IngestLease::acquire(&paths, "analytics backfill", INGEST_LEASE_TIMEOUT)?;
     paths.ensure_dirs()?;
     let index = SearchIndex::open_or_create(&paths.index)?;
     let db = analytics_path(&paths.state);
