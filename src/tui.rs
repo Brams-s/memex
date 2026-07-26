@@ -2078,7 +2078,7 @@ impl App {
                 .claude_resume_cmd
                 .clone()
                 .or_else(|| default_resume_template("claude")),
-            SourceKind::CodexSession | SourceKind::CodexHistory => self
+            SourceKind::Codex => self
                 .config
                 .codex_resume_cmd
                 .clone()
@@ -2134,7 +2134,7 @@ impl App {
 
         let tool = match session.source {
             SourceKind::Claude => "claude",
-            SourceKind::CodexSession | SourceKind::CodexHistory => "codex",
+            SourceKind::Codex => "codex",
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
@@ -3519,7 +3519,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
 fn source_color(source: SourceKind) -> Color {
     match source {
         SourceKind::Claude => Color::Rgb(214, 138, 88),
-        SourceKind::CodexSession | SourceKind::CodexHistory => Color::Rgb(160, 180, 200),
+        SourceKind::Codex => Color::Rgb(160, 180, 200),
         SourceKind::Opencode => Color::Rgb(150, 180, 150),
         SourceKind::Cursor => Color::Rgb(170, 150, 200),
         SourceKind::Pi => Color::Rgb(120, 190, 190),
@@ -5615,7 +5615,7 @@ fn resolve_session_cwd(session: &SessionSummary) -> Option<String> {
             return cwd;
         }
 
-        if session.source == SourceKind::CodexSession
+        if session.source == SourceKind::Codex
             && value.get("type").and_then(|v| v.as_str()) == Some("session_meta")
         {
             let payload_cwd = value
@@ -6125,7 +6125,7 @@ mod tests {
 
     fn record(role: &str, text: &str) -> Record {
         Record {
-            source: SourceKind::CodexSession,
+            source: SourceKind::Codex,
             doc_id: 1,
             ts: 0,
             project: "project".to_string(),
@@ -6232,12 +6232,12 @@ mod tests {
                 value: 3,
             },
             HomeChartPoint {
-                source: SourceKind::CodexSession,
+                source: SourceKind::Codex,
                 timestamp_ms: 4,
                 value: 1,
             },
             HomeChartPoint {
-                source: SourceKind::CodexHistory,
+                source: SourceKind::Codex,
                 timestamp_ms: 5,
                 value: 1,
             },
@@ -6259,7 +6259,7 @@ mod tests {
             value: 1,
         }];
         app.home_result_activity = vec![HomeChartPoint {
-            source: SourceKind::CodexSession,
+            source: SourceKind::Codex,
             timestamp_ms: 20,
             value: 1,
         }];
@@ -6334,7 +6334,7 @@ mod tests {
                 value: 2,
             },
             HomeChartPoint {
-                source: SourceKind::CodexSession,
+                source: SourceKind::Codex,
                 timestamp_ms: 500,
                 value: 2,
             },
@@ -6343,7 +6343,7 @@ mod tests {
         // codex the top cell.
         let grid = home_chart_grid(&points, (0, 1000), 1, 2);
         assert_eq!(grid[1][0].1, source_color(SourceKind::Claude));
-        assert_eq!(grid[0][0].1, source_color(SourceKind::CodexSession));
+        assert_eq!(grid[0][0].1, source_color(SourceKind::Codex));
     }
 
     #[test]
@@ -6355,7 +6355,7 @@ mod tests {
                 value: 2,
             },
             HomeChartPoint {
-                source: SourceKind::CodexSession,
+                source: SourceKind::Codex,
                 timestamp_ms: 50,
                 value: 3,
             },
@@ -6384,7 +6384,7 @@ mod tests {
                 value: 1,
             },
             HomeChartPoint {
-                source: SourceKind::CodexSession,
+                source: SourceKind::Codex,
                 timestamp_ms: 90,
                 value: 1,
             },
@@ -6471,7 +6471,7 @@ mod tests {
             SessionSummary {
                 session_id: "shared".into(),
                 project: "memex".into(),
-                source: SourceKind::CodexHistory,
+                source: SourceKind::Codex,
                 last_ts: 1,
                 hit_count: 1,
                 top_score: 1.0,
@@ -6779,11 +6779,11 @@ mod tests {
 
     #[test]
     fn timeline_chart_grid_uses_source_colors() {
-        let events = vec![(SourceKind::Claude, 10), (SourceKind::CodexSession, 90)];
+        let events = vec![(SourceKind::Claude, 10), (SourceKind::Codex, 90)];
         let grid = timeline_chart_grid(&events, (0, 100), 2, 1, 1);
 
         assert_eq!(grid[0][0].1, source_color(SourceKind::Claude));
-        assert_eq!(grid[0][1].1, source_color(SourceKind::CodexSession));
+        assert_eq!(grid[0][1].1, source_color(SourceKind::Codex));
     }
 
     #[test]

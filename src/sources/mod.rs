@@ -198,7 +198,7 @@ impl UsageParseOutput {
 pub fn versions(source: SourceKind) -> ParserVersions {
     match source {
         SourceKind::Claude => claude::VERSIONS,
-        SourceKind::CodexSession | SourceKind::CodexHistory => codex::VERSIONS,
+        SourceKind::Codex => codex::VERSIONS,
         SourceKind::Cursor => cursor::VERSIONS,
         SourceKind::Opencode => opencode::VERSIONS,
         SourceKind::Pi => pi::VERSIONS,
@@ -219,7 +219,7 @@ mod tests {
     fn reasoning_mode_is_part_of_index_state_version() {
         for source in [
             SourceKind::Claude,
-            SourceKind::CodexSession,
+            SourceKind::Codex,
             SourceKind::Pi,
             SourceKind::OpenClaw,
         ] {
@@ -236,7 +236,7 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
     let reasoning_mode = include_reasoning
         && matches!(
             source,
-            SourceKind::Claude | SourceKind::CodexSession | SourceKind::Pi | SourceKind::OpenClaw
+            SourceKind::Claude | SourceKind::Codex | SourceKind::Pi | SourceKind::OpenClaw
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
         .saturating_mul(2)

@@ -30,7 +30,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
 
     push(SourceKind::Claude, super::claude::usage_files());
     push(
-        SourceKind::CodexSession,
+        SourceKind::Codex,
         super::codex::discover_rollouts()
             .into_iter()
             .map(|file| file.path)
@@ -134,7 +134,7 @@ fn audit_file(source: SourceKind, path: &Path, audit: &mut SourceAudit) -> Resul
 
 fn producer_version(source: SourceKind, value: &Value) -> Option<String> {
     let version = match source {
-        SourceKind::CodexSession | SourceKind::CodexHistory => value
+        SourceKind::Codex => value
             .get("payload")
             .and_then(|payload| payload.get("cli_version")),
         _ => value.get("version"),
@@ -148,7 +148,7 @@ fn producer_version(source: SourceKind, value: &Value) -> Option<String> {
 
 fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &mut SourceAudit) {
     match source {
-        SourceKind::CodexSession | SourceKind::CodexHistory => {
+        SourceKind::Codex => {
             if let Some(payload) = value.get("payload").and_then(Value::as_object)
                 && let Some(payload_type) = payload.get("type").and_then(Value::as_str)
             {
@@ -239,7 +239,7 @@ mod tests {
         )
         .unwrap();
 
-        let audit = audit_files(SourceKind::CodexSession, &[path]).unwrap();
+        let audit = audit_files(SourceKind::Codex, &[path]).unwrap();
         assert_eq!(audit.files, 1);
         assert_eq!(audit.valid_json_lines, 2);
         assert_eq!(audit.malformed_json_lines, 1);

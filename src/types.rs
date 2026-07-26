@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum SourceKind {
     #[default]
     Claude,
-    CodexSession,
-    CodexHistory,
+    Codex,
     Opencode,
     Cursor,
     Pi,
@@ -15,10 +14,9 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 8] = [
+    pub const ALL: [SourceKind; 7] = [
         SourceKind::Claude,
-        SourceKind::CodexSession,
-        SourceKind::CodexHistory,
+        SourceKind::Codex,
         SourceKind::Opencode,
         SourceKind::Cursor,
         SourceKind::Pi,
@@ -30,26 +28,24 @@ impl SourceKind {
     pub fn idx(self) -> usize {
         match self {
             SourceKind::Claude => 0,
-            SourceKind::CodexSession => 1,
-            SourceKind::CodexHistory => 2,
-            SourceKind::Opencode => 3,
-            SourceKind::Cursor => 4,
-            SourceKind::Pi => 5,
-            SourceKind::OpenClaw => 6,
-            SourceKind::Copilot => 7,
+            SourceKind::Codex => 1,
+            SourceKind::Opencode => 2,
+            SourceKind::Cursor => 3,
+            SourceKind::Pi => 4,
+            SourceKind::OpenClaw => 5,
+            SourceKind::Copilot => 6,
         }
     }
 
     pub fn from_idx(idx: usize) -> Option<Self> {
         match idx {
             0 => Some(SourceKind::Claude),
-            1 => Some(SourceKind::CodexSession),
-            2 => Some(SourceKind::CodexHistory),
-            3 => Some(SourceKind::Opencode),
-            4 => Some(SourceKind::Cursor),
-            5 => Some(SourceKind::Pi),
-            6 => Some(SourceKind::OpenClaw),
-            7 => Some(SourceKind::Copilot),
+            1 => Some(SourceKind::Codex),
+            2 => Some(SourceKind::Opencode),
+            3 => Some(SourceKind::Cursor),
+            4 => Some(SourceKind::Pi),
+            5 => Some(SourceKind::OpenClaw),
+            6 => Some(SourceKind::Copilot),
             _ => None,
         }
     }
@@ -57,7 +53,7 @@ impl SourceKind {
     pub fn label(self) -> &'static str {
         match self {
             SourceKind::Claude => "claude",
-            SourceKind::CodexSession | SourceKind::CodexHistory => "codex",
+            SourceKind::Codex => "codex",
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
@@ -69,8 +65,7 @@ impl SourceKind {
     pub fn storage_label(self) -> &'static str {
         match self {
             SourceKind::Claude => "claude",
-            SourceKind::CodexSession => "codex-session",
-            SourceKind::CodexHistory => "codex-history",
+            SourceKind::Codex => "codex",
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
@@ -86,8 +81,7 @@ impl SourceKind {
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
             "claude" => Some(SourceKind::Claude),
-            "codex" | "codex-session" => Some(SourceKind::CodexSession),
-            "codex-history" => Some(SourceKind::CodexHistory),
+            "codex" | "codex-session" | "codex-history" => Some(SourceKind::Codex),
             "opencode" => Some(SourceKind::Opencode),
             "cursor" => Some(SourceKind::Cursor),
             "pi" => Some(SourceKind::Pi),
@@ -115,9 +109,7 @@ impl SourceFilter {
     pub fn matches(self, source: SourceKind) -> bool {
         match self {
             SourceFilter::Claude => source == SourceKind::Claude,
-            SourceFilter::Codex => {
-                source == SourceKind::CodexSession || source == SourceKind::CodexHistory
-            }
+            SourceFilter::Codex => source == SourceKind::Codex,
             SourceFilter::Opencode => source == SourceKind::Opencode,
             SourceFilter::Cursor => source == SourceKind::Cursor,
             SourceFilter::Pi => source == SourceKind::Pi,
@@ -214,6 +206,14 @@ mod tests {
     }
 
     #[test]
+    fn legacy_codex_labels_converge_to_codex() {
+        for label in ["codex", "codex-session", "codex-history"] {
+            assert_eq!(SourceKind::from_label(label), Some(SourceKind::Codex));
+        }
+        assert_eq!(SourceKind::Codex.storage_label(), "codex");
+    }
+
+    #[test]
     fn openclaw_source_filter_uses_unhyphenated_cli_name() {
         assert_eq!(
             SourceFilter::from_str("openclaw", true),
@@ -231,10 +231,19 @@ mod tests {
         let windows_path =
             "C:\\tmp\\.codex\\archived_sessions\\rollout-2026-02-10T11-16-28-abc.jsonl";
 
-        assert_eq!(SourceKind::from_path(unix_path), SourceKind::CodexSession);
+        assert_eq!(SourceKind::from_path(unix_path), SourceKind::Codex);
+        assert_eq!(SourceKind::from_path(windows_path), SourceKind::Codex);
+    }
+
+    #[test]
+    fn from_path_recognizes_codex_history_as_codex() {
         assert_eq!(
-            SourceKind::from_path(windows_path),
-            SourceKind::CodexSession
+            SourceKind::from_path("/tmp/.codex/history.jsonl"),
+            SourceKind::Codex
+        );
+        assert_eq!(
+            SourceKind::from_path("C:\\tmp\\.codex\\history.jsonl"),
+            SourceKind::Codex
         );
     }
 
