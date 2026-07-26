@@ -35,6 +35,7 @@ pub struct IngestOptions {
     pub include_cursor: bool,
     pub include_pi: bool,
     pub include_openclaw: bool,
+    pub include_hermes: bool,
     pub include_copilot: bool,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
@@ -65,6 +66,7 @@ struct FileTask {
     pending_tool_calls: HashMap<String, PendingToolCall>,
     identity: FileIdentity,
     parser_version: u32,
+    source_generation: u64,
 }
 
 #[derive(Debug)]
@@ -200,9 +202,58 @@ fn prepare_file_task(
             pending_tool_calls,
             identity,
             parser_version,
+            source_generation: previous.map_or(0, |state| state.source_generation),
         },
         skip,
     )
+}
+
+fn prepare_hermes_task(
+    path: PathBuf,
+    include_reasoning: bool,
+    metadata: &std::fs::Metadata,
+    previous: Option<&FileState>,
+    checkpoint: crate::sources::hermes::Checkpoint,
+) -> (FileTask, bool) {
+    let (mut task, _) = prepare_file_task(
+        path,
+        SourceKind::Hermes,
+        include_reasoning,
+        metadata,
+        previous,
+    );
+    task.source_generation = checkpoint.generation;
+    let Some(previous) = previous else {
+        task.offset = 0;
+        task.turn_id = 0;
+        task.delete_first = false;
+        task.pending_tool_calls.clear();
+        return (task, false);
+    };
+    let inode_changed = previous
+        .identity
+        .device
+        .zip(previous.identity.inode)
+        .zip(task.identity.device.zip(task.identity.inode))
+        .is_some_and(|((old_device, old_inode), (new_device, new_inode))| {
+            old_device != new_device || old_inode != new_inode
+        });
+    let invalidated = task.parser_version_invalidated
+        || inode_changed
+        || checkpoint.max_message_id < previous.offset
+        || checkpoint.generation != previous.source_generation;
+    if invalidated {
+        task.offset = 0;
+        task.turn_id = 0;
+        task.delete_first = true;
+        task.pending_tool_calls.clear();
+        return (task, false);
+    }
+    task.offset = previous.offset;
+    task.turn_id = 0;
+    task.delete_first = false;
+    task.pending_tool_calls = previous.pending_tool_calls.clone();
+    (task, checkpoint.max_message_id == previous.offset)
 }
 
 fn completed_file_state(
@@ -217,6 +268,7 @@ fn completed_file_state(
         offset,
         turn_id,
         parser_version: task.parser_version,
+        source_generation: task.source_generation,
         pending_tool_calls,
         identity: task.identity.clone(),
     }
@@ -513,6 +565,29 @@ pub fn ingest_all(
         }
     }
 
+    if options.include_hermes {
+        for source_file in crate::sources::hermes::discover() {
+            let path = source_file.path;
+            let meta = path.metadata()?;
+            let checkpoint = crate::sources::hermes::checkpoint(&path)?;
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_hermes_task(
+                path,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+                checkpoint,
+            );
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+
     if options.include_copilot {
         let copilot_files = crate::sources::copilot::discover_sessions();
         for source_file in copilot_files {
@@ -641,6 +716,14 @@ pub fn ingest_all(
                 &progress,
             )?,
             SourceKind::OpenClaw => parse_openclaw_file(
+                task,
+                options.include_reasoning,
+                &tx_record,
+                &tx_update,
+                &next_doc_id,
+                &progress,
+            )?,
+            SourceKind::Hermes => parse_hermes_file(
                 task,
                 options.include_reasoning,
                 &tx_record,
@@ -1177,6 +1260,39 @@ fn parse_openclaw_file(
         parsed,
     )
 }
+
+fn parse_hermes_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::hermes::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: 0,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Hermes, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Hermes,
+        source_path,
+        parsed,
+    )
+}
 fn parse_copilot_session(
     task: &FileTask,
     tx_record: &RecordSender,
@@ -1377,6 +1493,7 @@ mod tests {
             include_cursor: false,
             include_pi: false,
             include_openclaw: false,
+            include_hermes: false,
             include_copilot: false,
             embeddings,
             backfill_embeddings: false,
@@ -1444,6 +1561,7 @@ mod tests {
                 metadata.len().min(FILE_IDENTITY_PREFIX_BYTES as u64) as usize,
             ),
             parser_version: crate::sources::index_state_version(source),
+            source_generation: 0,
         }
     }
 
@@ -2059,6 +2177,7 @@ mod tests {
             turn_id: 1,
             parser_version: crate::sources::index_state_version(SourceKind::Claude)
                 .saturating_sub(1),
+            source_generation: 0,
             pending_tool_calls: HashMap::from([(
                 "stale".to_string(),
                 PendingToolCall {
@@ -2075,6 +2194,67 @@ mod tests {
         assert!(task.parser_version_invalidated);
         assert_eq!(task.offset, 0);
         assert!(task.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn hermes_appends_resume_from_message_id_and_rewinds_rebuild() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state.db");
+        fs::write(&path, "sqlite placeholder").expect("store");
+        let metadata = path.metadata().expect("metadata");
+        let (mut initial, _) =
+            prepare_file_task(path.clone(), SourceKind::Hermes, false, &metadata, None);
+        initial.source_generation = 7;
+        initial.pending_tool_calls.insert(
+            "call-1".to_string(),
+            PendingToolCall {
+                tool_name: Some("terminal".to_string()),
+                ..PendingToolCall::default()
+            },
+        );
+        let previous = completed_file_state(&initial, 106, 0, initial.pending_tool_calls.clone());
+
+        let (appended, skip) = prepare_hermes_task(
+            path.clone(),
+            false,
+            &metadata,
+            Some(&previous),
+            crate::sources::hermes::Checkpoint {
+                max_message_id: 107,
+                generation: 7,
+            },
+        );
+        assert!(!skip);
+        assert!(!appended.delete_first);
+        assert_eq!(appended.offset, 106);
+        assert!(appended.pending_tool_calls.contains_key("call-1"));
+
+        let (_, skip) = prepare_hermes_task(
+            path.clone(),
+            false,
+            &metadata,
+            Some(&previous),
+            crate::sources::hermes::Checkpoint {
+                max_message_id: 106,
+                generation: 7,
+            },
+        );
+        assert!(skip);
+
+        let (rewound, skip) = prepare_hermes_task(
+            path,
+            false,
+            &metadata,
+            Some(&previous),
+            crate::sources::hermes::Checkpoint {
+                max_message_id: 107,
+                generation: 8,
+            },
+        );
+        assert!(!skip);
+        assert!(rewound.delete_first);
+        assert_eq!(rewound.offset, 0);
+        assert!(rewound.pending_tool_calls.is_empty());
     }
 
     #[test]
@@ -2136,6 +2316,7 @@ mod tests {
             include_cursor: false,
             include_pi: false,
             include_openclaw: false,
+            include_hermes: false,
             include_copilot: false,
             embeddings: false,
             backfill_embeddings: false,
@@ -2512,6 +2693,7 @@ mod tests {
             include_cursor: false,
             include_pi: true,
             include_openclaw: false,
+            include_hermes: false,
             include_copilot: false,
             embeddings: false,
             backfill_embeddings: false,
@@ -2634,6 +2816,7 @@ mod tests {
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Pi),
+            source_generation: 0,
         };
         let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
         let next_doc_id = AtomicU64::new(1);
@@ -2713,16 +2896,17 @@ mod tests {
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Copilot),
+            source_generation: 0,
         };
         let (raw_tx_record, rx_record) = unbounded();
         let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
-        let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, 0, meta.len()],
-            [0, 0, 0, 0, 0, 0, 0, 1],
-            false,
-        ));
+        let mut totals = [0; SOURCE_COUNT];
+        totals[SourceKind::Copilot.idx()] = meta.len();
+        let mut file_totals = [0; SOURCE_COUNT];
+        file_totals[SourceKind::Copilot.idx()] = 1;
+        let progress = Arc::new(Progress::new(totals, file_totals, false));
 
         parse_copilot_session(&task, &tx_record, &tx_update, &next_doc_id, &progress)
             .expect("parse copilot session");

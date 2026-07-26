@@ -56,6 +56,10 @@ pub struct FileState {
     pub turn_id: u32,
     #[serde(default)]
     pub parser_version: u32,
+    /// Source-specific invalidation generation. Append-only sources leave this at zero;
+    /// SQLite-backed sources can advance it when prior rows may have changed.
+    #[serde(default)]
+    pub source_generation: u64,
     #[serde(default)]
     pub pending_tool_calls: HashMap<String, PendingToolCall>,
     #[serde(default)]

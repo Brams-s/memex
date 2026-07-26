@@ -12,10 +12,11 @@ pub enum SourceKind {
     Pi,
     OpenClaw,
     Copilot,
+    Hermes,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 8] = [
+    pub const ALL: [SourceKind; 9] = [
         SourceKind::Claude,
         SourceKind::CodexSession,
         SourceKind::CodexHistory,
@@ -24,6 +25,7 @@ impl SourceKind {
         SourceKind::Pi,
         SourceKind::OpenClaw,
         SourceKind::Copilot,
+        SourceKind::Hermes,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -37,6 +39,7 @@ impl SourceKind {
             SourceKind::Pi => 5,
             SourceKind::OpenClaw => 6,
             SourceKind::Copilot => 7,
+            SourceKind::Hermes => 8,
         }
     }
 
@@ -50,6 +53,7 @@ impl SourceKind {
             5 => Some(SourceKind::Pi),
             6 => Some(SourceKind::OpenClaw),
             7 => Some(SourceKind::Copilot),
+            8 => Some(SourceKind::Hermes),
             _ => None,
         }
     }
@@ -63,6 +67,7 @@ impl SourceKind {
             SourceKind::Pi => "pi",
             SourceKind::OpenClaw => "openclaw",
             SourceKind::Copilot => "copilot",
+            SourceKind::Hermes => "hermes",
         }
     }
 
@@ -76,6 +81,7 @@ impl SourceKind {
             SourceKind::Pi => "pi",
             SourceKind::OpenClaw => "openclaw",
             SourceKind::Copilot => "copilot",
+            SourceKind::Hermes => "hermes",
         }
     }
 
@@ -93,6 +99,7 @@ impl SourceKind {
             "pi" => Some(SourceKind::Pi),
             "openclaw" => Some(SourceKind::OpenClaw),
             "copilot" => Some(SourceKind::Copilot),
+            "hermes" => Some(SourceKind::Hermes),
             _ => None,
         }
     }
@@ -109,6 +116,7 @@ pub enum SourceFilter {
     #[value(name = "openclaw", alias = "open-claw")]
     OpenClaw,
     Copilot,
+    Hermes,
 }
 
 impl SourceFilter {
@@ -123,6 +131,7 @@ impl SourceFilter {
             SourceFilter::Pi => source == SourceKind::Pi,
             SourceFilter::OpenClaw => source == SourceKind::OpenClaw,
             SourceFilter::Copilot => source == SourceKind::Copilot,
+            SourceFilter::Hermes => source == SourceKind::Hermes,
         }
     }
 
@@ -135,6 +144,7 @@ impl SourceFilter {
             SourceFilter::Pi => &["pi"],
             SourceFilter::OpenClaw => &["openclaw"],
             SourceFilter::Copilot => &["copilot"],
+            SourceFilter::Hermes => &["hermes"],
         }
     }
 
@@ -147,6 +157,7 @@ impl SourceFilter {
             SourceFilter::Pi => "pi",
             SourceFilter::OpenClaw => "openclaw",
             SourceFilter::Copilot => "copilot",
+            SourceFilter::Hermes => "hermes",
         }
     }
 }
@@ -257,6 +268,15 @@ mod tests {
 
         assert_eq!(SourceKind::from_path(unix_path), SourceKind::Pi);
         assert_eq!(SourceKind::from_path(windows_path), SourceKind::Pi);
+    }
+
+    #[test]
+    fn from_path_recognizes_hermes_store() {
+        let unix_path = "/Users/nico/.hermes/state.db";
+        let windows_path = "C:\\Users\\nico\\.hermes\\state.db";
+
+        assert_eq!(SourceKind::from_path(unix_path), SourceKind::Hermes);
+        assert_eq!(SourceKind::from_path(windows_path), SourceKind::Hermes);
     }
 
     #[test]

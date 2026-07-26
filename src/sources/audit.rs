@@ -1,5 +1,6 @@
 use crate::types::{SourceFilter, SourceKind};
 use anyhow::Result;
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -66,6 +67,13 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .collect(),
     );
     push(
+        SourceKind::Hermes,
+        super::hermes::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
+    push(
         SourceKind::Copilot,
         super::copilot::discover_sessions()
             .into_iter()
@@ -88,6 +96,9 @@ fn deduplicate(files: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 pub fn audit_files(source: SourceKind, files: &[PathBuf]) -> Result<SourceAudit> {
+    if source == SourceKind::Hermes {
+        return audit_hermes_files(files);
+    }
     let mut audit = SourceAudit {
         source: source.storage_label().to_string(),
         files: files.len() as u64,
@@ -95,6 +106,54 @@ pub fn audit_files(source: SourceKind, files: &[PathBuf]) -> Result<SourceAudit>
     };
     for path in files {
         audit_file(source, path, &mut audit)?;
+    }
+    Ok(audit)
+}
+
+fn audit_hermes_files(files: &[PathBuf]) -> Result<SourceAudit> {
+    let mut audit = SourceAudit {
+        source: SourceKind::Hermes.storage_label().to_string(),
+        files: files.len() as u64,
+        ..SourceAudit::default()
+    };
+    for path in files {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        if let Ok(version) =
+            connection.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            && let Some(version) = version
+        {
+            increment(&mut audit.producer_versions, &version.to_string());
+        }
+        let has_active = connection
+            .prepare("SELECT active FROM messages LIMIT 0")
+            .is_ok();
+        let sql = if has_active {
+            "SELECT role, COUNT(*) FROM messages WHERE COALESCE(active, 1) != 0 GROUP BY role"
+        } else {
+            "SELECT role, COUNT(*) FROM messages GROUP BY role"
+        };
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (role, count) = row?;
+            let count = count.max(0) as u64;
+            audit.valid_json_lines += count;
+            *audit
+                .top_level_types
+                .entry("message".to_string())
+                .or_default() += count;
+            *audit
+                .semantic_types
+                .entry(format!("message/{role}"))
+                .or_default() += count;
+        }
     }
     Ok(audit)
 }
@@ -191,6 +250,7 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
             }
             record_content_blocks(value.get("content"), audit);
         }
+        SourceKind::Hermes => {}
     }
 }
 

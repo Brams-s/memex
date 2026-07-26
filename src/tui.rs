@@ -393,6 +393,7 @@ enum SourceChoice {
     Cursor,
     Pi,
     OpenClaw,
+    Hermes,
     Copilot,
 }
 
@@ -405,7 +406,8 @@ impl SourceChoice {
             SourceChoice::Opencode => SourceChoice::Cursor,
             SourceChoice::Cursor => SourceChoice::Pi,
             SourceChoice::Pi => SourceChoice::OpenClaw,
-            SourceChoice::OpenClaw => SourceChoice::Copilot,
+            SourceChoice::OpenClaw => SourceChoice::Hermes,
+            SourceChoice::Hermes => SourceChoice::Copilot,
             SourceChoice::Copilot => SourceChoice::All,
         }
     }
@@ -419,6 +421,7 @@ impl SourceChoice {
             SourceChoice::Cursor => Some(SourceFilter::Cursor),
             SourceChoice::Pi => Some(SourceFilter::Pi),
             SourceChoice::OpenClaw => Some(SourceFilter::OpenClaw),
+            SourceChoice::Hermes => Some(SourceFilter::Hermes),
             SourceChoice::Copilot => Some(SourceFilter::Copilot),
         }
     }
@@ -432,6 +435,7 @@ impl SourceChoice {
             SourceChoice::Cursor => "cursor",
             SourceChoice::Pi => "pi",
             SourceChoice::OpenClaw => "openclaw",
+            SourceChoice::Hermes => "hermes",
             SourceChoice::Copilot => "copilot",
         }
     }
@@ -926,6 +930,7 @@ impl App {
                     include_cursor: true,
                     include_pi: true,
                     include_openclaw: true,
+                    include_hermes: true,
                     include_copilot: true,
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
@@ -1260,6 +1265,8 @@ impl App {
                     SourceChoice::Opencode,
                     SourceChoice::Cursor,
                     SourceChoice::Pi,
+                    SourceChoice::OpenClaw,
+                    SourceChoice::Hermes,
                     SourceChoice::Copilot,
                 ]
                 .into_iter()
@@ -2073,6 +2080,7 @@ impl App {
                 .clone()
                 .or_else(|| default_resume_template("pi")),
             SourceKind::OpenClaw => None,
+            SourceKind::Hermes => None,
             SourceKind::Copilot => self
                 .config
                 .copilot_resume_cmd
@@ -2113,6 +2121,10 @@ impl App {
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
             SourceKind::OpenClaw => "pi",
+            SourceKind::Hermes => {
+                self.set_status("sharing Hermes SQLite sessions is not supported yet");
+                return Ok(());
+            }
             SourceKind::Copilot => "copilot",
         };
         let source_path = session.source_path.clone();
@@ -3485,6 +3497,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Cursor => label == "cursor",
         SourceChoice::Pi => label == "pi",
         SourceChoice::OpenClaw => label == "openclaw",
+        SourceChoice::Hermes => label == "hermes",
         SourceChoice::Copilot => label == "copilot",
         SourceChoice::All => false,
     }
@@ -3498,6 +3511,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Cursor => Color::Rgb(170, 150, 200),
         SourceKind::Pi => Color::Rgb(120, 190, 190),
         SourceKind::OpenClaw => Color::Rgb(235, 160, 110),
+        SourceKind::Hermes => Color::Rgb(205, 150, 225),
         SourceKind::Copilot => Color::Rgb(140, 160, 220),
     }
 }

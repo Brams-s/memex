@@ -10,6 +10,7 @@ pub mod codex;
 pub mod common;
 pub mod copilot;
 pub mod cursor;
+pub mod hermes;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
@@ -204,6 +205,7 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Pi => pi::VERSIONS,
         SourceKind::OpenClaw => openclaw::VERSIONS,
         SourceKind::Copilot => copilot::VERSIONS,
+        SourceKind::Hermes => hermes::VERSIONS,
     }
 }
 
@@ -222,6 +224,7 @@ mod tests {
             SourceKind::CodexSession,
             SourceKind::Pi,
             SourceKind::OpenClaw,
+            SourceKind::Hermes,
         ] {
             assert_ne!(
                 index_state_version_for(source, false),
@@ -236,7 +239,11 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
     let reasoning_mode = include_reasoning
         && matches!(
             source,
-            SourceKind::Claude | SourceKind::CodexSession | SourceKind::Pi | SourceKind::OpenClaw
+            SourceKind::Claude
+                | SourceKind::CodexSession
+                | SourceKind::Pi
+                | SourceKind::OpenClaw
+                | SourceKind::Hermes
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
         .saturating_mul(2)
@@ -256,6 +263,8 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Pi
     } else if openclaw::matches_path(path) {
         SourceKind::OpenClaw
+    } else if hermes::matches_path(path) {
+        SourceKind::Hermes
     } else if copilot::matches_path(path) {
         SourceKind::Copilot
     } else {
