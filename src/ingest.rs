@@ -3,22 +3,20 @@ use crate::config::{IndexedToolContentLimits, Paths};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
 use crate::progress::{Progress, SOURCE_COUNT};
-use crate::state::{FileState, IngestState, ScanCache};
-use crate::types::{Record, RecordLinks, SourceKind};
+use crate::state::{FileIdentity, FileState, IngestState, PendingToolCall, ScanCache};
+#[cfg(test)]
+use crate::types::RecordLinks;
+use crate::types::{Record, SourceKind};
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Utc};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use memchr::memchr;
-use memmap2::Mmap;
 use rayon::prelude::*;
-use simd_json::BorrowedValue;
-use simd_json::prelude::*;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use walkdir::WalkDir;
 
 const EMBED_BATCH_SIZE: usize = 64;
 const EMBED_MAX_CHARS: usize = 8192;
@@ -26,9 +24,6 @@ const RETAINED_HEAD_PERCENT: usize = 75;
 const INDEX_PROGRESS_BATCH: u64 = 1;
 // Keep a small amount of parser/writer overlap without retaining an unbounded transcript backlog.
 const RECORD_CHANNEL_CAPACITY: usize = 8;
-const CURSOR_SUBAGENT_TURN_BASE: u32 = 1_000_000_000;
-const CURSOR_SUBAGENT_TURN_STRIDE: u32 = 50_000;
-const CURSOR_SUBAGENT_TURN_BUCKETS: u32 = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
@@ -63,6 +58,10 @@ struct FileTask {
     size: u64,
     mtime: i64,
     delete_first: bool,
+    parser_version_invalidated: bool,
+    pending_tool_calls: HashMap<String, PendingToolCall>,
+    identity: FileIdentity,
+    parser_version: u32,
 }
 
 #[derive(Debug)]
@@ -70,6 +69,152 @@ struct FileUpdate {
     path: String,
     state: FileState,
     session_id: Option<String>,
+}
+
+const FILE_IDENTITY_PREFIX_BYTES: usize = 4096;
+
+fn file_identity(path: &Path, metadata: &std::fs::Metadata, prefix_bytes: usize) -> FileIdentity {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    let prefix_sha256 = if metadata.is_file() {
+        File::open(path).ok().and_then(|mut file| {
+            let mut bytes = vec![0; prefix_bytes];
+            let read = file.read(&mut bytes).ok()?;
+            bytes.truncate(read);
+            Some(format!("{:x}", Sha256::digest(&bytes)))
+        })
+    } else {
+        None
+    };
+
+    FileIdentity {
+        #[cfg(unix)]
+        device: Some(metadata.dev()),
+        #[cfg(not(unix))]
+        device: None,
+        #[cfg(unix)]
+        inode: Some(metadata.ino()),
+        #[cfg(not(unix))]
+        inode: None,
+        prefix_sha256,
+        prefix_bytes: prefix_bytes as u64,
+        modified_ns: metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64),
+    }
+}
+
+fn file_was_replaced(previous: &FileIdentity, current: &FileIdentity) -> bool {
+    previous
+        .device
+        .zip(previous.inode)
+        .zip(current.device.zip(current.inode))
+        .is_some_and(|((old_device, old_inode), (new_device, new_inode))| {
+            old_device != new_device || old_inode != new_inode
+        })
+        || previous
+            .prefix_sha256
+            .as_ref()
+            .zip(current.prefix_sha256.as_ref())
+            .is_some_and(|(old, new)| previous.prefix_bytes == current.prefix_bytes && old != new)
+}
+
+fn prepare_file_task(
+    path: PathBuf,
+    source: SourceKind,
+    metadata: &std::fs::Metadata,
+    previous: Option<&FileState>,
+) -> (FileTask, bool) {
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let prefix_bytes = previous
+        .map(|state| {
+            if state.identity.prefix_bytes > 0 {
+                state.identity.prefix_bytes
+            } else {
+                state.size.min(FILE_IDENTITY_PREFIX_BYTES as u64)
+            }
+        })
+        .unwrap_or_else(|| size.min(FILE_IDENTITY_PREFIX_BYTES as u64))
+        .min(size) as usize;
+    let identity = file_identity(&path, metadata, prefix_bytes);
+    let parser_version = crate::sources::index_state_version(source);
+    let parser_version_invalidated =
+        previous.is_some_and(|previous| previous.parser_version != parser_version);
+    let (offset, turn_id, delete_first, pending_tool_calls, skip) = match previous {
+        None => (0, 0, false, HashMap::new(), false),
+        Some(previous)
+            if size < previous.size
+                || mtime < previous.mtime
+                || previous.parser_version != parser_version
+                || file_was_replaced(&previous.identity, &identity)
+                || (size == previous.size
+                    && previous
+                        .identity
+                        .modified_ns
+                        .zip(identity.modified_ns)
+                        .is_some_and(|(old, new)| old != new))
+                || (size == previous.size && mtime != previous.mtime) =>
+        {
+            (0, 0, true, HashMap::new(), false)
+        }
+        Some(previous) if size == previous.size && mtime == previous.mtime => (
+            previous.offset,
+            previous.turn_id,
+            false,
+            previous.pending_tool_calls.clone(),
+            true,
+        ),
+        Some(previous) => (
+            previous.offset,
+            previous.turn_id,
+            false,
+            previous.pending_tool_calls.clone(),
+            false,
+        ),
+    };
+
+    (
+        FileTask {
+            path,
+            source,
+            offset,
+            turn_id,
+            size,
+            mtime,
+            delete_first,
+            parser_version_invalidated,
+            pending_tool_calls,
+            identity,
+            parser_version,
+        },
+        skip,
+    )
+}
+
+fn completed_file_state(
+    task: &FileTask,
+    offset: u64,
+    turn_id: u32,
+    pending_tool_calls: HashMap<String, PendingToolCall>,
+) -> FileState {
+    FileState {
+        size: task.size,
+        mtime: task.mtime,
+        offset,
+        turn_id,
+        parser_version: task.parser_version,
+        pending_tool_calls,
+        identity: task.identity.clone(),
+    }
 }
 
 #[derive(Clone)]
@@ -93,12 +238,41 @@ impl RecordSender {
 struct WriterContext {
     embeddings: bool,
     do_backfill_embeddings: bool,
+    reset_vector_store: bool,
     vector_dir: PathBuf,
     analytics_path: PathBuf,
     progress: Arc<Progress>,
     model: ModelChoice,
     embed_runtime: EmbedRuntimeConfig,
     tool_content_limits: IndexedToolContentLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VectorMigration {
+    rebuild: bool,
+    model: ModelChoice,
+}
+
+fn vector_migration(
+    vector_dir: &Path,
+    tasks: &[FileTask],
+    configured_model: ModelChoice,
+) -> VectorMigration {
+    let rebuild = tasks.iter().any(|task| task.parser_version_invalidated)
+        && vector_dir.join("usearch.index").exists();
+    let model = if rebuild {
+        crate::vector::VectorIndex::open(vector_dir)
+            .ok()
+            .and_then(|index| {
+                index
+                    .model()
+                    .and_then(|model| ModelChoice::parse(model).ok())
+            })
+            .unwrap_or(configured_model)
+    } else {
+        configured_model
+    };
+    VectorMigration { rebuild, model }
 }
 
 fn record_channel() -> (Sender<Record>, Receiver<Record>) {
@@ -148,312 +322,140 @@ pub fn ingest_all(
     let mut total_bytes = 0u64;
 
     if options.claude_source.exists() {
-        let claude_files = collect_claude_files(&options.claude_source, options.include_agents)?;
-        for path in claude_files {
+        let claude_files =
+            crate::sources::claude::discover(&options.claude_source, options.include_agents)?;
+        for source_file in claude_files {
+            let path = source_file.path;
             let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             files_scanned += 1;
-            total_bytes += size;
+            total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
+            let (task, skip) =
+                prepare_file_task(path, SourceKind::Claude, &meta, state.files.get(&key));
             if skip {
                 files_skipped += 1;
                 continue;
             }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::Claude,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
+            tasks.push(task);
         }
     }
 
     let mut session_ids = HashSet::new();
     if options.include_codex {
-        let codex_files = collect_codex_session_files()?;
-        for path in codex_files {
-            if let Some(id) = session_id_from_filename(&path) {
+        let codex_files = crate::sources::codex::discover_rollouts();
+        for source_file in codex_files {
+            let path = source_file.path;
+            if let Some(id) = crate::sources::codex::session_id_from_path(&path) {
                 session_ids.insert(id);
             }
             let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             files_scanned += 1;
-            total_bytes += size;
+            total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
+            let (task, skip) =
+                prepare_file_task(path, SourceKind::CodexSession, &meta, state.files.get(&key));
             if skip {
                 files_skipped += 1;
                 continue;
             }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::CodexSession,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
+            tasks.push(task);
         }
     }
 
     if options.include_codex {
-        let history_path = codex_history_path();
-        if history_path.exists() {
+        for history_path in crate::sources::codex::history_paths() {
             let meta = history_path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             files_scanned += 1;
-            total_bytes += size;
+            total_bytes += meta.len();
             let key = history_path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
+            let (task, skip) = prepare_file_task(
+                history_path,
+                SourceKind::CodexHistory,
+                &meta,
+                state.files.get(&key),
+            );
             if skip {
                 files_skipped += 1;
             } else {
-                tasks.push(FileTask {
-                    path: history_path,
-                    source: SourceKind::CodexHistory,
-                    offset,
-                    turn_id,
-                    size,
-                    mtime,
-                    delete_first,
-                });
+                tasks.push(task);
             }
         }
     }
 
     if options.include_opencode {
-        let opencode_files = collect_opencode_files()?;
-        for path in opencode_files {
+        let opencode_files = crate::sources::opencode::discover_sessions()?;
+        for source_file in opencode_files {
+            let path = source_file.path;
             let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             files_scanned += 1;
-            total_bytes += size;
+            total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
+            let (task, skip) =
+                prepare_file_task(path, SourceKind::Opencode, &meta, state.files.get(&key));
             if skip {
                 files_skipped += 1;
                 continue;
             }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::Opencode,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
+            tasks.push(task);
         }
     }
 
     if options.include_cursor {
-        let cursor_files = collect_cursor_files()?;
-        for path in cursor_files {
+        let cursor_files = crate::sources::cursor::discover_transcripts();
+        for source_file in cursor_files {
+            let path = source_file.path;
             let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             files_scanned += 1;
-            total_bytes += size;
+            total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
+            let (task, skip) =
+                prepare_file_task(path, SourceKind::Cursor, &meta, state.files.get(&key));
             if skip {
                 files_skipped += 1;
                 continue;
             }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::Cursor,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
+            tasks.push(task);
         }
     }
 
     if options.include_pi {
-        let pi_files = collect_pi_files()?;
-        for path in pi_files {
+        let pi_files = crate::sources::pi::discover();
+        for source_file in pi_files {
+            let path = source_file.path;
             let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             files_scanned += 1;
-            total_bytes += size;
+            total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
+            let (task, skip) =
+                prepare_file_task(path, SourceKind::Pi, &meta, state.files.get(&key));
             if skip {
                 files_skipped += 1;
                 continue;
             }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::Pi,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
+            tasks.push(task);
         }
     }
 
     if options.include_copilot {
-        let copilot_files = collect_copilot_files()?;
-        for path in copilot_files {
+        let copilot_files = crate::sources::copilot::discover_sessions();
+        for source_file in copilot_files {
+            let path = source_file.path;
             let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             files_scanned += 1;
-            total_bytes += size;
+            total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
+            let (task, skip) =
+                prepare_file_task(path, SourceKind::Copilot, &meta, state.files.get(&key));
             if skip {
                 files_skipped += 1;
                 continue;
             }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::Copilot,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
+            tasks.push(task);
         }
     }
 
     let opencode_session_links = if tasks.iter().any(|task| task.source == SourceKind::Opencode) {
-        opencode_session_links_by_id()
+        crate::sources::opencode::session_links_by_id()
     } else {
         HashMap::new()
     };
@@ -476,7 +478,9 @@ pub fn ingest_all(
         });
     }
 
-    let progress = Arc::new(Progress::new(totals, file_totals, options.embeddings));
+    let vector_migration = vector_migration(&paths.vectors, &tasks, options.model);
+    let embeddings = options.embeddings || vector_migration.rebuild;
+    let progress = Arc::new(Progress::new(totals, file_totals, embeddings));
 
     let (raw_tx_record, rx_record) = record_channel();
     let tx_record = RecordSender::new(raw_tx_record, options.tool_content_limits);
@@ -487,15 +491,15 @@ pub fn ingest_all(
         .filter(|t| t.delete_first)
         .map(|t| t.path.to_string_lossy().to_string())
         .collect();
-
     let writer_index = index.clone();
     let writer_ctx = WriterContext {
-        embeddings: options.embeddings,
-        do_backfill_embeddings: options.backfill_embeddings,
+        embeddings,
+        do_backfill_embeddings: options.backfill_embeddings || vector_migration.rebuild,
+        reset_vector_store: vector_migration.rebuild,
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_db.clone(),
         progress: progress.clone(),
-        model: options.model,
+        model: vector_migration.model,
         embed_runtime: options.embed_runtime.clone(),
         tool_content_limits: options.tool_content_limits,
     };
@@ -651,6 +655,7 @@ fn writer_loop(
     let WriterContext {
         embeddings,
         do_backfill_embeddings,
+        reset_vector_store,
         vector_dir,
         analytics_path,
         progress,
@@ -674,6 +679,9 @@ fn writer_loop(
     if embeddings {
         let handle = EmbedderHandle::with_model_and_runtime(model, &embed_runtime)?;
         let dims = handle.dims;
+        if reset_vector_store {
+            crate::vector::VectorIndex::reset(&vector_dir)?;
+        }
         vector_index = Some(crate::vector::VectorIndex::open_or_create(
             &vector_dir,
             dims,
@@ -694,7 +702,11 @@ fn writer_loop(
             progress.add_indexed(record.source, index_pending[source_idx]);
             index_pending[source_idx] = 0;
         }
-        if embeddings && is_embedding_role(&record.role) && !record.text.is_empty() {
+        if embeddings
+            && !reset_vector_store
+            && is_embedding_role(&record.role)
+            && !record.text.is_empty()
+        {
             let text = truncate_for_embedding(std::mem::take(&mut record.text));
             if let Some(vindex) = vector_index.as_ref()
                 && !vindex.contains(record.doc_id)
@@ -798,458 +810,6 @@ fn backfill_embeddings(
     Ok(embedded_count.get())
 }
 
-fn collect_claude_files(source: &Path, include_agents: bool) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        if !include_agents
-            && let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && name.starts_with("agent-")
-        {
-            continue;
-        }
-        files.push(path.to_path_buf());
-    }
-    Ok(files)
-}
-
-fn collect_codex_session_files() -> Result<Vec<PathBuf>> {
-    collect_codex_session_files_from_roots(&codex_session_roots())
-}
-
-fn collect_codex_session_files_from_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for root in roots {
-        if !root.exists() {
-            continue;
-        }
-        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            files.push(path.to_path_buf());
-        }
-    }
-    Ok(files)
-}
-
-fn collect_opencode_files() -> Result<Vec<PathBuf>> {
-    let root = opencode_root();
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = Vec::new();
-    // In opencode, "sessions" are directories inside storage/message/
-    // e.g. storage/message/ses_.../
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_dir()
-            && let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && name.starts_with("ses_")
-        {
-            files.push(path);
-        }
-    }
-    Ok(files)
-}
-
-fn collect_cursor_files() -> Result<Vec<PathBuf>> {
-    let root = cursor_projects_root();
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(path_str) = path.to_str() else {
-            continue;
-        };
-        if path_str.contains("/agent-transcripts/") || path_str.contains("\\agent-transcripts\\") {
-            files.push(path.to_path_buf());
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-fn collect_pi_files() -> Result<Vec<PathBuf>> {
-    collect_pi_files_from_root(&pi_sessions_root())
-}
-
-fn collect_pi_files_from_root(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        files.push(path.to_path_buf());
-    }
-    Ok(files)
-}
-
-fn collect_copilot_files() -> Result<Vec<PathBuf>> {
-    collect_copilot_files_from_root(&copilot_session_root())
-}
-
-fn collect_copilot_files_from_root(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.file_name().and_then(|n| n.to_str()) == Some("events.jsonl") {
-            files.push(path.to_path_buf());
-        }
-    }
-    Ok(files)
-}
-
-fn codex_root() -> PathBuf {
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".codex")
-}
-
-fn codex_session_roots() -> Vec<PathBuf> {
-    let codex_root = codex_root();
-    vec![
-        codex_root.join("sessions"),
-        codex_root.join("archived_sessions"),
-    ]
-}
-
-fn opencode_root() -> PathBuf {
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".local")
-        .join("share")
-        .join("opencode")
-        .join("storage")
-        .join("message")
-}
-
-fn copilot_root() -> PathBuf {
-    if let Some(path) = std::env::var_os("COPILOT_HOME") {
-        return PathBuf::from(path);
-    }
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".copilot")
-}
-
-fn copilot_session_root() -> PathBuf {
-    copilot_root().join("session-state")
-}
-
-fn opencode_parts_root() -> PathBuf {
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".local")
-        .join("share")
-        .join("opencode")
-        .join("storage")
-        .join("part")
-}
-
-fn opencode_default_session_links() -> SessionLinks {
-    SessionLinks {
-        conversation_kind: Some("main".to_string()),
-        ..SessionLinks::default()
-    }
-}
-
-fn opencode_session_links_by_id() -> HashMap<String, SessionLinks> {
-    opencode_session_links_by_id_from_root(&opencode_storage_root().join("session"))
-}
-
-fn opencode_session_links_by_id_from_root(root: &Path) -> HashMap<String, SessionLinks> {
-    let mut links_by_id = HashMap::new();
-    if !root.exists() {
-        return links_by_id;
-    }
-
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(session_id) = entry
-            .path()
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let Ok(file) = File::open(entry.path()) else {
-            continue;
-        };
-        let reader = std::io::BufReader::new(file);
-        let Ok(value) = serde_json::from_reader::<_, serde_json::Value>(reader) else {
-            continue;
-        };
-
-        links_by_id.insert(session_id, opencode_session_links_from_value(&value));
-    }
-
-    links_by_id
-}
-
-#[cfg(test)]
-fn opencode_session_links_from_root(root: &Path, session_id: &str) -> SessionLinks {
-    opencode_session_links_by_id_from_root(root)
-        .remove(session_id)
-        .unwrap_or_else(opencode_default_session_links)
-}
-
-fn opencode_session_links_from_value(value: &serde_json::Value) -> SessionLinks {
-    let parent_session_id = value
-        .get("parentID")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    SessionLinks {
-        conversation_kind: Some(if parent_session_id.is_some() {
-            "fork".to_string()
-        } else {
-            "main".to_string()
-        }),
-        thread_source: parent_session_id.as_ref().map(|_| "fork".to_string()),
-        parent_session_id,
-    }
-}
-
-fn opencode_storage_root() -> PathBuf {
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".local")
-        .join("share")
-        .join("opencode")
-        .join("storage")
-}
-
-fn codex_history_path() -> PathBuf {
-    codex_root().join("history.jsonl")
-}
-
-pub(crate) fn cursor_projects_root() -> PathBuf {
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".cursor").join("projects")
-}
-
-fn pi_agent_root() -> PathBuf {
-    if let Some(root) = std::env::var_os("PI_CODING_AGENT_DIR") {
-        return PathBuf::from(root);
-    }
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".pi").join("agent")
-}
-
-pub(crate) fn pi_sessions_root() -> PathBuf {
-    if let Some(root) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
-        return PathBuf::from(root);
-    }
-    let agent_root = pi_agent_root();
-    if let Some(root) = pi_configured_session_root(&agent_root) {
-        return root;
-    }
-    agent_root.join("sessions")
-}
-
-fn pi_configured_session_root(agent_root: &Path) -> Option<PathBuf> {
-    let settings_path = agent_root.join("settings.json");
-    let contents = std::fs::read_to_string(settings_path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    let session_dir = value.get("sessionDir")?.as_str()?.trim();
-    if session_dir.is_empty() {
-        return None;
-    }
-    Some(resolve_pi_settings_path(session_dir, agent_root))
-}
-
-fn resolve_pi_settings_path(raw: &str, base: &Path) -> PathBuf {
-    if raw == "~" {
-        return directories::BaseDirs::new()
-            .map(|b| b.home_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(raw));
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        return directories::BaseDirs::new()
-            .map(|b| b.home_dir().join(rest))
-            .unwrap_or_else(|| PathBuf::from(raw));
-    }
-    let path = PathBuf::from(raw);
-    if path.is_absolute() {
-        path
-    } else {
-        base.join(path)
-    }
-}
-
-#[derive(Clone, Default)]
-struct SessionLinks {
-    parent_session_id: Option<String>,
-    thread_source: Option<String>,
-    conversation_kind: Option<String>,
-}
-
-impl SessionLinks {
-    fn record_links(&self) -> RecordLinks {
-        RecordLinks {
-            parent_session_id: self.parent_session_id.clone(),
-            thread_source: self.thread_source.clone(),
-            conversation_kind: self.conversation_kind.clone(),
-            ..RecordLinks::default()
-        }
-    }
-}
-
-#[derive(Clone)]
-struct CodexSessionMeta {
-    session_id: String,
-    project: String,
-    links: SessionLinks,
-}
-
-fn codex_session_meta_from_path(path: &Path) -> CodexSessionMeta {
-    CodexSessionMeta {
-        session_id: session_id_from_filename(path).unwrap_or_else(|| "unknown".to_string()),
-        project: "codex".to_string(),
-        links: SessionLinks {
-            conversation_kind: Some("main".to_string()),
-            ..SessionLinks::default()
-        },
-    }
-}
-
-fn read_codex_session_meta_until(path: &Path, limit: u64) -> Result<CodexSessionMeta> {
-    let mut meta = codex_session_meta_from_path(path);
-    if limit == 0 {
-        return Ok(meta);
-    }
-    let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = 0usize;
-    let limit = (limit as usize).min(mmap.len());
-    let mut buf = Vec::new();
-    while start < limit {
-        let slice = &mmap[start..limit];
-        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
-        let line = &slice[..rel];
-        start += rel + 1;
-        if line.is_empty() {
-            continue;
-        }
-        buf.clear();
-        buf.extend_from_slice(line);
-        let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if value.get("type").and_then(|v| v.as_str()) == Some("session_meta")
-            && let Some(payload) = value.get("payload").and_then(|v| v.as_object())
-        {
-            apply_codex_session_meta(payload, &mut meta);
-        }
-    }
-    Ok(meta)
-}
-
-fn apply_codex_session_meta(payload: &simd_json::borrowed::Object, meta: &mut CodexSessionMeta) {
-    if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
-        meta.session_id = id.to_string();
-    }
-    if let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) {
-        meta.project = project_from_path(cwd);
-    }
-
-    let forked_from_id = payload
-        .get("forked_from_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let parent_thread_id = payload
-        .get("source")
-        .and_then(|v| v.as_object())
-        .and_then(|source| source.get("subagent"))
-        .and_then(|v| v.as_object())
-        .and_then(|subagent| subagent.get("thread_spawn"))
-        .and_then(|v| v.as_object())
-        .and_then(|spawn| spawn.get("parent_thread_id"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let thread_source = payload
-        .get("thread_source")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| parent_thread_id.as_ref().map(|_| "subagent".to_string()))
-        .or_else(|| forked_from_id.as_ref().map(|_| "fork".to_string()));
-
-    meta.links.parent_session_id = forked_from_id.clone().or(parent_thread_id);
-    meta.links.thread_source = thread_source.clone();
-    meta.links.conversation_kind = Some(if thread_source.as_deref() == Some("subagent") {
-        "subagent".to_string()
-    } else if forked_from_id.is_some() {
-        "fork".to_string()
-    } else {
-        "main".to_string()
-    });
-}
-
-fn opt_str(obj: &simd_json::borrowed::Object, key: &str) -> Option<String> {
-    obj.get(key).and_then(|v| v.as_str()).map(str::to_string)
-}
-
-fn pi_base_links(obj: &simd_json::borrowed::Object, conversation_kind: &str) -> RecordLinks {
-    RecordLinks {
-        event_id: opt_str(obj, "id"),
-        parent_event_id: opt_str(obj, "parentId"),
-        logical_parent_event_id: opt_str(obj, "fromId"),
-        thread_source: (conversation_kind != "main").then(|| conversation_kind.to_string()),
-        conversation_kind: Some(conversation_kind.to_string()),
-        ..RecordLinks::default()
-    }
-}
-
 fn parse_claude_file(
     task: &FileTask,
     tx_record: &RecordSender,
@@ -1257,248 +817,28 @@ fn parse_claude_file(
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
 ) -> Result<()> {
-    let file = File::open(&task.path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = task.offset as usize;
-    let mut turn_id = task.turn_id;
-
-    let project = project_from_claude_path(&task.path);
-    let session_id = task
-        .path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let is_agent_file = session_id.starts_with("agent-")
-        || task
-            .path
-            .components()
-            .any(|component| component.as_os_str().to_str() == Some("subagents"));
     let source_path = task.path.to_string_lossy().to_string();
-    let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
-
-    let mut buf = Vec::new();
-    let mut parsed_bytes = 0u64;
-    while start < mmap.len() {
-        let slice = &mmap[start..];
-        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
-        let line = &slice[..rel];
-        let advanced = rel + 1;
-        start += advanced;
-        parsed_bytes += advanced as u64;
-        if parsed_bytes >= 64 * 1024 {
-            progress.add_parsed_bytes(SourceKind::Claude, parsed_bytes);
-            parsed_bytes = 0;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        buf.clear();
-        buf.extend_from_slice(line);
-        let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let obj = match value.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
-        let entry_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if entry_type != "user" && entry_type != "assistant" {
-            continue;
-        }
-        let entry_uuid = opt_str(obj, "uuid");
-        let entry_parent_uuid = opt_str(obj, "parentUuid");
-        let is_sidechain = obj
-            .get("isSidechain")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let conversation_kind = if is_agent_file {
-            "subagent"
-        } else if is_sidechain {
-            "sidechain"
-        } else {
-            "main"
-        };
-        let thread_source = if is_agent_file {
-            Some("subagent".to_string())
-        } else if is_sidechain {
-            Some("sidechain".to_string())
-        } else {
-            None
-        };
-        let entry_links = RecordLinks {
-            event_id: entry_uuid.clone(),
-            parent_event_id: entry_parent_uuid,
-            logical_parent_event_id: opt_str(obj, "logicalParentUuid"),
-            parent_session_id: is_agent_file.then(|| opt_str(obj, "sessionId")).flatten(),
-            thread_source,
-            conversation_kind: Some(conversation_kind.to_string()),
-            parent_tool_use_id: opt_str(obj, "parentToolUseID"),
-            source_tool_use_id: opt_str(obj, "sourceToolUseID"),
-            source_tool_assistant_uuid: opt_str(obj, "sourceToolAssistantUUID"),
-        };
-        let timestamp = obj
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .and_then(parse_iso_millis)
-            .unwrap_or(0);
-        let message = match obj.get("message").and_then(|v| v.as_object()) {
-            Some(m) => m,
-            None => continue,
-        };
-        let content = message.get("content");
-        let mut text_parts = Vec::new();
-        if let Some(content) = content {
-            if let Some(text) = content.as_str() {
-                text_parts.push(text);
-            } else if let Some(arr) = content.as_array() {
-                for block in arr {
-                    let block_obj = match block.as_object() {
-                        Some(b) => b,
-                        None => continue,
-                    };
-                    let block_type = block_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if block_type == "text" {
-                        if let Some(text) = block_obj.get("text").and_then(|v| v.as_str()) {
-                            text_parts.push(text);
-                        }
-                    } else if block_type == "tool_use" {
-                        let tool_name = block_obj
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        if let (Some(id), Some(name)) = (
-                            block_obj.get("id").and_then(|v| v.as_str()),
-                            tool_name.clone(),
-                        ) {
-                            tool_id_to_name.insert(id.to_string(), name);
-                        }
-                        let tool_input = block_obj.get("input").map(|v| v.to_string());
-                        let text = tool_input.clone().unwrap_or_default();
-                        let mut links = entry_links.clone();
-                        if let Some(tool_id) = block_obj.get("id").and_then(|v| v.as_str()) {
-                            links.event_id = Some(tool_id.to_string());
-                            links.parent_event_id = entry_uuid.clone();
-                        }
-                        let record = Record {
-                            source: SourceKind::Claude,
-                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                            ts: timestamp,
-                            project: project.clone(),
-                            session_id: session_id.clone(),
-                            turn_id,
-                            role: "tool_use".to_string(),
-                            text,
-                            tool_name,
-                            tool_input,
-                            tool_output: None,
-                            links,
-                            source_path: source_path.clone(),
-                        };
-                        progress.add_produced(SourceKind::Claude, 1);
-                        tx_record.send(record)?;
-                        turn_id += 1;
-                    }
-                }
-            }
-        }
-
-        if entry_type == "user"
-            && let Some(content) = content
-            && let Some(arr) = content.as_array()
-        {
-            for block in arr {
-                let block_obj = match block.as_object() {
-                    Some(b) => b,
-                    None => continue,
-                };
-                if block_obj.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                    let tool_output = block_obj.get("content").map(|v| v.to_string());
-                    let mut text = extract_text_from_tool_result(block).unwrap_or_default();
-                    if text.is_empty()
-                        && let Some(content) = block_obj.get("content")
-                    {
-                        text = content.to_string();
-                    }
-                    let tool_name = block_obj
-                        .get("tool_use_id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|id| tool_id_to_name.get(id))
-                        .cloned();
-                    let tool_use_id = block_obj
-                        .get("tool_use_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                    let mut links = entry_links.clone();
-                    if let Some(tool_use_id) = &tool_use_id {
-                        links.event_id = entry_uuid
-                            .as_ref()
-                            .map(|uuid| format!("{uuid}:tool_result:{tool_use_id}"));
-                        links.parent_event_id = Some(tool_use_id.clone());
-                        links.parent_tool_use_id = Some(tool_use_id.clone());
-                    }
-                    let record = Record {
-                        source: SourceKind::Claude,
-                        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                        ts: timestamp,
-                        project: project.clone(),
-                        session_id: session_id.clone(),
-                        turn_id,
-                        role: "tool_result".to_string(),
-                        text,
-                        tool_name,
-                        tool_input: None,
-                        tool_output,
-                        links,
-                        source_path: source_path.clone(),
-                    };
-                    progress.add_produced(SourceKind::Claude, 1);
-                    tx_record.send(record)?;
-                    turn_id += 1;
-                }
-            }
-        }
-
-        let text = text_parts.join(" ").trim().to_string();
-        if !text.is_empty() {
-            let record = Record {
-                source: SourceKind::Claude,
-                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                ts: timestamp,
-                project: project.clone(),
-                session_id: session_id.clone(),
-                turn_id,
-                role: entry_type.to_string(),
-                text,
-                tool_name: None,
-                tool_input: None,
-                tool_output: None,
-                links: entry_links,
-                source_path: source_path.clone(),
-            };
+    let parsed = crate::sources::claude::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        next_doc_id,
+        |record| {
             progress.add_produced(SourceKind::Claude, 1);
-            tx_record.send(record)?;
-            turn_id += 1;
-        }
-    }
-
-    if parsed_bytes > 0 {
-        progress.add_parsed_bytes(SourceKind::Claude, parsed_bytes);
-    }
-    progress.add_files_done(SourceKind::Claude, 1);
-    let state = FileState {
-        size: task.size,
-        mtime: task.mtime,
-        offset: mmap.len() as u64,
-        turn_id,
-    };
-    tx_update.send(FileUpdate {
-        path: source_path,
-        state,
-        session_id: Some(session_id),
-    })?;
-    Ok(())
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Claude,
+        source_path,
+        parsed,
+    )
 }
 
 fn parse_codex_session(
@@ -1508,198 +848,28 @@ fn parse_codex_session(
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
 ) -> Result<()> {
-    let file = File::open(&task.path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = task.offset as usize;
-    let mut turn_id = task.turn_id;
-
     let source_path = task.path.to_string_lossy().to_string();
-    let mut meta = read_codex_session_meta_until(&task.path, task.offset)?;
-    let mut call_id_to_name: HashMap<String, String> = HashMap::new();
-
-    let mut buf = Vec::new();
-    let mut parsed_bytes = 0u64;
-    while start < mmap.len() {
-        let slice = &mmap[start..];
-        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
-        let line = &slice[..rel];
-        let advanced = rel + 1;
-        start += advanced;
-        parsed_bytes += advanced as u64;
-        if parsed_bytes >= 64 * 1024 {
-            progress.add_parsed_bytes(SourceKind::CodexSession, parsed_bytes);
-            parsed_bytes = 0;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        buf.clear();
-        buf.extend_from_slice(line);
-        let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let obj = match value.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
-        let entry_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp = obj
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .and_then(parse_iso_millis)
-            .unwrap_or(0);
-        if entry_type == "session_meta" {
-            if let Some(payload) = obj.get("payload").and_then(|v| v.as_object()) {
-                apply_codex_session_meta(payload, &mut meta);
-            }
-            continue;
-        }
-        if entry_type != "response_item" {
-            continue;
-        }
-        let payload = match obj.get("payload").and_then(|v| v.as_object()) {
-            Some(p) => p,
-            None => continue,
-        };
-        let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let mut base_links = meta.links.record_links();
-        base_links.event_id = opt_str(payload, "id");
-        if payload_type == "message" {
-            let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            let content = payload.get("content");
-            let mut text_parts = Vec::new();
-            if let Some(content) = content {
-                if let Some(text) = content.as_str() {
-                    text_parts.push(text);
-                } else if let Some(arr) = content.as_array() {
-                    for block in arr {
-                        if let Some(block_obj) = block.as_object()
-                            && let Some(text) = block_obj.get("text").and_then(|v| v.as_str())
-                        {
-                            text_parts.push(text);
-                        }
-                    }
-                }
-            }
-            let text = text_parts.join("\n").trim().to_string();
-            if text.is_empty() {
-                continue;
-            }
-            if is_system_instruction(&text) {
-                continue;
-            }
-            let record = Record {
-                source: SourceKind::CodexSession,
-                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                ts: timestamp,
-                project: meta.project.clone(),
-                session_id: meta.session_id.clone(),
-                turn_id,
-                role: role.to_string(),
-                text,
-                tool_name: None,
-                tool_input: None,
-                tool_output: None,
-                links: base_links,
-                source_path: source_path.clone(),
-            };
+    let parsed = crate::sources::codex::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        next_doc_id,
+        |record| {
             progress.add_produced(SourceKind::CodexSession, 1);
-            tx_record.send(record)?;
-            turn_id += 1;
-        } else if payload_type == "function_call" {
-            let tool_name = payload
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let tool_input = payload
-                .get("arguments")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str())
-                && let Some(name) = tool_name.clone()
-            {
-                call_id_to_name.insert(call_id.to_string(), name);
-            }
-            let text = tool_input.clone().unwrap_or_default();
-            let mut links = base_links;
-            if let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str()) {
-                links.event_id = Some(call_id.to_string());
-            }
-            let record = Record {
-                source: SourceKind::CodexSession,
-                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                ts: timestamp,
-                project: meta.project.clone(),
-                session_id: meta.session_id.clone(),
-                turn_id,
-                role: "tool_use".to_string(),
-                text,
-                tool_name,
-                tool_input,
-                tool_output: None,
-                links,
-                source_path: source_path.clone(),
-            };
-            progress.add_produced(SourceKind::CodexSession, 1);
-            tx_record.send(record)?;
-            turn_id += 1;
-        } else if payload_type == "function_call_output" {
-            let call_id = payload
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let tool_name = call_id_to_name.get(call_id).cloned();
-            let tool_output = payload
-                .get("output")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let text = tool_output.clone().unwrap_or_default();
-            if text.is_empty() {
-                continue;
-            }
-            let mut links = base_links;
-            if !call_id.is_empty() {
-                links.parent_event_id = Some(call_id.to_string());
-                links.parent_tool_use_id = Some(call_id.to_string());
-            }
-            let record = Record {
-                source: SourceKind::CodexSession,
-                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                ts: timestamp,
-                project: meta.project.clone(),
-                session_id: meta.session_id.clone(),
-                turn_id,
-                role: "tool_result".to_string(),
-                text,
-                tool_name,
-                tool_input: None,
-                tool_output,
-                links,
-                source_path: source_path.clone(),
-            };
-            progress.add_produced(SourceKind::CodexSession, 1);
-            tx_record.send(record)?;
-            turn_id += 1;
-        }
-    }
-
-    if parsed_bytes > 0 {
-        progress.add_parsed_bytes(SourceKind::CodexSession, parsed_bytes);
-    }
-    progress.add_files_done(SourceKind::CodexSession, 1);
-    let state = FileState {
-        size: task.size,
-        mtime: task.mtime,
-        offset: mmap.len() as u64,
-        turn_id,
-    };
-    tx_update.send(FileUpdate {
-        path: source_path,
-        state,
-        session_id: Some(meta.session_id),
-    })?;
-    Ok(())
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::CodexSession,
+        source_path,
+        parsed,
+    )
 }
 
 fn parse_codex_history(
@@ -1710,216 +880,85 @@ fn parse_codex_history(
     session_ids: &HashSet<String>,
     progress: &Arc<Progress>,
 ) -> Result<()> {
-    let file = File::open(&task.path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = task.offset as usize;
-    let mut turn_id = task.turn_id;
     let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::codex::parse_history_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        session_ids,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::CodexHistory, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::CodexHistory,
+        source_path,
+        parsed,
+    )
+}
 
-    let mut buf = Vec::new();
-    let mut parsed_bytes = 0u64;
-    while start < mmap.len() {
-        let slice = &mmap[start..];
-        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
-        let line = &slice[..rel];
-        let advanced = rel + 1;
-        start += advanced;
-        parsed_bytes += advanced as u64;
-        if parsed_bytes >= 64 * 1024 {
-            progress.add_parsed_bytes(SourceKind::CodexHistory, parsed_bytes);
-            parsed_bytes = 0;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        buf.clear();
-        buf.extend_from_slice(line);
-        let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let obj = match value.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
-        let session_id = obj.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-        if session_id.is_empty() || session_ids.contains(session_id) {
-            continue;
-        }
-        let ts = obj.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
-        let ts_ms = (ts.max(0) as u64) * 1000;
-        let text = obj
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if text.is_empty() {
-            continue;
-        }
-        let record = Record {
-            source: SourceKind::CodexHistory,
-            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-            ts: ts_ms,
-            project: "codex".to_string(),
-            session_id: session_id.to_string(),
-            turn_id,
-            role: "user".to_string(),
-            text,
-            tool_name: None,
-            tool_input: None,
-            tool_output: None,
-            links: RecordLinks {
-                conversation_kind: Some("main".to_string()),
-                ..RecordLinks::default()
-            },
-            source_path: source_path.clone(),
-        };
-        progress.add_produced(SourceKind::CodexHistory, 1);
-        tx_record.send(record)?;
-        turn_id += 1;
-    }
-
-    if parsed_bytes > 0 {
-        progress.add_parsed_bytes(SourceKind::CodexHistory, parsed_bytes);
-    }
-    progress.add_files_done(SourceKind::CodexHistory, 1);
-    let state = FileState {
-        size: task.size,
-        mtime: task.mtime,
-        offset: mmap.len() as u64,
-        turn_id,
-    };
+fn finish_source_parse(
+    task: &FileTask,
+    tx_update: &Sender<FileUpdate>,
+    progress: &Arc<Progress>,
+    source: SourceKind,
+    source_path: String,
+    parsed: crate::sources::IndexParseOutput,
+) -> Result<()> {
+    progress.add_parsed_bytes(source, parsed.offset.saturating_sub(task.offset));
+    progress.add_files_done(source, 1);
+    let state = completed_file_state(
+        task,
+        parsed.offset,
+        parsed.turn_id,
+        parsed.pending_tool_calls,
+    );
     tx_update.send(FileUpdate {
         path: source_path,
         state,
-        session_id: None,
+        session_id: parsed.session_id,
     })?;
     Ok(())
 }
-
 fn parse_opencode_file(
     task: &FileTask,
     tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
-    opencode_session_links: &HashMap<String, SessionLinks>,
+    opencode_session_links: &HashMap<String, crate::sources::opencode::SessionLinks>,
 ) -> Result<()> {
-    let session_dir = &task.path;
-    let session_id = session_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let project = SourceKind::Opencode.label().to_string();
-    let session_links = opencode_session_links
-        .get(&session_id)
-        .cloned()
-        .unwrap_or_else(opencode_default_session_links);
-
-    let mut messages = Vec::new();
-    for entry in std::fs::read_dir(session_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let file = File::open(&path)?;
-        let reader = std::io::BufReader::new(file);
-        let msg: serde_json::Value = match serde_json::from_reader(reader) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let msg_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-        if msg_id.is_empty() {
-            continue;
-        }
-        let timestamp = msg
-            .get("time")
-            .and_then(|t| t.get("created"))
-            .and_then(|c| c.as_u64())
-            .unwrap_or(0);
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-
-        messages.push((msg_id.to_string(), timestamp, role.to_string()));
-    }
-
-    messages.sort_by_key(|k| k.1);
-
-    let parts_root = opencode_parts_root();
-    let mut turn_id = task.turn_id;
-
-    for (msg_id, timestamp, role) in messages {
-        let part_dir = parts_root.join(&msg_id);
-        if !part_dir.exists() {
-            continue;
-        }
-
-        let mut part_files: Vec<_> = std::fs::read_dir(&part_dir)?
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        // Ensure deterministic order for message parts
-        part_files.sort();
-
-        let mut text_parts = Vec::new();
-        for path in part_files {
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let file = File::open(&path)?;
-            let reader = std::io::BufReader::new(file);
-            let part: serde_json::Value = match serde_json::from_reader(reader) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                text_parts.push(text.to_string());
-            }
-        }
-
-        if text_parts.is_empty() {
-            continue;
-        }
-
-        let text = text_parts.join("\n");
-        let mut links = session_links.record_links();
-        links.event_id = Some(msg_id.clone());
-        let record = Record {
-            source: SourceKind::Opencode,
-            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-            ts: timestamp,
-            project: project.clone(),
-            session_id: session_id.clone(),
-            turn_id,
-            role: role.clone(),
-            text,
-            tool_name: None,
-            tool_input: None,
-            tool_output: None,
-            links,
-            source_path: session_dir.to_string_lossy().to_string(),
-        };
-        progress.add_produced(SourceKind::Opencode, 1);
-        tx_record.send(record)?;
-        turn_id += 1;
-    }
-
-    progress.add_files_done(SourceKind::Opencode, 1);
-    let state = FileState {
-        size: task.size,
-        mtime: task.mtime,
-        offset: 0,
-        turn_id,
-    };
-    tx_update.send(FileUpdate {
-        path: session_dir.to_string_lossy().to_string(),
-        state,
-        session_id: Some(session_id),
-    })?;
-    Ok(())
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::opencode::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        opencode_session_links,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Opencode, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Opencode,
+        source_path,
+        parsed,
+    )
 }
 
 fn parse_cursor_file(
@@ -1929,164 +968,30 @@ fn parse_cursor_file(
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
 ) -> Result<()> {
-    let file = File::open(&task.path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = task.offset as usize;
-    let mut turn_id = cursor_initial_turn_id(&task.path, task.turn_id);
-
     let source_path = task.path.to_string_lossy().to_string();
-    let session_id = cursor_session_id_from_path(&task.path);
-    let project = project_from_cursor_path(&task.path);
-    let timestamp = task.mtime.max(0) as u64 * 1000;
-
-    let mut buf = Vec::new();
-    let mut parsed_bytes = 0u64;
-    while start < mmap.len() {
-        let slice = &mmap[start..];
-        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
-        let line = &slice[..rel];
-        let advanced = rel + 1;
-        start += advanced;
-        parsed_bytes += advanced as u64;
-        if parsed_bytes >= 64 * 1024 {
-            progress.add_parsed_bytes(SourceKind::Cursor, parsed_bytes);
-            parsed_bytes = 0;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        buf.clear();
-        buf.extend_from_slice(line);
-        let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let obj = match value.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
-        let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        if role != "user" && role != "assistant" {
-            continue;
-        }
-        let message = match obj.get("message").and_then(|v| v.as_object()) {
-            Some(m) => m,
-            None => continue,
-        };
-        let mut text_parts = Vec::new();
-        if let Some(content) = message.get("content") {
-            if let Some(text) = content.as_str() {
-                text_parts.push(text);
-            } else if let Some(arr) = content.as_array() {
-                for block in arr {
-                    let Some(block_obj) = block.as_object() else {
-                        continue;
-                    };
-                    let block_type = block_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if block_type == "text" {
-                        if let Some(text) = block_obj.get("text").and_then(|v| v.as_str()) {
-                            text_parts.push(text);
-                        }
-                    } else if block_type == "tool_use" {
-                        let tool_name = block_obj
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        let tool_input = block_obj.get("input").map(|v| v.to_string());
-                        let text = tool_input.clone().unwrap_or_default();
-                        let record = Record {
-                            source: SourceKind::Cursor,
-                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                            ts: timestamp,
-                            project: project.clone(),
-                            session_id: session_id.clone(),
-                            turn_id,
-                            role: "tool_use".to_string(),
-                            text,
-                            tool_name,
-                            tool_input,
-                            tool_output: None,
-                            links: cursor_record_links(&task.path, &session_id, turn_id),
-                            source_path: source_path.clone(),
-                        };
-                        progress.add_produced(SourceKind::Cursor, 1);
-                        tx_record.send(record)?;
-                        turn_id += 1;
-                    } else if block_type == "tool_result" {
-                        let tool_output = block_obj.get("content").map(|v| v.to_string());
-                        let mut text = extract_text_from_tool_result(block).unwrap_or_default();
-                        if text.is_empty()
-                            && let Some(content) = block_obj.get("content")
-                        {
-                            text = content.to_string();
-                        }
-                        if text.is_empty() {
-                            continue;
-                        }
-                        let record = Record {
-                            source: SourceKind::Cursor,
-                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                            ts: timestamp,
-                            project: project.clone(),
-                            session_id: session_id.clone(),
-                            turn_id,
-                            role: "tool_result".to_string(),
-                            text,
-                            tool_name: None,
-                            tool_input: None,
-                            tool_output,
-                            links: cursor_record_links(&task.path, &session_id, turn_id),
-                            source_path: source_path.clone(),
-                        };
-                        progress.add_produced(SourceKind::Cursor, 1);
-                        tx_record.send(record)?;
-                        turn_id += 1;
-                    }
-                }
-            }
-        }
-
-        let text = text_parts.join("\n").trim().to_string();
-        if !text.is_empty() {
-            let record = Record {
-                source: SourceKind::Cursor,
-                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                ts: timestamp,
-                project: project.clone(),
-                session_id: session_id.clone(),
-                turn_id,
-                role: role.to_string(),
-                text,
-                tool_name: None,
-                tool_input: None,
-                tool_output: None,
-                links: cursor_record_links(&task.path, &session_id, turn_id),
-                source_path: source_path.clone(),
-            };
+    let parsed = crate::sources::cursor::parse_index_records(
+        &task.path,
+        task.mtime,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        next_doc_id,
+        |record| {
             progress.add_produced(SourceKind::Cursor, 1);
-            tx_record.send(record)?;
-            turn_id += 1;
-        }
-    }
-
-    if parsed_bytes > 0 {
-        progress.add_parsed_bytes(SourceKind::Cursor, parsed_bytes);
-    }
-    progress.add_files_done(SourceKind::Cursor, 1);
-    let state = FileState {
-        size: task.size,
-        mtime: task.mtime,
-        offset: mmap.len() as u64,
-        turn_id,
-    };
-    tx_update.send(FileUpdate {
-        path: source_path,
-        state,
-        session_id: Some(session_id),
-    })?;
-    Ok(())
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Cursor,
+        source_path,
+        parsed,
+    )
 }
-
 fn parse_pi_file(
     task: &FileTask,
     tx_record: &RecordSender,
@@ -2094,434 +999,29 @@ fn parse_pi_file(
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
 ) -> Result<()> {
-    let file = File::open(&task.path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = task.offset as usize;
-    let mut turn_id = task.turn_id;
-
     let source_path = task.path.to_string_lossy().to_string();
-    let mut session_id = pi_session_id_from_path(&task.path);
-    let mut project = project_from_pi_session_path(&task.path);
-    let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
-
-    let mut buf = Vec::new();
-    if start > 0 && !mmap.is_empty() {
-        let rel = memchr(b'\n', &mmap).unwrap_or(mmap.len());
-        let line = &mmap[..rel];
-        if !line.is_empty() {
-            buf.extend_from_slice(line);
-            if let Ok(value) = simd_json::to_borrowed_value(&mut buf)
-                && let Some(obj) = value.as_object()
-                && obj.get("type").and_then(|v| v.as_str()) == Some("session")
-            {
-                apply_pi_session_header(obj, &mut session_id, &mut project);
-            }
-            buf.clear();
-        }
-    }
-    let mut parsed_bytes = 0u64;
-    while start < mmap.len() {
-        let slice = &mmap[start..];
-        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
-        let line = &slice[..rel];
-        let advanced = rel + 1;
-        start += advanced;
-        parsed_bytes += advanced as u64;
-        if parsed_bytes >= 64 * 1024 {
-            progress.add_parsed_bytes(SourceKind::Pi, parsed_bytes);
-            parsed_bytes = 0;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        buf.clear();
-        buf.extend_from_slice(line);
-        let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let obj = match value.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
-        let entry_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp = obj
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .and_then(parse_iso_millis)
-            .unwrap_or(0);
-        let conversation_kind = match entry_type {
-            "branch_summary" => "branch",
-            "compaction" => "compaction",
-            _ => "main",
-        };
-        let mut base_links = pi_base_links(obj, conversation_kind);
-
-        if entry_type == "session" {
-            apply_pi_session_header(obj, &mut session_id, &mut project);
-            continue;
-        }
-
-        if entry_type == "compaction" || entry_type == "branch_summary" {
-            let summary = obj
-                .get("summary")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim();
-            if summary.is_empty() {
-                continue;
-            }
-            let record = Record {
-                source: SourceKind::Pi,
-                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                ts: timestamp,
-                project: project.clone(),
-                session_id: session_id.clone(),
-                turn_id,
-                role: "assistant".to_string(),
-                text: format!("{entry_type}: {summary}"),
-                tool_name: None,
-                tool_input: None,
-                tool_output: None,
-                links: base_links,
-                source_path: source_path.clone(),
-            };
+    let parsed = crate::sources::pi::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        next_doc_id,
+        |record| {
             progress.add_produced(SourceKind::Pi, 1);
-            tx_record.send(record)?;
-            turn_id += 1;
-            continue;
-        }
-
-        if entry_type == "custom_message" {
-            let text = pi_content_text(obj.get("content")).trim().to_string();
-            if text.is_empty() {
-                continue;
-            }
-            let custom_type = obj.get("customType").and_then(|v| v.as_str()).unwrap_or("");
-            let prefix = if custom_type.is_empty() {
-                "custom_message".to_string()
-            } else {
-                format!("custom_message({custom_type})")
-            };
-            let record = Record {
-                source: SourceKind::Pi,
-                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                ts: timestamp,
-                project: project.clone(),
-                session_id: session_id.clone(),
-                turn_id,
-                role: "assistant".to_string(),
-                text: format!("{prefix}: {text}"),
-                tool_name: None,
-                tool_input: None,
-                tool_output: None,
-                links: base_links,
-                source_path: source_path.clone(),
-            };
-            progress.add_produced(SourceKind::Pi, 1);
-            tx_record.send(record)?;
-            turn_id += 1;
-            continue;
-        }
-
-        if entry_type != "message" {
-            continue;
-        }
-        let message = match obj.get("message").and_then(|v| v.as_object()) {
-            Some(m) => m,
-            None => continue,
-        };
-        let timestamp = if timestamp == 0 {
-            message
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .and_then(parse_iso_millis)
-                .unwrap_or(0)
-        } else {
-            timestamp
-        };
-        let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        if conversation_kind == "main" {
-            match role {
-                "branchSummary" => {
-                    base_links.thread_source = Some("branch".to_string());
-                    base_links.conversation_kind = Some("branch".to_string());
-                }
-                "compactionSummary" => {
-                    base_links.thread_source = Some("compaction".to_string());
-                    base_links.conversation_kind = Some("compaction".to_string());
-                }
-                _ => {}
-            }
-        }
-
-        match role {
-            "user" | "assistant" => {
-                let content = message.get("content");
-                if role == "assistant"
-                    && let Some(arr) = content.and_then(|v| v.as_array())
-                {
-                    for block in arr {
-                        let Some(block_obj) = block.as_object() else {
-                            continue;
-                        };
-                        if block_obj.get("type").and_then(|v| v.as_str()) != Some("toolCall") {
-                            continue;
-                        }
-                        let tool_name = block_obj
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        if let (Some(id), Some(name)) = (
-                            block_obj.get("id").and_then(|v| v.as_str()),
-                            tool_name.clone(),
-                        ) {
-                            tool_id_to_name.insert(id.to_string(), name);
-                        }
-                        let tool_input = block_obj.get("arguments").map(|v| v.to_string());
-                        let mut links = base_links.clone();
-                        if let Some(tool_call_id) = block_obj.get("id").and_then(|v| v.as_str()) {
-                            links.event_id = Some(tool_call_id.to_string());
-                            links.parent_event_id = base_links.event_id.clone();
-                        }
-                        let record = Record {
-                            source: SourceKind::Pi,
-                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                            ts: timestamp,
-                            project: project.clone(),
-                            session_id: session_id.clone(),
-                            turn_id,
-                            role: "tool_use".to_string(),
-                            text: tool_input.clone().unwrap_or_default(),
-                            tool_name,
-                            tool_input,
-                            tool_output: None,
-                            links,
-                            source_path: source_path.clone(),
-                        };
-                        progress.add_produced(SourceKind::Pi, 1);
-                        tx_record.send(record)?;
-                        turn_id += 1;
-                    }
-                }
-
-                let text = pi_content_text(content).trim().to_string();
-                if text.is_empty() {
-                    continue;
-                }
-                let record = Record {
-                    source: SourceKind::Pi,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                    ts: timestamp,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    role: role.to_string(),
-                    text,
-                    tool_name: None,
-                    tool_input: None,
-                    tool_output: None,
-                    links: base_links,
-                    source_path: source_path.clone(),
-                };
-                progress.add_produced(SourceKind::Pi, 1);
-                tx_record.send(record)?;
-                turn_id += 1;
-            }
-            "toolResult" => {
-                let tool_call_id = message
-                    .get("toolCallId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let tool_name = message
-                    .get("toolName")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| tool_id_to_name.get(tool_call_id).cloned());
-                let tool_output = Some(pi_content_text(message.get("content")));
-                let text = tool_output.clone().unwrap_or_default();
-                if text.trim().is_empty() {
-                    continue;
-                }
-                let mut links = base_links;
-                if !tool_call_id.is_empty() {
-                    links.parent_tool_use_id = Some(tool_call_id.to_string());
-                }
-                let record = Record {
-                    source: SourceKind::Pi,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                    ts: timestamp,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    role: "tool_result".to_string(),
-                    text,
-                    tool_name,
-                    tool_input: None,
-                    tool_output,
-                    links,
-                    source_path: source_path.clone(),
-                };
-                progress.add_produced(SourceKind::Pi, 1);
-                tx_record.send(record)?;
-                turn_id += 1;
-            }
-            "bashExecution" => {
-                if message
-                    .get("excludeFromContext")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let command = message
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let output = message
-                    .get("output")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let exit_code = message.get("exitCode").and_then(|v| v.as_i64());
-                let text = pi_bash_text(&command, &output, exit_code);
-                if text.trim().is_empty() {
-                    continue;
-                }
-                let record = Record {
-                    source: SourceKind::Pi,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                    ts: timestamp,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    role: "tool_result".to_string(),
-                    text,
-                    tool_name: Some("Bash".to_string()),
-                    tool_input: if command.is_empty() {
-                        None
-                    } else {
-                        Some(command)
-                    },
-                    tool_output: if output.is_empty() {
-                        None
-                    } else {
-                        Some(output)
-                    },
-                    links: base_links,
-                    source_path: source_path.clone(),
-                };
-                progress.add_produced(SourceKind::Pi, 1);
-                tx_record.send(record)?;
-                turn_id += 1;
-            }
-            "custom" | "branchSummary" | "compactionSummary" => {
-                let text = pi_summary_message_text(message, role);
-                if text.is_empty() {
-                    continue;
-                }
-                let record = Record {
-                    source: SourceKind::Pi,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                    ts: timestamp,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    role: "assistant".to_string(),
-                    text: format!("{role}: {text}"),
-                    tool_name: None,
-                    tool_input: None,
-                    tool_output: None,
-                    links: base_links,
-                    source_path: source_path.clone(),
-                };
-                progress.add_produced(SourceKind::Pi, 1);
-                tx_record.send(record)?;
-                turn_id += 1;
-            }
-            _ => {}
-        }
-    }
-
-    if parsed_bytes > 0 {
-        progress.add_parsed_bytes(SourceKind::Pi, parsed_bytes);
-    }
-    progress.add_files_done(SourceKind::Pi, 1);
-    let state = FileState {
-        size: task.size,
-        mtime: task.mtime,
-        offset: mmap.len() as u64,
-        turn_id,
-    };
-    tx_update.send(FileUpdate {
-        path: source_path,
-        state,
-        session_id: Some(session_id),
-    })?;
-    Ok(())
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Pi,
+        source_path,
+        parsed,
+    )
 }
-
-fn parse_iso_millis(input: &str) -> Option<u64> {
-    DateTime::parse_from_rfc3339(input)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc).timestamp_millis() as u64)
-}
-
-fn project_from_claude_path(path: &Path) -> String {
-    let Some(parent) = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-    else {
-        return "unknown".to_string();
-    };
-    decode_project_name(parent)
-}
-
-fn project_from_path(path: &str) -> String {
-    let p = Path::new(path);
-    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-        return name.to_string();
-    }
-    "codex".to_string()
-}
-
-fn apply_pi_session_header(
-    obj: &simd_json::borrowed::Object,
-    session_id: &mut String,
-    project: &mut String,
-) {
-    apply_pi_session_identity(
-        obj.get("id").and_then(|v| v.as_str()),
-        obj.get("cwd").and_then(|v| v.as_str()),
-        session_id,
-        project,
-    );
-}
-
-pub(crate) fn apply_pi_session_identity(
-    id: Option<&str>,
-    cwd: Option<&str>,
-    session_id: &mut String,
-    project: &mut String,
-) {
-    if let Some(id) = id.filter(|id| !id.is_empty()) {
-        *session_id = id.to_string();
-    }
-    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
-        *project = project_from_path(cwd);
-    }
-}
-
-#[derive(Debug, Default)]
-struct CopilotWorkspace {
-    cwd: Option<String>,
-    git_root: Option<String>,
-    repository: Option<String>,
-    branch: Option<String>,
-}
-
 fn parse_copilot_session(
     task: &FileTask,
     tx_record: &RecordSender,
@@ -2529,790 +1029,29 @@ fn parse_copilot_session(
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
 ) -> Result<()> {
-    let file = File::open(&task.path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = task.offset as usize;
-    let mut turn_id = task.turn_id;
-
     let source_path = task.path.to_string_lossy().to_string();
-    let mut session_id =
-        session_id_from_copilot_path(&task.path).unwrap_or_else(|| "unknown".to_string());
-    let mut workspace = read_copilot_workspace(&task.path);
-    let mut project = copilot_project(&workspace);
-    let mut call_id_to_name: HashMap<String, String> = HashMap::new();
-
-    let mut parsed_bytes = 0u64;
-    while start < mmap.len() {
-        let slice = &mmap[start..];
-        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
-        let line = &slice[..rel];
-        let advanced = rel + 1;
-        start += advanced;
-        parsed_bytes += advanced as u64;
-        if parsed_bytes >= 64 * 1024 {
-            progress.add_parsed_bytes(SourceKind::Copilot, parsed_bytes);
-            parsed_bytes = 0;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        let value: serde_json::Value = match serde_json::from_slice(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let Some(obj) = value.as_object() else {
-            continue;
-        };
-        let entry_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let data = obj
-            .get("data")
-            .or_else(|| obj.get("payload"))
-            .unwrap_or(&serde_json::Value::Null);
-        let timestamp = obj
-            .get("timestamp")
-            .and_then(json_timestamp_millis)
-            .or_else(|| data.get("timestamp").and_then(json_timestamp_millis))
-            .unwrap_or(0);
-
-        match entry_type {
-            "session.start" | "session.resume" => {
-                if let Some(id) = data
-                    .get("sessionId")
-                    .or_else(|| data.get("session_id"))
-                    .and_then(|v| v.as_str())
-                {
-                    session_id = id.to_string();
-                }
-                merge_copilot_workspace(&mut workspace, data.get("context").unwrap_or(data));
-                project = copilot_project(&workspace);
-            }
-            "session.context_changed" => {
-                merge_copilot_workspace(&mut workspace, data);
-                project = copilot_project(&workspace);
-            }
-            "user.message" => {
-                let text = data
-                    .get("content")
-                    .or_else(|| data.get("message"))
-                    .or_else(|| data.get("prompt"))
-                    .and_then(text_from_json)
-                    .unwrap_or_default();
-                if text.trim().is_empty() {
-                    continue;
-                }
-                let links = copilot_record_links(obj, data, &session_id, turn_id);
-                let record = Record {
-                    source: SourceKind::Copilot,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                    ts: timestamp,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    role: "user".to_string(),
-                    text,
-                    tool_name: None,
-                    tool_input: None,
-                    tool_output: None,
-                    links,
-                    source_path: source_path.clone(),
-                };
-                progress.add_produced(SourceKind::Copilot, 1);
-                tx_record.send(record)?;
-                turn_id += 1;
-            }
-            "assistant.message" => {
-                let text = data
-                    .get("content")
-                    .and_then(text_from_json)
-                    .unwrap_or_default();
-                if text.trim().is_empty() {
-                    continue;
-                }
-                let links = copilot_record_links(obj, data, &session_id, turn_id);
-                let record = Record {
-                    source: SourceKind::Copilot,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                    ts: timestamp,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    role: "assistant".to_string(),
-                    text,
-                    tool_name: None,
-                    tool_input: None,
-                    tool_output: None,
-                    links,
-                    source_path: source_path.clone(),
-                };
-                progress.add_produced(SourceKind::Copilot, 1);
-                tx_record.send(record)?;
-                turn_id += 1;
-            }
-            "tool.execution_start" | "tool.user_requested" => {
-                let tool_name = data
-                    .get("toolName")
-                    .or_else(|| data.get("name"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                if let Some(call_id) = data.get("toolCallId").and_then(|v| v.as_str())
-                    && let Some(name) = tool_name.clone()
-                {
-                    call_id_to_name.insert(call_id.to_string(), name);
-                }
-                let tool_input = data
-                    .get("arguments")
-                    .map(json_to_text)
-                    .filter(|s| !s.is_empty());
-                let text = tool_input.clone().unwrap_or_default();
-                let mut links = copilot_record_links(obj, data, &session_id, turn_id);
-                if let Some(call_id) = data.get("toolCallId").and_then(|v| v.as_str()) {
-                    links.event_id = Some(call_id.to_string());
-                }
-                let record = Record {
-                    source: SourceKind::Copilot,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                    ts: timestamp,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    role: "tool_use".to_string(),
-                    text,
-                    tool_name,
-                    tool_input,
-                    tool_output: None,
-                    links,
-                    source_path: source_path.clone(),
-                };
-                progress.add_produced(SourceKind::Copilot, 1);
-                tx_record.send(record)?;
-                turn_id += 1;
-            }
-            "tool.execution_complete" => {
-                let call_id = data
-                    .get("toolCallId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let tool_name = data
-                    .get("toolName")
-                    .or_else(|| data.get("name"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| call_id_to_name.get(call_id).cloned());
-                let tool_output = copilot_tool_output(data);
-                let text = tool_output.clone().unwrap_or_default();
-                if text.trim().is_empty() {
-                    continue;
-                }
-                let mut links = copilot_record_links(obj, data, &session_id, turn_id);
-                if !call_id.is_empty() {
-                    links.parent_event_id = Some(call_id.to_string());
-                    links.parent_tool_use_id = Some(call_id.to_string());
-                }
-                let record = Record {
-                    source: SourceKind::Copilot,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                    ts: timestamp,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    role: "tool_result".to_string(),
-                    text,
-                    tool_name,
-                    tool_input: None,
-                    tool_output,
-                    links,
-                    source_path: source_path.clone(),
-                };
-                progress.add_produced(SourceKind::Copilot, 1);
-                tx_record.send(record)?;
-                turn_id += 1;
-            }
-            "session.task_complete" => {
-                let text = data
-                    .get("summary")
-                    .and_then(text_from_json)
-                    .unwrap_or_default();
-                if text.trim().is_empty() {
-                    continue;
-                }
-                let links = copilot_record_links(obj, data, &session_id, turn_id);
-                let record = Record {
-                    source: SourceKind::Copilot,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                    ts: timestamp,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    role: "assistant".to_string(),
-                    text,
-                    tool_name: None,
-                    tool_input: None,
-                    tool_output: None,
-                    links,
-                    source_path: source_path.clone(),
-                };
-                progress.add_produced(SourceKind::Copilot, 1);
-                tx_record.send(record)?;
-                turn_id += 1;
-            }
-            _ => {}
-        }
-    }
-
-    if parsed_bytes > 0 {
-        progress.add_parsed_bytes(SourceKind::Copilot, parsed_bytes);
-    }
-    progress.add_files_done(SourceKind::Copilot, 1);
-    let state = FileState {
-        size: task.size,
-        mtime: task.mtime,
-        offset: mmap.len() as u64,
-        turn_id,
-    };
-    tx_update.send(FileUpdate {
-        path: source_path,
-        state,
-        session_id: Some(session_id),
-    })?;
-    Ok(())
+    let parsed = crate::sources::copilot::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Copilot, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Copilot,
+        source_path,
+        parsed,
+    )
 }
-
-fn read_copilot_workspace(events_path: &Path) -> CopilotWorkspace {
-    let Some(dir) = events_path.parent() else {
-        return CopilotWorkspace::default();
-    };
-    let path = dir.join("workspace.yaml");
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return CopilotWorkspace::default();
-    };
-    parse_copilot_workspace_yaml(&contents)
-}
-
-fn parse_copilot_workspace_yaml(contents: &str) -> CopilotWorkspace {
-    let mut workspace = CopilotWorkspace::default();
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with('#')
-            || line.chars().next().is_some_and(|c| c.is_whitespace())
-        {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let value = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
-        if value.is_empty() {
-            continue;
-        }
-        match key.trim() {
-            "cwd" => workspace.cwd = Some(value),
-            "gitRoot" | "git_root" => workspace.git_root = Some(value),
-            "repository" => workspace.repository = Some(value),
-            "branch" => workspace.branch = Some(value),
-            _ => {}
-        }
-    }
-    workspace
-}
-
-fn merge_copilot_workspace(workspace: &mut CopilotWorkspace, value: &serde_json::Value) {
-    if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
-        workspace.cwd = Some(cwd.to_string());
-    }
-    if let Some(git_root) = value
-        .get("gitRoot")
-        .or_else(|| value.get("git_root"))
-        .and_then(|v| v.as_str())
-    {
-        workspace.git_root = Some(git_root.to_string());
-    }
-    if let Some(repository) = value.get("repository").and_then(|v| v.as_str()) {
-        workspace.repository = Some(repository.to_string());
-    }
-    if let Some(branch) = value.get("branch").and_then(|v| v.as_str()) {
-        workspace.branch = Some(branch.to_string());
-    }
-}
-
-fn copilot_project(workspace: &CopilotWorkspace) -> String {
-    if let Some(repo) = workspace.repository.as_deref() {
-        if let Some((_, name)) = repo.rsplit_once('/')
-            && !name.is_empty()
-        {
-            return name.to_string();
-        }
-        if !repo.is_empty() {
-            return repo.to_string();
-        }
-    }
-    if let Some(git_root) = workspace.git_root.as_deref() {
-        return project_from_path(git_root);
-    }
-    if let Some(cwd) = workspace.cwd.as_deref() {
-        return project_from_path(cwd);
-    }
-    "copilot".to_string()
-}
-
-fn session_id_from_copilot_path(path: &Path) -> Option<String> {
-    path.parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
-fn copilot_record_links(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    data: &serde_json::Value,
-    session_id: &str,
-    turn_id: u32,
-) -> RecordLinks {
-    let parent_session_id = copilot_string_field(data, obj, COPILOT_PARENT_SESSION_KEYS);
-    let explicit_thread_source =
-        copilot_string_field(data, obj, &["threadSource", "thread_source", "source"]);
-    let thread_source = explicit_thread_source.or_else(|| {
-        parent_session_id
-            .as_ref()
-            .filter(|parent| parent.as_str() != session_id)
-            .map(|_| "fork".to_string())
-    });
-    let conversation_kind = match thread_source.as_deref() {
-        Some("subagent") => "subagent",
-        Some("sidechain") => "sidechain",
-        Some("branch") => "branch",
-        Some("fork") => "fork",
-        _ => "main",
-    };
-
-    RecordLinks {
-        event_id: copilot_string_field(data, obj, COPILOT_EVENT_KEYS)
-            .or_else(|| Some(format!("{session_id}:{turn_id}"))),
-        parent_event_id: copilot_string_field(data, obj, COPILOT_PARENT_EVENT_KEYS),
-        logical_parent_event_id: copilot_string_field(data, obj, COPILOT_LOGICAL_PARENT_KEYS),
-        parent_session_id,
-        thread_source,
-        conversation_kind: Some(conversation_kind.to_string()),
-        ..RecordLinks::default()
-    }
-}
-
-const COPILOT_EVENT_KEYS: &[&str] = &[
-    "id",
-    "eventId",
-    "event_id",
-    "messageId",
-    "message_id",
-    "requestId",
-    "request_id",
-    "responseId",
-    "response_id",
-];
-const COPILOT_PARENT_EVENT_KEYS: &[&str] = &[
-    "parentId",
-    "parent_id",
-    "parentMessageId",
-    "parent_message_id",
-    "parentEventId",
-    "parent_event_id",
-];
-const COPILOT_LOGICAL_PARENT_KEYS: &[&str] = &["fromId", "from_id", "rootId", "root_id"];
-const COPILOT_PARENT_SESSION_KEYS: &[&str] = &[
-    "parentSessionId",
-    "parent_session_id",
-    "forkedFromSessionId",
-    "forked_from_session_id",
-];
-
-fn copilot_string_field(
-    data: &serde_json::Value,
-    obj: &serde_json::Map<String, serde_json::Value>,
-    keys: &[&str],
-) -> Option<String> {
-    for key in keys {
-        if let Some(value) = data
-            .get(*key)
-            .or_else(|| obj.get(*key))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn json_timestamp_millis(value: &serde_json::Value) -> Option<u64> {
-    if let Some(text) = value.as_str() {
-        if let Some(ts) = parse_iso_millis(text) {
-            return Some(ts);
-        }
-        return text.parse::<u64>().ok();
-    }
-    if let Some(n) = value.as_u64() {
-        return Some(if n < 10_000_000_000 { n * 1000 } else { n });
-    }
-    None
-}
-
-fn text_from_json(value: &serde_json::Value) -> Option<String> {
-    if let Some(text) = value.as_str() {
-        return Some(text.trim().to_string());
-    }
-    if let Some(arr) = value.as_array() {
-        let mut parts = Vec::new();
-        for item in arr {
-            if let Some(text) = item.as_str() {
-                parts.push(text);
-                continue;
-            }
-            if let Some(obj) = item.as_object()
-                && let Some(text) = obj
-                    .get("text")
-                    .or_else(|| obj.get("content"))
-                    .and_then(|v| v.as_str())
-            {
-                parts.push(text);
-            }
-        }
-        if !parts.is_empty() {
-            return Some(parts.join("\n").trim().to_string());
-        }
-    }
-    None
-}
-
-fn json_to_text(value: &serde_json::Value) -> String {
-    if let Some(text) = text_from_json(value) {
-        return text;
-    }
-    serde_json::to_string(value).unwrap_or_default()
-}
-
-fn copilot_tool_output(data: &serde_json::Value) -> Option<String> {
-    if let Some(result) = data.get("result") {
-        for key in ["detailedContent", "content"] {
-            if let Some(text) = result.get(key).and_then(text_from_json)
-                && !text.trim().is_empty()
-            {
-                return Some(text);
-            }
-        }
-        if let Some(contents) = result.get("contents").and_then(|v| v.as_array()) {
-            let mut parts = Vec::new();
-            for item in contents {
-                if let Some(text) = text_from_json(item) {
-                    parts.push(text);
-                }
-            }
-            if !parts.is_empty() {
-                return Some(parts.join("\n"));
-            }
-        }
-    }
-    if let Some(error) = data.get("error") {
-        if let Some(message) = error.get("message").and_then(|v| v.as_str()) {
-            return Some(message.to_string());
-        }
-        return Some(json_to_text(error));
-    }
-    None
-}
-
-pub(crate) fn project_from_cursor_path(path: &Path) -> String {
-    let root = cursor_projects_root();
-    let Ok(relative) = path.strip_prefix(root) else {
-        return "cursor".to_string();
-    };
-    let Some(project_folder) = relative
-        .components()
-        .next()
-        .and_then(|c| c.as_os_str().to_str())
-    else {
-        return "cursor".to_string();
-    };
-    if project_folder == "empty-window" {
-        return project_folder.to_string();
-    }
-    decode_project_name(project_folder)
-}
-
-pub(crate) fn cursor_session_id_from_path(path: &Path) -> String {
-    let components: Vec<_> = path.components().collect();
-    for (idx, component) in components.iter().enumerate() {
-        if component.as_os_str().to_str() == Some("agent-transcripts")
-            && let Some(session_id) = components
-                .get(idx + 1)
-                .and_then(|c| Path::new(c.as_os_str()).file_stem())
-                .and_then(|s| s.to_str())
-                .filter(|s| !s.is_empty())
-        {
-            return session_id.to_string();
-        }
-    }
-
-    session_id_from_filename(path).unwrap_or_else(|| {
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string()
-    })
-}
-
-fn cursor_initial_turn_id(path: &Path, cached_turn_id: u32) -> u32 {
-    if cached_turn_id != 0 {
-        return cached_turn_id;
-    }
-    cursor_subagent_turn_base(path).unwrap_or(cached_turn_id)
-}
-
-fn cursor_subagent_turn_base(path: &Path) -> Option<u32> {
-    if !path
-        .components()
-        .any(|component| component.as_os_str().to_str() == Some("subagents"))
-    {
-        return None;
-    }
-
-    let agent_id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())?;
-    let bucket = stable_cursor_turn_bucket(agent_id);
-    Some(CURSOR_SUBAGENT_TURN_BASE + bucket.saturating_mul(CURSOR_SUBAGENT_TURN_STRIDE))
-}
-
-fn cursor_is_subagent_transcript(path: &Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str().to_str() == Some("subagents"))
-}
-
-pub(crate) fn cursor_transcript_id(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-fn cursor_record_links(path: &Path, session_id: &str, turn_id: u32) -> RecordLinks {
-    let is_subagent = cursor_is_subagent_transcript(path);
-    RecordLinks {
-        event_id: Some(format!("{}:{turn_id}", cursor_transcript_id(path))),
-        parent_session_id: is_subagent.then(|| session_id.to_string()),
-        thread_source: is_subagent.then(|| "subagent".to_string()),
-        conversation_kind: Some(if is_subagent { "subagent" } else { "main" }.to_string()),
-        ..RecordLinks::default()
-    }
-}
-
-fn stable_cursor_turn_bucket(value: &str) -> u32 {
-    let mut hash = 2_166_136_261u32;
-    for byte in value.as_bytes() {
-        hash ^= *byte as u32;
-        hash = hash.wrapping_mul(16_777_619);
-    }
-    hash % CURSOR_SUBAGENT_TURN_BUCKETS
-}
-
-pub(crate) fn project_from_pi_session_path(path: &Path) -> String {
-    path.parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .map(|name| decode_pi_project_name(pi_session_dir_project_key(name)))
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "pi".to_string())
-}
-
-fn pi_session_dir_project_key(name: &str) -> &str {
-    if name.starts_with("--") && name.ends_with("--") && name.len() > 4 {
-        &name[1..name.len() - 1]
-    } else {
-        name
-    }
-}
-
-fn pi_content_text(content: Option<&BorrowedValue>) -> String {
-    let Some(content) = content else {
-        return String::new();
-    };
-    if let Some(text) = content.as_str() {
-        return text.to_string();
-    }
-    if let Some(arr) = content.as_array() {
-        let mut parts = Vec::new();
-        for item in arr {
-            if let Some(text) = item.as_str() {
-                parts.push(text.to_string());
-                continue;
-            }
-            let Some(obj) = item.as_object() else {
-                continue;
-            };
-            match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-                "text" => {
-                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                        parts.push(text.to_string());
-                    }
-                }
-                "thinking" => {
-                    if let Some(text) = obj.get("thinking").and_then(|v| v.as_str()) {
-                        parts.push(format!("Thinking:\n{text}"));
-                    }
-                }
-                "toolCall" => {}
-                _ => {
-                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                        parts.push(text.to_string());
-                    } else if let Some(text) = obj.get("content").and_then(|v| v.as_str()) {
-                        parts.push(text.to_string());
-                    }
-                }
-            }
-        }
-        return parts.join("\n");
-    }
-    content.to_string()
-}
-
-fn pi_summary_message_text(message: &simd_json::borrowed::Object, role: &str) -> String {
-    let summary = if role == "branchSummary" || role == "compactionSummary" {
-        message.get("summary").and_then(|v| v.as_str())
-    } else {
-        None
-    };
-    summary
-        .map(str::to_string)
-        .unwrap_or_else(|| pi_content_text(message.get("content")))
-        .trim()
-        .to_string()
-}
-
-fn pi_bash_text(command: &str, output: &str, exit_code: Option<i64>) -> String {
-    let mut parts = Vec::new();
-    if !command.is_empty() {
-        parts.push(format!("$ {command}"));
-    }
-    if !output.is_empty() {
-        parts.push(output.to_string());
-    }
-    if let Some(code) = exit_code {
-        parts.push(format!("exit code: {code}"));
-    }
-    parts.join("\n")
-}
-
-fn decode_pi_project_name(folder_name: &str) -> String {
-    let decoded = decode_project_name(folder_name);
-    decoded
-        .rsplit('-')
-        .find(|part| !part.is_empty())
-        .unwrap_or(&decoded)
-        .to_string()
-}
-
-fn decode_project_name(folder_name: &str) -> String {
-    let prefixes_to_strip = ["-home-", "-mnt-c-Users-", "-mnt-c-users-", "-Users-"];
-    let mut name = folder_name;
-    if name.len() > 10 {
-        let bytes = name.as_bytes();
-        if bytes[0] == b'-'
-            && bytes[2] == b'-'
-            && bytes[3] == b'-'
-            && bytes[1].is_ascii_alphabetic()
-            && name[4..].to_lowercase().starts_with("users-")
-        {
-            name = &name[10..];
-        }
-    }
-    for prefix in prefixes_to_strip {
-        if name.to_lowercase().starts_with(&prefix.to_lowercase()) {
-            name = &name[prefix.len()..];
-            break;
-        }
-    }
-    let parts: Vec<&str> = name.split('-').filter(|p| !p.is_empty()).collect();
-    let skip_dirs = [
-        "projects",
-        "code",
-        "repos",
-        "src",
-        "dev",
-        "work",
-        "documents",
-    ];
-    let mut meaningful = Vec::new();
-    let mut found_project = false;
-
-    for (i, part) in parts.iter().enumerate() {
-        if i == 0 && !found_project {
-            let remaining: Vec<String> = parts[i + 1..].iter().map(|p| p.to_lowercase()).collect();
-            if remaining.iter().any(|d| skip_dirs.contains(&d.as_str())) {
-                continue;
-            }
-        }
-        if skip_dirs.contains(&part.to_lowercase().as_str()) {
-            found_project = true;
-            continue;
-        }
-        meaningful.push(*part);
-        found_project = true;
-    }
-    if meaningful.is_empty() {
-        return folder_name.to_string();
-    }
-    meaningful.join("-")
-}
-
-fn extract_text_from_tool_result(block: &simd_json::BorrowedValue) -> Option<String> {
-    let obj = block.as_object()?;
-    let content = obj.get("content")?;
-    if let Some(text) = content.as_str() {
-        return Some(text.to_string());
-    }
-    if let Some(arr) = content.as_array() {
-        let mut parts = Vec::new();
-        for item in arr {
-            if let Some(obj) = item.as_object()
-                && obj.get("type").and_then(|v| v.as_str()) == Some("text")
-                && let Some(text) = obj.get("text").and_then(|v| v.as_str())
-            {
-                parts.push(text);
-            }
-        }
-        if !parts.is_empty() {
-            return Some(parts.join(" "));
-        }
-    }
-    None
-}
-
-fn session_id_from_filename(path: &Path) -> Option<String> {
-    static UUID_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
-            .expect("uuid regex")
-    });
-    let name = path.file_stem()?.to_string_lossy();
-    UUID_RE
-        .captures(&name)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-}
-
-pub(crate) fn pi_session_id_from_path(path: &Path) -> String {
-    session_id_from_filename(path).unwrap_or_else(|| path.to_string_lossy().into_owned())
-}
-
-fn is_system_instruction(text: &str) -> bool {
-    let t = text.trim_start();
-    t.starts_with("<system_instruction>") || t.starts_with("<system-instruction>")
-}
-
 fn flush_embeddings(
     buffer: &mut Vec<(u64, String, SourceKind)>,
     embedder: &mut EmbedderHandle,
@@ -3506,6 +1245,54 @@ mod tests {
             .expect("mark analytics complete");
     }
 
+    fn incremental_task(
+        path: &Path,
+        source: SourceKind,
+        offset: u64,
+        turn_id: u32,
+        pending_tool_calls: HashMap<String, PendingToolCall>,
+    ) -> FileTask {
+        let metadata = path.metadata().expect("transcript metadata");
+        FileTask {
+            path: path.to_path_buf(),
+            source,
+            offset,
+            turn_id,
+            size: metadata.len(),
+            mtime: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0),
+            delete_first: false,
+            parser_version_invalidated: false,
+            pending_tool_calls,
+            identity: file_identity(
+                path,
+                &metadata,
+                metadata.len().min(FILE_IDENTITY_PREFIX_BYTES as u64) as usize,
+            ),
+            parser_version: crate::sources::index_state_version(source),
+        }
+    }
+
+    fn parser_channels() -> (
+        RecordSender,
+        Receiver<Record>,
+        Sender<FileUpdate>,
+        Receiver<FileUpdate>,
+    ) {
+        let (raw_tx_record, rx_record) = unbounded();
+        let (tx_update, rx_update) = unbounded();
+        (
+            RecordSender::new(raw_tx_record, IndexedToolContentLimits::default()),
+            rx_record,
+            tx_update,
+            rx_update,
+        )
+    }
+
     fn record(doc_id: u64, role: &str, text: &str) -> Record {
         Record {
             source: SourceKind::Claude,
@@ -3639,7 +1426,7 @@ mod tests {
         );
 
         assert_eq!(
-            cursor_session_id_from_path(path),
+            crate::sources::cursor::session_id_from_path(path),
             "11111111-1111-1111-1111-111111111111"
         );
     }
@@ -3652,7 +1439,7 @@ mod tests {
         );
 
         assert_eq!(
-            cursor_session_id_from_path(path),
+            crate::sources::cursor::session_id_from_path(path),
             "11111111-1111-1111-1111-111111111111"
         );
     }
@@ -3666,7 +1453,7 @@ mod tests {
         );
 
         assert_eq!(
-            cursor_session_id_from_path(path),
+            crate::sources::cursor::session_id_from_path(path),
             "11111111-1111-1111-1111-111111111111"
         );
     }
@@ -3679,8 +1466,8 @@ mod tests {
              11111111-1111-1111-1111-111111111111.jsonl",
         );
 
-        assert_eq!(cursor_initial_turn_id(path, 0), 0);
-        assert_eq!(cursor_initial_turn_id(path, 42), 42);
+        assert_eq!(crate::sources::cursor::initial_turn_id(path, 0), 0);
+        assert_eq!(crate::sources::cursor::initial_turn_id(path, 42), 42);
     }
 
     #[test]
@@ -3691,9 +1478,12 @@ mod tests {
              22222222-2222-2222-2222-222222222222.jsonl",
         );
 
-        let initial = cursor_initial_turn_id(path, 0);
-        assert!(initial >= CURSOR_SUBAGENT_TURN_BASE);
-        assert_eq!(cursor_initial_turn_id(path, initial + 3), initial + 3);
+        let initial = crate::sources::cursor::initial_turn_id(path, 0);
+        assert!(initial >= 1_000_000_000);
+        assert_eq!(
+            crate::sources::cursor::initial_turn_id(path, initial + 3),
+            initial + 3
+        );
     }
 
     #[test]
@@ -3704,7 +1494,8 @@ mod tests {
              22222222-2222-2222-2222-222222222222.jsonl",
         );
 
-        let links = cursor_record_links(path, "11111111-1111-1111-1111-111111111111", 42);
+        let links =
+            crate::sources::cursor::record_links(path, "11111111-1111-1111-1111-111111111111", 42);
 
         assert_eq!(
             links.event_id.as_deref(),
@@ -3729,7 +1520,9 @@ mod tests {
         )
         .expect("write opencode session");
 
-        let links = opencode_session_links_from_root(tmp.path(), "ses_child");
+        let links = crate::sources::opencode::session_links_by_id_from_root(tmp.path())
+            .remove("ses_child")
+            .expect("child links");
 
         assert_eq!(links.parent_session_id.as_deref(), Some("ses_parent"));
         assert_eq!(links.thread_source.as_deref(), Some("fork"));
@@ -3752,7 +1545,7 @@ mod tests {
         )
         .expect("write main session");
 
-        let links_by_id = opencode_session_links_by_id_from_root(tmp.path());
+        let links_by_id = crate::sources::opencode::session_links_by_id_from_root(tmp.path());
         let child_links = links_by_id.get("ses_child").expect("child links");
         let main_links = links_by_id.get("ses_main").expect("main links");
 
@@ -3779,17 +1572,333 @@ mod tests {
         )
         .expect("write codex session");
 
-        let meta = read_codex_session_meta_until(&path, fs::metadata(&path).unwrap().len())
-            .expect("read codex meta");
+        let meta = crate::sources::codex::probe(&path).expect("read codex meta");
 
-        assert_eq!(meta.session_id, "019e5155-b507-7d83-8c3d-9ecee5f93f12");
-        assert_eq!(meta.project, "project");
         assert_eq!(
-            meta.links.parent_session_id.as_deref(),
+            meta.session.session_id,
+            "019e5155-b507-7d83-8c3d-9ecee5f93f12"
+        );
+        assert_eq!(meta.project.as_deref(), Some("project"));
+        assert_eq!(
+            meta.session.parent_session_id.as_deref(),
             Some("019e5117-c673-7660-b218-af0489416e0f")
         );
-        assert_eq!(meta.links.thread_source.as_deref(), Some("subagent"));
-        assert_eq!(meta.links.conversation_kind.as_deref(), Some("subagent"));
+        assert_eq!(
+            meta.session.conversation_kind,
+            crate::sources::ConversationKind::Subagent
+        );
+    }
+
+    #[test]
+    fn claude_incremental_results_use_persisted_calls_out_of_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("-Users-nico-Code-memex");
+        fs::create_dir_all(&project).expect("project dir");
+        let path = project.join("claude-incremental.jsonl");
+        let calls = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"assistant-1\",\"sessionId\":\"claude-incremental\",\"timestamp\":\"2026-07-20T10:00:00Z\",\"message\":{\"content\":[",
+            "{\"type\":\"tool_use\",\"id\":\"call-a\",\"name\":\"Read\",\"input\":{\"path\":\"a\"}},",
+            "{\"type\":\"tool_use\",\"id\":\"call-b\",\"name\":\"Grep\",\"input\":{\"pattern\":\"b\"}}]}}\n"
+        );
+        let results = concat!(
+            "{\"type\":\"user\",\"uuid\":\"result-b\",\"parentUuid\":\"assistant-1\",\"sessionId\":\"claude-incremental\",\"timestamp\":\"2026-07-20T10:00:01Z\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-b\",\"content\":\"B\"}]}}\n",
+            "{\"type\":\"user\",\"uuid\":\"result-a\",\"parentUuid\":\"result-b\",\"sessionId\":\"claude-incremental\",\"timestamp\":\"2026-07-20T10:00:02Z\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-a\",\"content\":\"A\"}]}}\n"
+        );
+        fs::write(&path, calls).expect("write calls");
+
+        let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
+        let next_doc_id = AtomicU64::new(1);
+        let (tx_record, rx_record, tx_update, rx_update) = parser_channels();
+        let first = incremental_task(&path, SourceKind::Claude, 0, 0, HashMap::new());
+        parse_claude_file(&first, &tx_record, &tx_update, &next_doc_id, &progress)
+            .expect("parse calls");
+        let first_records: Vec<_> = rx_record.try_iter().collect();
+        let first_state = rx_update.try_recv().expect("first state").state;
+        assert_eq!(first_records.len(), 2);
+        assert_eq!(first_state.pending_tool_calls.len(), 2);
+        let pending_a = first_state
+            .pending_tool_calls
+            .get("call-a")
+            .expect("pending call a");
+        assert_eq!(pending_a.tool_name.as_deref(), Some("Read"));
+        assert_eq!(pending_a.tool_use_event_id.as_deref(), Some("call-a"));
+        assert_eq!(pending_a.tool_use_doc_id, Some(first_records[0].doc_id));
+        assert!(pending_a.argument_sha256.is_some());
+        assert!(pending_a.argument_bytes.is_some_and(|bytes| bytes > 0));
+
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append")
+            .write_all(results.as_bytes())
+            .expect("append results");
+        let second = incremental_task(
+            &path,
+            SourceKind::Claude,
+            first_state.offset,
+            first_state.turn_id,
+            first_state.pending_tool_calls,
+        );
+        parse_claude_file(&second, &tx_record, &tx_update, &next_doc_id, &progress)
+            .expect("parse results");
+        let second_records: Vec<_> = rx_record.try_iter().collect();
+        let second_state = rx_update.try_recv().expect("second state").state;
+
+        assert_eq!(second_records.len(), 2);
+        assert_eq!(second_records[0].tool_name.as_deref(), Some("Grep"));
+        assert_eq!(
+            second_records[0].links.parent_tool_use_id.as_deref(),
+            Some("call-b")
+        );
+        assert_eq!(second_records[1].tool_name.as_deref(), Some("Read"));
+        assert_eq!(
+            second_records[1].links.parent_event_id.as_deref(),
+            Some("call-a")
+        );
+        assert!(
+            second_records
+                .iter()
+                .all(|record| record.session_id == "claude-incremental"
+                    && record.source == SourceKind::Claude
+                    && record.source_path == path.to_string_lossy())
+        );
+        assert!(second_state.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn codex_incremental_result_uses_persisted_call_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp
+            .path()
+            .join("rollout-2026-07-20T10-00-00-11111111-1111-4111-8111-111111111111.jsonl");
+        let call = concat!(
+            "{\"timestamp\":\"2026-07-20T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"11111111-1111-4111-8111-111111111111\",\"cwd\":\"/Users/nico/Code/memex\"}}\n",
+            "{\"timestamp\":\"2026-07-20T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"fc-item\",\"call_id\":\"call-1\",\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"}}\n"
+        );
+        let result = "{\"timestamp\":\"2026-07-20T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"/Users/nico/Code/memex\"}}\n";
+        fs::write(&path, call).expect("write call");
+
+        let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
+        let next_doc_id = AtomicU64::new(10);
+        let (tx_record, rx_record, tx_update, rx_update) = parser_channels();
+        let first = incremental_task(&path, SourceKind::CodexSession, 0, 0, HashMap::new());
+        parse_codex_session(&first, &tx_record, &tx_update, &next_doc_id, &progress)
+            .expect("parse call");
+        let call_record = rx_record.try_recv().expect("call record");
+        let first_state = rx_update.try_recv().expect("first state").state;
+        assert_eq!(call_record.tool_name.as_deref(), Some("shell"));
+        assert_eq!(
+            first_state
+                .pending_tool_calls
+                .get("call-1")
+                .and_then(|call| call.tool_use_doc_id),
+            Some(call_record.doc_id)
+        );
+
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append")
+            .write_all(result.as_bytes())
+            .expect("append result");
+        let second = incremental_task(
+            &path,
+            SourceKind::CodexSession,
+            first_state.offset,
+            first_state.turn_id,
+            first_state.pending_tool_calls,
+        );
+        parse_codex_session(&second, &tx_record, &tx_update, &next_doc_id, &progress)
+            .expect("parse result");
+        let result_record = rx_record.try_recv().expect("result record");
+        let second_state = rx_update.try_recv().expect("second state").state;
+
+        assert_eq!(result_record.tool_name.as_deref(), Some("shell"));
+        assert_eq!(
+            result_record.links.parent_tool_use_id.as_deref(),
+            Some("call-1")
+        );
+        assert_eq!(
+            result_record.links.parent_event_id.as_deref(),
+            Some("call-1")
+        );
+        assert_eq!(
+            result_record.session_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(result_record.project, "memex");
+        assert_eq!(result_record.source, SourceKind::CodexSession);
+        assert_eq!(result_record.source_path, path.to_string_lossy());
+        assert!(second_state.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn truncation_and_replacement_clear_stale_pending_calls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("session.jsonl");
+        fs::write(&path, "original transcript with a pending call\n").expect("write original");
+        let metadata = path.metadata().expect("original metadata");
+        let (mut original, _) =
+            prepare_file_task(path.clone(), SourceKind::Claude, &metadata, None);
+        original.pending_tool_calls.insert(
+            "stale".to_string(),
+            PendingToolCall {
+                tool_name: Some("StaleTool".to_string()),
+                ..PendingToolCall::default()
+            },
+        );
+        let prior = completed_file_state(
+            &original,
+            metadata.len(),
+            1,
+            original.pending_tool_calls.clone(),
+        );
+
+        fs::write(&path, "short\n").expect("truncate");
+        let truncated_meta = path.metadata().expect("truncated metadata");
+        let (truncated, skip) = prepare_file_task(
+            path.clone(),
+            SourceKind::Claude,
+            &truncated_meta,
+            Some(&prior),
+        );
+        assert!(!skip);
+        assert!(truncated.delete_first);
+        assert_eq!(truncated.offset, 0);
+        assert!(truncated.pending_tool_calls.is_empty());
+
+        let replacement = tmp.path().join("replacement.jsonl");
+        fs::write(
+            &replacement,
+            "replacement transcript that is longer than the original\n",
+        )
+        .expect("write replacement");
+        fs::rename(&replacement, &path).expect("replace path");
+        let replacement_meta = path.metadata().expect("replacement metadata");
+        let (replaced, skip) =
+            prepare_file_task(path, SourceKind::Claude, &replacement_meta, Some(&prior));
+        assert!(!skip);
+        assert!(replaced.delete_first);
+        assert_eq!(replaced.offset, 0);
+        assert!(replaced.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn short_file_append_preserves_pending_calls_and_offset() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        fs::write(&path, "tool call\n").expect("write call");
+        let metadata = path.metadata().expect("call metadata");
+        let (mut first, _) = prepare_file_task(path.clone(), SourceKind::Claude, &metadata, None);
+        first.pending_tool_calls.insert(
+            "call-1".to_string(),
+            PendingToolCall {
+                tool_name: Some("Read".to_string()),
+                ..PendingToolCall::default()
+            },
+        );
+        let previous =
+            completed_file_state(&first, metadata.len(), 1, first.pending_tool_calls.clone());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append")
+            .write_all(b"tool result\n")
+            .expect("append result");
+        let appended_metadata = path.metadata().expect("appended metadata");
+        let (appended, skip) = prepare_file_task(
+            path,
+            SourceKind::Claude,
+            &appended_metadata,
+            Some(&previous),
+        );
+
+        assert!(!skip);
+        assert!(!appended.delete_first);
+        assert_eq!(appended.offset, metadata.len());
+        assert_eq!(
+            appended
+                .pending_tool_calls
+                .get("call-1")
+                .and_then(|call| call.tool_name.as_deref()),
+            Some("Read")
+        );
+    }
+
+    #[test]
+    fn index_parser_version_change_rebuilds_and_clears_pending_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        fs::write(&path, "{}\n").expect("transcript");
+        let metadata = path.metadata().expect("metadata");
+        let identity = file_identity(
+            &path,
+            &metadata,
+            metadata.len().min(FILE_IDENTITY_PREFIX_BYTES as u64) as usize,
+        );
+        let previous = FileState {
+            size: metadata.len(),
+            mtime: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0),
+            offset: metadata.len(),
+            turn_id: 1,
+            parser_version: crate::sources::index_state_version(SourceKind::Claude)
+                .saturating_sub(1),
+            pending_tool_calls: HashMap::from([(
+                "stale".to_string(),
+                PendingToolCall {
+                    tool_name: Some("Old".to_string()),
+                    ..PendingToolCall::default()
+                },
+            )]),
+            identity,
+        };
+        let (task, skip) = prepare_file_task(path, SourceKind::Claude, &metadata, Some(&previous));
+        assert!(!skip);
+        assert!(task.delete_first);
+        assert!(task.parser_version_invalidated);
+        assert_eq!(task.offset, 0);
+        assert!(task.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parser_version_migration_rebuilds_vectors_with_the_existing_model() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "bge", 384);
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(&transcript, "{}\n").expect("transcript");
+        let mut task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
+        task.parser_version_invalidated = true;
+
+        let migration = vector_migration(&paths.vectors, &[task], ModelChoice::Gemma);
+
+        assert!(migration.rebuild);
+        assert_eq!(migration.model, ModelChoice::BGESmall);
+    }
+
+    #[test]
+    fn ordinary_file_replacement_does_not_rebuild_the_vector_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "bge", 384);
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(&transcript, "{}\n").expect("transcript");
+        let task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
+
+        let migration = vector_migration(&paths.vectors, &[task], ModelChoice::Gemma);
+
+        assert!(!migration.rebuild);
+        assert_eq!(migration.model, ModelChoice::Gemma);
     }
 
     #[test]
@@ -3879,6 +1988,7 @@ mod tests {
             records[3].links.parent_tool_use_id.as_deref(),
             Some("tool-claude")
         );
+        assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
     }
 
     #[test]
@@ -3899,9 +2009,7 @@ mod tests {
         fs::write(&archived, "{}\n").expect("write archived");
         fs::write(&ignored, "{}\n").expect("write ignored");
 
-        let mut files = collect_codex_session_files_from_roots(&[sessions_root, archived_root])
-            .expect("collect codex sessions");
-        files.sort();
+        let files = crate::sources::common::jsonl_files([sessions_root, archived_root]);
 
         assert_eq!(files, vec![archived, live]);
     }
@@ -4080,7 +2188,7 @@ mod tests {
         fs::write(&session, "{}\n").expect("write pi session");
         fs::write(&ignored, "{}\n").expect("write ignored");
 
-        let files = collect_pi_files_from_root(&sessions_root).expect("collect pi files");
+        let files = crate::sources::common::jsonl_files([sessions_root]);
 
         assert_eq!(files, vec![session]);
     }
@@ -4098,7 +2206,7 @@ mod tests {
             ("PI_CODING_AGENT_DIR", None),
         ]);
 
-        assert_eq!(pi_sessions_root(), custom_sessions);
+        assert_eq!(crate::sources::pi::sessions_root(), custom_sessions);
     }
 
     #[test]
@@ -4117,7 +2225,10 @@ mod tests {
             ("PI_CODING_AGENT_DIR", Some(pi_root.as_os_str())),
         ]);
 
-        assert_eq!(pi_sessions_root(), pi_root.join(".pi/sessions"));
+        assert_eq!(
+            crate::sources::pi::sessions_root(),
+            pi_root.join(".pi/sessions")
+        );
     }
 
     #[test]
@@ -4144,10 +2255,13 @@ mod tests {
             .join("--home-alice-code-acme-memex--")
             .join("20260703T010203Z_11111111-1111-1111-1111-111111111111.jsonl");
 
-        assert_eq!(project_from_pi_session_path(&home_path), "memex");
-        assert_eq!(project_from_pi_session_path(&users_path), "memex");
-        assert_eq!(project_from_pi_session_path(&windows_path), "memex");
-        assert_eq!(project_from_pi_session_path(&nested_path), "memex");
+        assert_eq!(crate::sources::pi::project_from_path(&home_path), "memex");
+        assert_eq!(crate::sources::pi::project_from_path(&users_path), "memex");
+        assert_eq!(
+            crate::sources::pi::project_from_path(&windows_path),
+            "memex"
+        );
+        assert_eq!(crate::sources::pi::project_from_path(&nested_path), "memex");
     }
 
     #[test]
@@ -4305,6 +2419,10 @@ mod tests {
             size: (existing.len() + appended.len()) as u64,
             mtime: 0,
             delete_first: false,
+            parser_version_invalidated: false,
+            pending_tool_calls: HashMap::new(),
+            identity: FileIdentity::default(),
+            parser_version: crate::sources::index_state_version(SourceKind::Pi),
         };
         let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
         let next_doc_id = AtomicU64::new(1);
@@ -4331,8 +2449,11 @@ mod tests {
         fs::write(&events, "{}\n").expect("write events");
         fs::write(&ignored, "cwd: /tmp/project\n").expect("write workspace");
 
-        let files = collect_copilot_files_from_root(&tmp.path().join("session-state"))
-            .expect("collect copilot sessions");
+        let files =
+            crate::sources::copilot::discover_sessions_from_root(&tmp.path().join("session-state"))
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>();
 
         assert_eq!(files, vec![events]);
     }
@@ -4369,6 +2490,10 @@ mod tests {
             size: meta.len(),
             mtime: 0,
             delete_first: false,
+            parser_version_invalidated: false,
+            pending_tool_calls: HashMap::new(),
+            identity: FileIdentity::default(),
+            parser_version: crate::sources::index_state_version(SourceKind::Copilot),
         };
         let (raw_tx_record, rx_record) = unbounded();
         let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
@@ -4457,6 +2582,7 @@ mod tests {
         let ctx = WriterContext {
             embeddings: false,
             do_backfill_embeddings: false,
+            reset_vector_store: false,
             vector_dir,
             analytics_path: tmp.path().join("state").join("analytics.sqlite"),
             progress,

@@ -4,23 +4,17 @@
 //! request-level accounting, but they are not authoritative subscription-limit telemetry.
 
 use crate::analytics::ProjectGrouping;
-use crate::types::{SourceFilter, SourceKind};
-use anyhow::{Context, Result};
-use chrono::DateTime;
+use crate::types::SourceFilter;
+use anyhow::Result;
 use clap::ValueEnum;
-use memchr::memmem;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
-use rusqlite::{Connection, OpenFlags, params};
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{Map, Value};
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use walkdir::WalkDir;
 
 #[derive(Clone, Debug, Default)]
 pub struct UsageQuery {
@@ -65,7 +59,7 @@ pub struct TokenBuckets {
 }
 
 impl TokenBuckets {
-    fn additive_total(&self) -> u64 {
+    pub(crate) fn additive_total(&self) -> u64 {
         self.uncached_input
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_write)
@@ -76,7 +70,7 @@ impl TokenBuckets {
         self.additive_total()
     }
 
-    fn codex(input: u64, cached: u64, output: u64, reasoning: u64) -> Self {
+    pub(crate) fn codex(input: u64, cached: u64, output: u64, reasoning: u64) -> Self {
         let cache_read = cached.min(input);
         Self {
             raw_input: input,
@@ -89,7 +83,7 @@ impl TokenBuckets {
         }
     }
 
-    fn disjoint(input: u64, cache_read: u64, cache_write: u64, output: u64) -> Self {
+    pub(crate) fn disjoint(input: u64, cache_read: u64, cache_write: u64, output: u64) -> Self {
         Self {
             raw_input: input,
             uncached_input: input,
@@ -121,9 +115,9 @@ pub struct UsageEvent {
     pub dedupe_confidence: &'static str,
     pub conservative_undercount: bool,
     #[serde(skip)]
-    sidechain: bool,
+    pub(crate) sidechain: bool,
     #[serde(skip)]
-    source_order: u64,
+    pub(crate) source_order: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -529,11 +523,11 @@ fn assemble_usage_events(
     publish_scan_progress(None);
 
     let reconcile_start = Instant::now();
-    reconcile_claude(&mut events);
-    reconcile_codex_copies(&mut events);
-    reconcile_cursor_copies(&mut events);
-    reconcile_copilot_copies(&mut events);
-    reconcile_opencode_copies(&mut events);
+    crate::sources::claude::reconcile_usage(&mut events);
+    crate::sources::codex::reconcile_usage(&mut events);
+    crate::sources::cursor::reconcile_usage(&mut events);
+    crate::sources::copilot::reconcile_usage(&mut events);
+    crate::sources::opencode::reconcile_usage(&mut events);
     usage_timing(reconcile_start, || {
         format!("reconcile ({} events kept)", events.len())
     });
@@ -562,74 +556,6 @@ fn usage_timing(start: Instant, message: impl FnOnce() -> String) {
             start.elapsed().as_millis()
         );
     }
-}
-
-fn home() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"))
-}
-
-fn jsonl_files(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for root in roots {
-        if !root.exists() {
-            continue;
-        }
-        for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
-            let path = entry.path();
-            if entry.file_type().is_file()
-                && path.extension().and_then(|v| v.to_str()) == Some("jsonl")
-            {
-                files.push(path.to_path_buf());
-            }
-        }
-    }
-    files.sort();
-    files.dedup();
-    files
-}
-
-fn lines(path: &Path) -> Result<impl Iterator<Item = (u64, Value)>> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    Ok(BufReader::new(file)
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let line = line.ok()?;
-            serde_json::from_str(&line)
-                .ok()
-                .map(|value| (index as u64, value))
-        }))
-}
-
-fn timestamp_ms(value: &Value) -> u64 {
-    value
-        .as_u64()
-        .map(|n| if n < 10_000_000_000 { n * 1000 } else { n })
-        .or_else(|| value.as_i64().filter(|n| *n >= 0).map(|n| n as u64))
-        .or_else(|| {
-            value
-                .as_str()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.timestamp_millis().max(0) as u64)
-        })
-        .unwrap_or(0)
-}
-
-fn u64_at(value: &Value, aliases: &[&str]) -> u64 {
-    aliases
-        .iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_u64))
-        .unwrap_or(0)
-}
-
-fn str_at(value: &Value, aliases: &[&str]) -> Option<String> {
-    aliases
-        .iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
 }
 
 fn usage_project_matches(
@@ -670,138 +596,6 @@ fn usage_project_key(value: &str) -> String {
     tail.to_string()
 }
 
-#[derive(Deserialize)]
-struct ClaudeUsageLine {
-    #[serde(
-        rename = "type",
-        default,
-        deserialize_with = "deserialize_optional_string"
-    )]
-    kind: Option<String>,
-    message: Option<ClaudeUsageMessage>,
-    // Claude Code 2.1.210+ writes BOTH spellings on one line; a serde `alias` would
-    // reject that as a duplicate field and silently drop the event, so each spelling
-    // gets its own field and they are merged at use sites.
-    #[serde(
-        rename = "sessionId",
-        default,
-        deserialize_with = "deserialize_optional_string"
-    )]
-    session_id_camel: Option<String>,
-    #[serde(
-        rename = "session_id",
-        default,
-        deserialize_with = "deserialize_optional_string"
-    )]
-    session_id_snake: Option<String>,
-    #[serde(
-        rename = "requestId",
-        default,
-        deserialize_with = "deserialize_optional_string"
-    )]
-    request_id_camel: Option<String>,
-    #[serde(
-        rename = "request_id",
-        default,
-        deserialize_with = "deserialize_optional_string"
-    )]
-    request_id_snake: Option<String>,
-    timestamp: Option<Value>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    cwd: Option<String>,
-    #[serde(
-        rename = "costUSD",
-        default,
-        deserialize_with = "deserialize_optional_f64"
-    )]
-    cost_usd: Option<f64>,
-    #[serde(
-        rename = "isSidechain",
-        default,
-        deserialize_with = "deserialize_bool_or_false"
-    )]
-    is_sidechain: bool,
-}
-
-#[derive(Deserialize)]
-struct ClaudeUsageMessage {
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    id: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    model: Option<String>,
-    usage: Option<ClaudeTokenUsage>,
-}
-
-#[derive(Deserialize)]
-struct ClaudeTokenUsage {
-    #[serde(
-        default,
-        alias = "inputTokens",
-        deserialize_with = "deserialize_u64_or_zero"
-    )]
-    input_tokens: u64,
-    #[serde(
-        default,
-        alias = "cacheReadInputTokens",
-        deserialize_with = "deserialize_u64_or_zero"
-    )]
-    cache_read_input_tokens: u64,
-    #[serde(
-        default,
-        alias = "cacheCreationInputTokens",
-        deserialize_with = "deserialize_u64_or_zero"
-    )]
-    cache_creation_input_tokens: u64,
-    #[serde(
-        default,
-        alias = "outputTokens",
-        deserialize_with = "deserialize_u64_or_zero"
-    )]
-    output_tokens: u64,
-    cache_creation: Option<Value>,
-}
-
-fn deserialize_optional_string<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(Value::deserialize(deserializer)?
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(str::to_string))
-}
-
-fn deserialize_optional_f64<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(Value::deserialize(deserializer)?.as_f64())
-}
-
-fn deserialize_bool_or_false<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(Value::deserialize(deserializer)?.as_bool().unwrap_or(false))
-}
-
-fn deserialize_u64_or_zero<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(Value::deserialize(deserializer)?.as_u64().unwrap_or(0))
-}
-
-// Parser versions also cover the cached blob encoding (postcard); bump them when either
-// the per-source parsing or `CachedUsageEvent` changes shape.
-const CLAUDE_PARSER_VERSION: i64 = 4;
-const CODEX_PARSER_VERSION: i64 = 4;
-const PI_PARSER_VERSION: i64 = 2;
-const CURSOR_PARSER_VERSION: i64 = 2;
-const COPILOT_PARSER_VERSION: i64 = 2;
-const OPENCODE_PARSER_VERSION: i64 = 2;
 /// Reuse cached Cursor state databases this long even when their metadata changed: a
 /// running Cursor rewrites its (potentially multi-GB) databases continuously, and
 /// re-reading them on every scan makes live scans unusable.
@@ -921,26 +715,8 @@ struct CachedFileRow {
     deps: Vec<UsageFileDep>,
 }
 
-/// A parse closure's output: the file's events plus whether the result may be persisted.
-/// `cacheable` is false when parsing depended on state outside the file that can change
-/// while the file itself does not — e.g. a codex fork whose parent rollout was not yet on
-/// disk, so its baseline was guessed and must be recomputed once the parent appears.
-struct FileParse {
-    events: Vec<UsageEvent>,
-    cacheable: bool,
-    /// Other files this parse's result depends on; a change to any invalidates the cache.
-    deps: Vec<UsageFileDep>,
-}
-
-impl FileParse {
-    fn cacheable(events: Vec<UsageEvent>) -> Self {
-        Self {
-            events,
-            cacheable: true,
-            deps: Vec::new(),
-        }
-    }
-}
+type FileParse = crate::sources::UsageParseOutput;
+type UsageFileDep = crate::sources::UsageDependency;
 
 struct ParsedUsageFile {
     index: usize,
@@ -1311,37 +1087,18 @@ fn scan_claude(
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
 ) -> Result<()> {
-    let roots = if let Some(config) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        config
-            .to_string_lossy()
-            .split(',')
-            .map(|part| {
-                let path = PathBuf::from(part.trim());
-                if path.file_name().and_then(|n| n.to_str()) == Some("projects") {
-                    path
-                } else {
-                    path.join("projects")
-                }
-            })
-            .collect()
-    } else {
-        vec![
-            home().join(".claude/projects"),
-            home().join(".config/claude/projects"),
-        ]
-    };
-    let files = jsonl_files(roots);
+    let files = crate::sources::claude::usage_files();
     scan_files_cached(
         SourceScan {
             source: "claude",
-            parser_version: CLAUDE_PARSER_VERSION,
+            parser_version: crate::sources::claude::VERSIONS.usage,
             volatile_reuse_ms: |_| None,
         },
         &files,
         cache,
         warnings,
         out,
-        |path| scan_claude_file(path).map(FileParse::cacheable),
+        |path| crate::sources::claude::parse_usage_file(path).map(FileParse::cacheable),
     );
     Ok(())
 }
@@ -1381,789 +1138,30 @@ fn parse_missing_usage_files(
     parsed
 }
 
-/// Stream a file line by line as raw bytes, reusing one buffer. Line indices count every
-/// line in the file so record ids stay stable across parser changes.
-fn for_each_line(path: &Path, mut visit: impl FnMut(u64, &[u8])) -> Result<()> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut reader = BufReader::with_capacity(256 * 1024, file);
-    let mut line = Vec::with_capacity(16 * 1024);
-    let mut index = 0u64;
-    loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            return Ok(());
-        }
-        if line.last() == Some(&b'\n') {
-            line.pop();
-        }
-        visit(index, &line);
-        index += 1;
-    }
-}
-
-fn scan_claude_file(path: &Path) -> Result<Vec<UsageEvent>> {
-    static USAGE_NEEDLE: Lazy<memmem::Finder<'static>> =
-        Lazy::new(|| memmem::Finder::new(b"\"usage\""));
-    let source_path: Arc<str> = Arc::from(path.to_string_lossy());
-    let fallback_session = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .map(str::to_string);
-    let mut events = Vec::new();
-    for_each_line(path, |index, line| {
-        if USAGE_NEEDLE.find(line).is_none() {
-            return;
-        }
-        let Ok(value) = serde_json::from_slice::<ClaudeUsageLine>(line) else {
-            return;
-        };
-        if value.kind.as_deref() != Some("assistant") {
-            return;
-        }
-        let Some(message) = value.message else {
-            return;
-        };
-        let Some(usage) = message.usage else {
-            return;
-        };
-        let cache_write = usage.cache_creation_input_tokens;
-        let mut tokens = TokenBuckets::disjoint(
-            usage.input_tokens,
-            usage.cache_read_input_tokens,
-            cache_write,
-            usage.output_tokens,
-        );
-        tokens.cache_write_1h = usage
-            .cache_creation
-            .as_ref()
-            .and_then(|cache| cache.get("ephemeral_1h_input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default()
-            .min(tokens.cache_write);
-        if tokens.additive_total() == 0 {
-            return;
-        }
-        let session_id = value.session_id_camel.or(value.session_id_snake);
-        let request_id = value.request_id_camel.or(value.request_id_snake);
-        let exact_dedupe = message.id.is_some() && request_id.is_some();
-        events.push(UsageEvent {
-            source: "claude",
-            source_path: source_path.clone(),
-            source_record_id: Some(format!("line:{index}")),
-            session_id: session_id.or_else(|| fallback_session.clone()),
-            request_id,
-            message_id: message.id,
-            timestamp_ms: value.timestamp.as_ref().map(timestamp_ms).unwrap_or(0),
-            project: value.cwd,
-            provider: Some("anthropic".into()),
-            model: message.model,
-            tokens,
-            source_cost_usd: value.cost_usd,
-            dedupe_confidence: if exact_dedupe { "exact" } else { "heuristic" },
-            conservative_undercount: false,
-            sidechain: value.is_sidechain,
-            source_order: index,
-        });
-    })?;
-    Ok(events)
-}
-
-fn reconcile_claude(events: &mut Vec<UsageEvent>) {
-    // Map keys borrow from `events`: both passes only read events and write `keep`, and
-    // assembled scans hold millions of events, so per-event key clones matter.
-    let mut best_exact: HashMap<(&str, &str), usize> = HashMap::new();
-    let mut keep = vec![true; events.len()];
-    for (index, event) in events.iter().enumerate() {
-        if event.source != "claude" {
-            continue;
-        }
-        let (Some(message), Some(request)) =
-            (event.message_id.as_deref(), event.request_id.as_deref())
-        else {
-            continue;
-        };
-        let key = (message, request);
-        if let Some(previous) = best_exact.get(&key).copied() {
-            let winner = choose_claude(&events[previous], event);
-            if winner {
-                keep[index] = false;
-            } else {
-                keep[previous] = false;
-                best_exact.insert(key, index);
-            }
-        } else {
-            best_exact.insert(key, index);
-        }
-    }
-    let mut by_message: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (index, event) in events.iter().enumerate() {
-        if keep[index]
-            && event.source == "claude"
-            && let Some(message) = event.message_id.as_deref()
-        {
-            by_message.entry(message).or_default().push(index);
-        }
-    }
-    for indices in by_message.into_values() {
-        if indices.len() < 2 || !indices.iter().any(|index| !events[*index].sidechain) {
-            continue;
-        }
-        // Message-only matching is a sidechain replay fallback. Keep every distinct parent
-        // request; suppress only sidechain copies of a message present in a parent transcript.
-        for index in indices {
-            if events[index].sidechain {
-                keep[index] = false;
-            }
-        }
-    }
-    let mut index = 0usize;
-    events.retain(|_| {
-        let retain = keep[index];
-        index += 1;
-        retain
-    });
-}
-
-/// True means `a` wins. Prefer parent/non-sidechain, then completeness, then source order.
-fn choose_claude(a: &UsageEvent, b: &UsageEvent) -> bool {
-    if a.sidechain != b.sidechain {
-        return !a.sidechain;
-    }
-    let a_parent = !a.source_path.contains("/subagents/");
-    let b_parent = !b.source_path.contains("/subagents/");
-    if a_parent != b_parent {
-        return a_parent;
-    }
-    let a_total = a.tokens.additive_total();
-    let b_total = b.tokens.additive_total();
-    if a_total != b_total {
-        return a_total > b_total;
-    }
-    a.source_order >= b.source_order
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-struct CodexTokens {
-    input: u64,
-    cached: u64,
-    output: u64,
-    reasoning: u64,
-}
-
-impl CodexTokens {
-    fn from(value: &Value) -> Self {
-        Self {
-            input: u64_at(value, &["input_tokens", "inputTokens", "prompt_tokens"]),
-            cached: u64_at(
-                value,
-                &[
-                    "cached_input_tokens",
-                    "cachedInputTokens",
-                    "cache_read_input_tokens",
-                ],
-            ),
-            output: u64_at(
-                value,
-                &["output_tokens", "outputTokens", "completion_tokens"],
-            ),
-            reasoning: u64_at(
-                value,
-                &[
-                    "reasoning_output_tokens",
-                    "reasoningTokens",
-                    "reasoning_tokens",
-                ],
-            ),
-        }
-    }
-    fn zero(self) -> bool {
-        self.input == 0 && self.cached == 0 && self.output == 0 && self.reasoning == 0
-    }
-    fn add(self, rhs: Self) -> Self {
-        Self {
-            input: self.input.saturating_add(rhs.input),
-            cached: self.cached.saturating_add(rhs.cached),
-            output: self.output.saturating_add(rhs.output),
-            reasoning: self.reasoning.saturating_add(rhs.reasoning),
-        }
-    }
-    fn sub(self, rhs: Self) -> Self {
-        Self {
-            input: self.input.saturating_sub(rhs.input),
-            cached: self.cached.saturating_sub(rhs.cached),
-            output: self.output.saturating_sub(rhs.output),
-            reasoning: self.reasoning.saturating_sub(rhs.reasoning),
-        }
-    }
-    fn min(self, rhs: Self) -> Self {
-        Self {
-            input: self.input.min(rhs.input),
-            cached: self.cached.min(rhs.cached),
-            output: self.output.min(rhs.output),
-            reasoning: self.reasoning.min(rhs.reasoning),
-        }
-    }
-    fn max(self, rhs: Self) -> Self {
-        Self {
-            input: self.input.max(rhs.input),
-            cached: self.cached.max(rhs.cached),
-            output: self.output.max(rhs.output),
-            reasoning: self.reasoning.max(rhs.reasoning),
-        }
-    }
-    fn at_least(self, rhs: Self) -> bool {
-        self.input >= rhs.input
-            && self.cached >= rhs.cached
-            && self.output >= rhs.output
-            && self.reasoning >= rhs.reasoning
-    }
-    fn at_most(self, rhs: Self) -> bool {
-        self.input <= rhs.input
-            && self.cached <= rhs.cached
-            && self.output <= rhs.output
-            && self.reasoning <= rhs.reasoning
-    }
-}
-
-#[derive(Default)]
-struct CodexCounter {
-    counted: CodexTokens,
-    raw_baseline: CodexTokens,
-    watermark: CodexTokens,
-    seen: Vec<CodexTokens>,
-    /// Cumulative totals the fork parent reached before the fork point. Fork files replay
-    /// the parent's history with re-stamped timestamps; any total in this set is a replayed
-    /// snapshot, not new usage, regardless of event order or replay truncation.
-    inherited_seen: HashSet<CodexTokens>,
-    divergent: bool,
-    interleaved: bool,
-}
-
-impl CodexCounter {
-    fn establish_unresolved_fork_baseline(&mut self, total: CodexTokens) {
-        self.raw_baseline = total;
-        self.watermark = self.watermark.max(total);
-        if self.seen.last() != Some(&total) {
-            self.seen.push(total);
-            if self.seen.len() > 64 {
-                self.seen.remove(0);
-            }
-        }
-    }
-
-    /// Seeds the counter from the fork parent's snapshots at-or-before the fork timestamp
-    /// (the CodexBar inherited-baseline policy): new usage counts as growth beyond the
-    /// parent's final pre-fork totals, and every replayed parent snapshot is suppressed.
-    /// `snapshots` may be merged from several parent copies and so need not be ordered; the
-    /// baseline is the component-wise maximum rather than the last element.
-    fn seed_inherited(&mut self, snapshots: &[CodexTokens]) {
-        let Some(baseline) = snapshots.iter().copied().reduce(CodexTokens::max) else {
-            return;
-        };
-        self.inherited_seen.extend(snapshots.iter().copied());
-        self.raw_baseline = baseline;
-        self.watermark = self.watermark.max(baseline);
-    }
-
-    fn account(&mut self, last: Option<CodexTokens>, total: Option<CodexTokens>) -> CodexTokens {
-        if let Some(total) = total {
-            if self.seen.contains(&total) || self.inherited_seen.contains(&total) {
-                return CodexTokens::default();
-            }
-            if !total.at_least(self.watermark) {
-                self.interleaved = true;
-            }
-        }
-        let baseline = self.watermark.max(self.raw_baseline);
-        let delta = match (last, total) {
-            (Some(last), Some(total)) if self.interleaved => {
-                last.min(contained(total, baseline, self.counted))
-            }
-            (None, Some(total)) if self.interleaved => contained(total, baseline, self.counted),
-            (Some(last), Some(total)) => {
-                let total_delta = total.sub(baseline);
-                if !self.divergent && total.at_least(baseline) && total_delta.at_most(last) {
-                    total_delta
-                } else {
-                    last
-                }
-            }
-            (None, Some(total)) if self.divergent => contained(total, baseline, self.counted),
-            (None, Some(total)) => total.sub(baseline),
-            (Some(last), None) => last,
-            (None, None) => return CodexTokens::default(),
-        };
-        self.counted = self.counted.add(delta);
-        if let Some(total) = total {
-            self.raw_baseline = total;
-            self.divergent |= total != self.counted;
-            self.watermark = self.watermark.max(total);
-            if self.seen.last() != Some(&total) {
-                self.seen.push(total);
-                if self.seen.len() > 64 {
-                    self.seen.remove(0);
-                }
-            }
-        } else {
-            self.raw_baseline = self.counted;
-            self.watermark = self.watermark.max(self.counted);
-        }
-        delta
-    }
-}
-
-fn contained(current: CodexTokens, watermark: CodexTokens, counted: CodexTokens) -> CodexTokens {
-    fn one(current: u64, watermark: u64, counted: u64) -> u64 {
-        if current >= watermark {
-            current.saturating_sub(watermark.max(counted))
-        } else {
-            current.saturating_sub(counted)
-        }
-    }
-    CodexTokens {
-        input: one(current.input, watermark.input, counted.input),
-        cached: one(current.cached, watermark.cached, counted.cached),
-        output: one(current.output, watermark.output, counted.output),
-        reasoning: one(current.reasoning, watermark.reasoning, counted.reasoning),
-    }
-}
-
-/// A file whose content a cached parse depended on, recorded so the cached result can be
-/// invalidated when that file changes. Used for codex fork children, whose baseline comes
-/// from a separate parent rollout that can change (be synced, extended) without the child
-/// file changing.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
-struct UsageFileDep {
-    path: String,
-    size: u64,
-    mtime_ns: i64,
-}
-
-impl UsageFileDep {
-    /// True if the file still matches the recorded size and mtime. A vanished or changed
-    /// dependency invalidates the cached parse that depended on it.
-    fn is_current(&self) -> bool {
-        usage_file_metadata(Path::new(&self.path))
-            .map(|(size, mtime_ns)| size == self.size && mtime_ns == self.mtime_ns)
-            .unwrap_or(false)
-    }
-}
-
-struct CodexParentData {
-    /// Every rollout file carrying this session id; a child depends on all of them so a
-    /// change to any copy re-parses it.
-    deps: Vec<UsageFileDep>,
-    /// Snapshots merged across all copies. Order is not meaningful — callers filter by
-    /// timestamp and treat the set as a suppression set plus a component-wise-max baseline.
-    snapshots: Vec<(u64, CodexTokens)>,
-}
-
-/// Resolves a forked session's parent rollout files and the parent's cumulative token
-/// totals, so fork children can inherit a baseline instead of recounting replayed history.
-/// The same session id can appear in more than one file (active plus archived, or across
-/// comma-separated CODEX_HOME roots); snapshots are merged across every copy so a child
-/// never inherits a truncated baseline from an arbitrary one, and every copy's metadata
-/// travels with the resolution so a child re-parses when any of them changes.
-type CodexParentSlot = Option<Arc<CodexParentData>>;
-
-struct CodexParentIndex {
-    by_session: HashMap<String, Vec<PathBuf>>,
-    parents: Mutex<HashMap<String, CodexParentSlot>>,
-}
-
-impl CodexParentIndex {
-    fn new(files: &[PathBuf]) -> Self {
-        let mut by_session: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        for path in files {
-            if let Some(session) = codex_session_uuid_from_stem(path) {
-                by_session.entry(session).or_default().push(path.clone());
-            }
-        }
-        Self {
-            by_session,
-            parents: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn load(&self, parent: &str) -> CodexParentSlot {
-        if let Some(slot) = self.parents.lock().unwrap().get(parent) {
-            return slot.clone();
-        }
-        let loaded = self.by_session.get(parent).and_then(|paths| {
-            let mut deps = Vec::new();
-            let mut snapshots = Vec::new();
-            for path in paths {
-                let Ok((size, mtime_ns)) = usage_file_metadata(path) else {
-                    continue;
-                };
-                let Ok(file_snapshots) = codex_total_snapshots(path) else {
-                    continue;
-                };
-                deps.push(UsageFileDep {
-                    path: path.to_string_lossy().to_string(),
-                    size,
-                    mtime_ns,
-                });
-                snapshots.extend(file_snapshots);
-            }
-            (!deps.is_empty()).then(|| Arc::new(CodexParentData { deps, snapshots }))
-        });
-        self.parents
-            .lock()
-            .unwrap()
-            .entry(parent.to_string())
-            .or_insert(loaded)
-            .clone()
-    }
-
-    /// True if the current set of parent copies still matches the copies recorded when a fork
-    /// child was cached. A child's `deps` are the parent rollout copies present at resolution
-    /// time; if a fuller copy later appears at a new path (an archive lands, another
-    /// CODEX_HOME root syncs), the merged baseline changes even though every recorded copy is
-    /// unchanged, so the child must re-parse. Non-fork rows have no deps and are always valid.
-    fn deps_match_current_candidates(&self, deps: &[UsageFileDep]) -> bool {
-        let Some(first) = deps.first() else {
-            return true;
-        };
-        let Some(session) = codex_session_uuid_from_stem(Path::new(&first.path)) else {
-            return true;
-        };
-        let current: HashSet<&str> = self
-            .by_session
-            .get(&session)
-            .map(|paths| paths.iter().filter_map(|path| path.to_str()).collect())
-            .unwrap_or_default();
-        let recorded: HashSet<&str> = deps.iter().map(|dep| dep.path.as_str()).collect();
-        current == recorded
-    }
-
-    /// Parent snapshots recorded at-or-before `cutoff_ms` paired with the dependency
-    /// fingerprints of every parent copy. `None` means the parent is unknown or had no usage
-    /// before the fork, so the caller falls back to the unresolved-fork baseline and does not
-    /// cache.
-    fn resolve(
-        &self,
-        parent: &str,
-        cutoff_ms: u64,
-    ) -> Option<(Vec<UsageFileDep>, Vec<CodexTokens>)> {
-        let data = self.load(parent)?;
-        let totals: Vec<CodexTokens> = data
-            .snapshots
-            .iter()
-            .filter(|(ts, _)| *ts <= cutoff_ms)
-            .map(|(_, totals)| *totals)
-            .collect();
-        if totals.is_empty() {
-            return None;
-        }
-        Some((data.deps.clone(), totals))
-    }
-}
-
-/// Codex records a fork/subagent parent either as a flat `forked_from_id` or nested under
-/// `source.subagent.thread_spawn.parent_thread_id`. Matches `apply_codex_session_meta` in
-/// `ingest.rs` so both shapes are treated as forks.
-fn codex_parent_session_id(payload: &Value) -> Option<String> {
-    str_at(
-        payload,
-        &["forked_from_id", "parent_session_id", "parentSessionId"],
-    )
-    .or_else(|| {
-        payload
-            .pointer("/source/subagent/thread_spawn/parent_thread_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    })
-}
-
-fn codex_session_uuid_from_stem(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    if stem.len() < 36 {
-        return None;
-    }
-    let candidate = &stem[stem.len() - 36..];
-    let uuid_shaped = candidate.bytes().enumerate().all(|(i, b)| {
-        if matches!(i, 8 | 13 | 18 | 23) {
-            b == b'-'
-        } else {
-            b.is_ascii_hexdigit()
-        }
-    });
-    uuid_shaped.then(|| candidate.to_string())
-}
-
-/// Extracts every (timestamp, total_token_usage) snapshot from a rollout file.
-fn codex_total_snapshots(path: &Path) -> Result<Vec<(u64, CodexTokens)>> {
-    static TOKEN_COUNT_NEEDLE: Lazy<memmem::Finder<'static>> =
-        Lazy::new(|| memmem::Finder::new(b"token_count"));
-    let mut snapshots = Vec::new();
-    for_each_line(path, |_, line| {
-        if TOKEN_COUNT_NEEDLE.find(line).is_none() {
-            return;
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(line) else {
-            return;
-        };
-        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
-            return;
-        }
-        let payload = value.get("payload").unwrap_or(&Value::Null);
-        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
-            return;
-        }
-        let info = payload.get("info").unwrap_or(payload);
-        let Some(total) = info
-            .get("total_token_usage")
-            .map(CodexTokens::from)
-            .filter(|total| !total.zero())
-        else {
-            return;
-        };
-        let ts = value.get("timestamp").map(timestamp_ms).unwrap_or(0);
-        snapshots.push((ts, total));
-    })?;
-    Ok(snapshots)
-}
-
 fn scan_codex(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
 ) -> Result<()> {
-    let homes: Vec<PathBuf> = std::env::var_os("CODEX_HOME")
-        .map(|v| {
-            v.to_string_lossy()
-                .split(',')
-                .map(|s| PathBuf::from(s.trim()))
-                .collect()
-        })
-        .unwrap_or_else(|| vec![home().join(".codex")]);
-    let mut files = Vec::new();
-    for root in homes {
-        let active = root.join("sessions");
-        let archived = root.join("archived_sessions");
-        if active.exists() || archived.exists() {
-            files.extend(jsonl_files([active, archived]));
-        } else {
-            files.extend(jsonl_files([root]));
-        }
-    }
-    let parents = CodexParentIndex::new(&files);
+    let files = crate::sources::codex::discover_rollouts()
+        .into_iter()
+        .map(|file| file.path)
+        .collect::<Vec<_>>();
+    let parents = crate::sources::codex::UsageParentIndex::new(&files);
     scan_files_cached_with(
         SourceScan {
             source: "codex",
-            parser_version: CODEX_PARSER_VERSION,
+            parser_version: crate::sources::codex::VERSIONS.usage,
             volatile_reuse_ms: |_| None,
         },
         &files,
         cache,
         warnings,
         out,
-        |path| scan_codex_file(path, &parents),
+        |path| crate::sources::codex::parse_usage_file(path, &parents),
         |deps| parents.deps_match_current_candidates(deps),
     );
     Ok(())
-}
-
-/// Matches every line kind `scan_codex_file` can consume; other lines (the vast majority:
-/// prompts, tool output, reasoning) are skipped without a JSON parse.
-static CODEX_LINE_NEEDLES: Lazy<Vec<memmem::Finder<'static>>> = Lazy::new(|| {
-    [
-        &b"token_count"[..],
-        b"turn_context",
-        b"session_meta",
-        b"task_started",
-        b"\"usage\"",
-    ]
-    .into_iter()
-    .map(memmem::Finder::new)
-    .collect()
-});
-
-fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<FileParse> {
-    let source_path: Arc<str> = Arc::from(path.to_string_lossy());
-    let mut session = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .map(str::to_string);
-    let mut parent = None;
-    let mut fork_timestamp_ms = None;
-    let mut fork_resolved = false;
-    let mut parent_deps: Vec<UsageFileDep> = Vec::new();
-    let mut project = None;
-    let mut model = None;
-    let mut turn = None;
-    let mut counter = CodexCounter::default();
-    let mut event_index = 0u64;
-    let mut unresolved_fork_baseline_seen = false;
-    let mut out = Vec::new();
-    for_each_line(path, |line_index, line| {
-        if !CODEX_LINE_NEEDLES
-            .iter()
-            .any(|needle| needle.find(line).is_some())
-        {
-            return;
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(line) else {
-            return;
-        };
-        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-        let payload = value.get("payload").unwrap_or(&Value::Null);
-        match kind {
-            "session_meta" => {
-                session = str_at(payload, &["id", "session_id"]).or_else(|| session.take());
-                parent = codex_parent_session_id(payload);
-                if parent.is_some() {
-                    fork_timestamp_ms = value.get("timestamp").map(timestamp_ms);
-                }
-                if let (Some(parent_id), Some(fork_ms)) = (&parent, fork_timestamp_ms)
-                    && let Some((deps, inherited)) = parents.resolve(parent_id, fork_ms)
-                {
-                    counter.seed_inherited(&inherited);
-                    // The parent baseline is resolved; the first post-fork event is a
-                    // real turn and must not be swallowed as a baseline guess.
-                    unresolved_fork_baseline_seen = true;
-                    fork_resolved = true;
-                    parent_deps = deps;
-                }
-                project = str_at(payload, &["cwd"]);
-            }
-            "turn_context" => model = str_at(payload, &["model", "model_name"]),
-            "event_msg" if payload.get("type").and_then(Value::as_str) == Some("task_started") => {
-                turn = str_at(payload, &["turn_id", "turnId"])
-            }
-            "event_msg" if payload.get("type").and_then(Value::as_str) == Some("token_count") => {
-                let info = payload.get("info").unwrap_or(payload);
-                let last = info
-                    .get("last_token_usage")
-                    .map(CodexTokens::from)
-                    .filter(|v| !v.zero());
-                let total = info
-                    .get("total_token_usage")
-                    .map(CodexTokens::from)
-                    .filter(|v| !v.zero());
-                let event_timestamp_ms = value.get("timestamp").map(timestamp_ms).unwrap_or(0);
-                if parent.is_some()
-                    && fork_timestamp_ms.is_some_and(|fork| event_timestamp_ms <= fork)
-                {
-                    if let Some(total) = total {
-                        counter.establish_unresolved_fork_baseline(total);
-                        unresolved_fork_baseline_seen = true;
-                    }
-                    return;
-                }
-                if parent.is_some()
-                    && !unresolved_fork_baseline_seen
-                    && let Some(total) = total
-                {
-                    counter.establish_unresolved_fork_baseline(total);
-                    unresolved_fork_baseline_seen = true;
-                    return;
-                }
-                let delta = counter.account(last, total);
-                if delta.zero() {
-                    return;
-                }
-                out.push(UsageEvent {
-                    source: "codex",
-                    source_path: source_path.clone(),
-                    source_record_id: Some(format!("event:{event_index}")),
-                    session_id: session.clone(),
-                    request_id: turn.clone(),
-                    message_id: None,
-                    timestamp_ms: event_timestamp_ms,
-                    project: project.clone(),
-                    provider: Some("openai".into()),
-                    model: model
-                        .clone()
-                        .or_else(|| str_at(info, &["model", "model_name"])),
-                    tokens: TokenBuckets::codex(
-                        delta.input,
-                        delta.cached,
-                        delta.output,
-                        delta.reasoning,
-                    ),
-                    source_cost_usd: None,
-                    dedupe_confidence: "strong",
-                    conservative_undercount: counter.interleaved
-                        || (parent.is_some() && !fork_resolved),
-                    sidechain: false,
-                    source_order: line_index,
-                });
-                event_index += 1;
-            }
-            _ => {
-                if let Some(usage) = value
-                    .get("usage")
-                    .or_else(|| value.pointer("/data/usage"))
-                    .or_else(|| value.pointer("/result/usage"))
-                    .or_else(|| value.pointer("/response/usage"))
-                {
-                    let tokens = CodexTokens::from(usage);
-                    if tokens.zero() {
-                        return;
-                    }
-                    out.push(UsageEvent {
-                        source: "codex",
-                        source_path: source_path.clone(),
-                        source_record_id: Some(format!("line:{line_index}")),
-                        session_id: session.clone(),
-                        request_id: None,
-                        message_id: None,
-                        timestamp_ms: value
-                            .get("timestamp")
-                            .or_else(|| value.get("created_at"))
-                            .map(timestamp_ms)
-                            .unwrap_or(0),
-                        project: project.clone(),
-                        provider: Some("openai".into()),
-                        model: model
-                            .clone()
-                            .or_else(|| str_at(&value, &["model", "model_name"])),
-                        tokens: TokenBuckets::codex(
-                            tokens.input,
-                            tokens.cached,
-                            tokens.output,
-                            tokens.reasoning,
-                        ),
-                        source_cost_usd: None,
-                        dedupe_confidence: "strong",
-                        conservative_undercount: false,
-                        sidechain: false,
-                        source_order: line_index,
-                    });
-                }
-            }
-        }
-    })?;
-    // A fork whose parent rollout was not on disk this scan was counted with a guessed
-    // baseline; persisting it would freeze that guess even after the parent appears, so the
-    // result is provisional and must be recomputed on the next scan.
-    let cacheable = parent.is_none() || fork_resolved;
-    // A resolved fork depends on the parent rollout's content: if any parent copy is later
-    // synced further or extended, the cached child must be re-parsed so its baseline
-    // reflects the fuller parent instead of a partial prefix.
-    Ok(FileParse {
-        events: out,
-        cacheable,
-        deps: parent_deps,
-    })
-}
-
-fn reconcile_codex_copies(events: &mut Vec<UsageEvent>) {
-    let mut seen = HashSet::new();
-    events.retain(|event| {
-        if event.source != "codex" {
-            return true;
-        }
-        let Some(session) = &event.session_id else {
-            return true;
-        };
-        let Some(record) = &event.source_record_id else {
-            return true;
-        };
-        seen.insert((session.clone(), record.clone(), event.tokens.clone()))
-    });
 }
 
 fn scan_pi(
@@ -2171,131 +1169,23 @@ fn scan_pi(
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
 ) -> Result<()> {
-    let files = jsonl_files([crate::ingest::pi_sessions_root()]);
+    let files = crate::sources::pi::discover()
+        .into_iter()
+        .map(|file| file.path)
+        .collect::<Vec<_>>();
     scan_files_cached(
         SourceScan {
             source: "pi",
-            parser_version: PI_PARSER_VERSION,
+            parser_version: crate::sources::pi::VERSIONS.usage,
             volatile_reuse_ms: |_| None,
         },
         &files,
         cache,
         warnings,
         out,
-        |path| scan_pi_file(path).map(FileParse::cacheable),
+        |path| crate::sources::pi::parse_usage_file(path).map(FileParse::cacheable),
     );
     Ok(())
-}
-
-fn scan_pi_file(path: &Path) -> Result<Vec<UsageEvent>> {
-    let mut out = Vec::new();
-    {
-        let source_path: Arc<str> = Arc::from(path.to_string_lossy());
-        let mut session = crate::ingest::pi_session_id_from_path(path);
-        let mut project = crate::ingest::project_from_pi_session_path(path);
-        let mut current_model = None;
-        let mut current_provider = None;
-        for (index, value) in lines(path)? {
-            if value.get("type").and_then(Value::as_str) == Some("session") {
-                crate::ingest::apply_pi_session_identity(
-                    value.get("id").and_then(Value::as_str),
-                    value.get("cwd").and_then(Value::as_str),
-                    &mut session,
-                    &mut project,
-                );
-                continue;
-            }
-            if value.get("type").and_then(Value::as_str) == Some("model_change") {
-                current_model = str_at(&value, &["modelId", "model", "model_id"]);
-                current_provider = str_at(&value, &["provider", "providerId", "provider_id"]);
-                continue;
-            }
-            if value.get("type").and_then(Value::as_str) != Some("message") {
-                continue;
-            }
-            let Some(message) = value.get("message") else {
-                continue;
-            };
-            if message.get("role").and_then(Value::as_str) != Some("assistant") {
-                continue;
-            }
-            let Some(usage) = message.get("usage") else {
-                continue;
-            };
-            let tokens = TokenBuckets::disjoint(
-                u64_at(
-                    usage,
-                    &[
-                        "input",
-                        "inputTokens",
-                        "input_tokens",
-                        "promptTokens",
-                        "prompt_tokens",
-                    ],
-                ),
-                u64_at(
-                    usage,
-                    &[
-                        "cacheRead",
-                        "cacheReadTokens",
-                        "cache_read",
-                        "cache_read_tokens",
-                        "cacheReadInputTokens",
-                        "cache_read_input_tokens",
-                    ],
-                ),
-                u64_at(
-                    usage,
-                    &[
-                        "cacheWrite",
-                        "cacheWriteTokens",
-                        "cache_write",
-                        "cache_write_tokens",
-                        "cacheCreationTokens",
-                        "cache_creation_tokens",
-                        "cacheCreationInputTokens",
-                        "cache_creation_input_tokens",
-                    ],
-                ),
-                u64_at(
-                    usage,
-                    &[
-                        "output",
-                        "outputTokens",
-                        "output_tokens",
-                        "completionTokens",
-                        "completion_tokens",
-                    ],
-                ),
-            );
-            if tokens.additive_total() == 0 {
-                continue;
-            }
-            out.push(UsageEvent {
-                source: "pi",
-                source_path: source_path.clone(),
-                source_record_id: Some(format!("line:{index}")),
-                session_id: Some(session.clone()),
-                request_id: None,
-                message_id: str_at(&value, &["id"]),
-                timestamp_ms: value.get("timestamp").map(timestamp_ms).unwrap_or(0),
-                project: Some(project.clone()),
-                provider: str_at(message, &["provider"])
-                    .or_else(|| str_at(&value, &["provider"]))
-                    .or_else(|| current_provider.clone()),
-                model: str_at(message, &["model", "modelId"])
-                    .or_else(|| str_at(&value, &["model", "modelId"]))
-                    .or_else(|| current_model.clone()),
-                tokens,
-                source_cost_usd: usage.pointer("/cost/total").and_then(Value::as_f64),
-                dedupe_confidence: "exact",
-                conservative_undercount: false,
-                sidechain: false,
-                source_order: index,
-            });
-        }
-    }
-    Ok(out)
 }
 
 fn scan_opencode(
@@ -2303,50 +1193,11 @@ fn scan_opencode(
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
 ) -> Result<()> {
-    let roots: Vec<PathBuf> = std::env::var_os("OPENCODE_DATA_DIR")
-        .map(|v| {
-            v.to_string_lossy()
-                .split(',')
-                .map(|s| PathBuf::from(s.trim()))
-                .collect()
-        })
-        .unwrap_or_else(|| vec![home().join(".local/share/opencode")]);
-    // Databases come before message files so `reconcile_opencode_copies` keeps the
-    // database copy of a message, matching the pre-cache suppression order.
-    let mut files = Vec::new();
-    for root in &roots {
-        let mut databases = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(root) {
-            databases.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
-                path.extension().and_then(|v| v.to_str()) == Some("db")
-                    && path
-                        .file_name()
-                        .and_then(|v| v.to_str())
-                        .is_some_and(|n| n.starts_with("opencode"))
-            }));
-        }
-        databases.sort();
-        files.extend(databases);
-    }
-    for root in &roots {
-        let message_root = root.join("storage/message");
-        if message_root.exists() {
-            files.extend(
-                WalkDir::new(message_root)
-                    .into_iter()
-                    .flatten()
-                    .filter(|e| {
-                        e.file_type().is_file()
-                            && e.path().extension().and_then(|v| v.to_str()) == Some("json")
-                    })
-                    .map(|e| e.path().to_path_buf()),
-            );
-        }
-    }
+    let files = crate::sources::opencode::usage_files();
     scan_files_cached(
         SourceScan {
             source: "opencode",
-            parser_version: OPENCODE_PARSER_VERSION,
+            parser_version: crate::sources::opencode::VERSIONS.usage,
             // Only the databases are volatile; message JSON files are updated in place
             // while a response streams and must re-parse as soon as they change.
             volatile_reuse_ms: |path| {
@@ -2358,138 +1209,9 @@ fn scan_opencode(
         cache,
         warnings,
         out,
-        |path| {
-            if path.extension().and_then(|v| v.to_str()) == Some("db") {
-                scan_opencode_db(path)
-            } else {
-                scan_opencode_message_file(path)
-            }
-            .map(FileParse::cacheable)
-        },
+        |path| crate::sources::opencode::parse_usage_file(path).map(FileParse::cacheable),
     );
     Ok(())
-}
-
-/// A message can exist both in an OpenCode database and as a JSON file under
-/// `storage/message` (and in databases from several roots). Keep the first copy in scan
-/// order, which lists databases first.
-fn reconcile_opencode_copies(events: &mut Vec<UsageEvent>) {
-    let mut seen = HashSet::new();
-    events.retain(|event| {
-        if event.source != "opencode" {
-            return true;
-        }
-        let Some(record) = &event.source_record_id else {
-            return true;
-        };
-        seen.insert(record.clone())
-    });
-}
-
-fn scan_opencode_message_file(path: &Path) -> Result<Vec<UsageEvent>> {
-    let mut out = Vec::new();
-    let value: Value = match File::open(path)
-        .ok()
-        .and_then(|file| serde_json::from_reader(file).ok())
-    {
-        Some(value) => value,
-        None => return Ok(out),
-    };
-    let id = str_at(&value, &["id"]).or_else(|| {
-        path.file_stem()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-    });
-    push_opencode_event(&value, path, id, &mut out);
-    Ok(out)
-}
-
-fn scan_opencode_db(path: &Path) -> Result<Vec<UsageEvent>> {
-    let mut out = Vec::new();
-    let mut ids = HashSet::new();
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    conn.busy_timeout(Duration::from_secs(1))?;
-    let mut stmt = conn.prepare("SELECT id, session_id, data FROM message")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (id, session, data) = row?;
-        let Ok(mut value) = serde_json::from_str::<Value>(&data) else {
-            continue;
-        };
-        if value.get("sessionID").is_none()
-            && let Some(object) = value.as_object_mut()
-        {
-            object.insert(
-                "sessionID".into(),
-                session.map(Value::String).unwrap_or(Value::Null),
-            );
-        }
-        let before = out.len();
-        if !ids.contains(&id) {
-            push_opencode_event(&value, path, Some(id.clone()), &mut out);
-        }
-        if out.len() > before {
-            ids.insert(id);
-        }
-    }
-    Ok(out)
-}
-
-fn push_opencode_event(value: &Value, path: &Path, id: Option<String>, out: &mut Vec<UsageEvent>) {
-    let Some(usage) = value.get("tokens") else {
-        return;
-    };
-    let reasoning = u64_at(usage, &["reasoning"]);
-    let mut tokens = TokenBuckets::disjoint(
-        u64_at(usage, &["input"]),
-        usage
-            .pointer("/cache/read")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        usage
-            .pointer("/cache/write")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        u64_at(usage, &["output"]).saturating_add(reasoning),
-    );
-    // OpenCode persists reasoning separately from output. Fold it into the
-    // additive output bucket while retaining the detail field for reporting.
-    tokens.reasoning = reasoning;
-    if tokens.additive_total() == 0 {
-        return;
-    }
-    out.push(UsageEvent {
-        source: "opencode",
-        source_path: Arc::from(path.to_string_lossy()),
-        source_record_id: id.clone(),
-        session_id: str_at(value, &["sessionID", "session_id"]),
-        request_id: None,
-        message_id: id,
-        timestamp_ms: value
-            .pointer("/time/created")
-            .map(timestamp_ms)
-            .unwrap_or(0),
-        // Ingestion currently groups all OpenCode sessions under this
-        // synthetic project, so usage must use the same attribution.
-        project: Some(SourceKind::Opencode.label().to_string()),
-        provider: str_at(value, &["providerID", "provider"]),
-        model: str_at(value, &["modelID", "model"]),
-        tokens,
-        source_cost_usd: value.get("cost").and_then(Value::as_f64),
-        dedupe_confidence: "exact",
-        conservative_undercount: false,
-        sidechain: false,
-        source_order: 0,
-    });
 }
 
 fn scan_cursor(
@@ -2497,246 +1219,25 @@ fn scan_cursor(
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
 ) -> Result<()> {
-    let user = if cfg!(target_os = "macos") {
-        home().join("Library/Application Support/Cursor/User")
-    } else {
-        home().join(".config/Cursor/User")
-    };
-    let mut databases = vec![user.join("globalStorage/state.vscdb")];
-    databases.extend(
-        WalkDir::new(user.join("workspaceStorage"))
-            .max_depth(3)
-            .into_iter()
-            .flatten()
-            .filter(|e| e.file_type().is_file() && e.file_name() == "state.vscdb")
-            .map(|e| e.path().to_path_buf()),
-    );
-    let databases: Vec<PathBuf> = databases.into_iter().filter(|path| path.exists()).collect();
+    let databases = crate::sources::cursor::usage_databases();
     let start = out.len();
     scan_files_cached(
         SourceScan {
             source: "cursor",
-            parser_version: CURSOR_PARSER_VERSION,
+            parser_version: crate::sources::cursor::VERSIONS.usage,
             volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
         },
         &databases,
         cache,
         warnings,
         out,
-        |path| scan_cursor_db(path).map(FileParse::cacheable),
+        |path| crate::sources::cursor::parse_usage_database(path).map(FileParse::cacheable),
     );
-    apply_cursor_projects(&mut out[start..], &cursor_project_by_session());
+    crate::sources::cursor::apply_projects(
+        &mut out[start..],
+        &crate::sources::cursor::project_by_session(),
+    );
     Ok(())
-}
-
-/// Project attribution comes from `.cursor/projects` transcripts, which change independently
-/// of the database files the cache is keyed on. Derive it fresh on every scan (cached rows
-/// included) so a transcript that is indexed or moved after a database was cached still
-/// updates attribution.
-fn apply_cursor_projects(events: &mut [UsageEvent], project_by_session: &HashMap<String, String>) {
-    for event in events {
-        event.project = event
-            .session_id
-            .as_deref()
-            .and_then(|session_id| project_by_session.get(session_id))
-            .cloned();
-    }
-}
-
-/// Cursor generations can appear in both the global and a workspace database. Keep the
-/// first copy in database order, mirroring the shared `seen` set the scanners used before
-/// results were cached per database.
-fn reconcile_cursor_copies(events: &mut Vec<UsageEvent>) {
-    let mut seen = HashSet::new();
-    events.retain(|event| {
-        if event.source != "cursor" {
-            return true;
-        }
-        let Some(record) = &event.source_record_id else {
-            return true;
-        };
-        seen.insert((record.clone(), event.tokens.raw_input, event.tokens.output))
-    });
-}
-
-fn cursor_project_by_session() -> HashMap<String, String> {
-    let root = crate::ingest::cursor_projects_root();
-    let mut projects = HashMap::new();
-    for entry in WalkDir::new(root).into_iter().flatten().filter(|entry| {
-        entry.file_type().is_file()
-            && entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-    }) {
-        let path = entry.path();
-        let project = crate::ingest::project_from_cursor_path(path);
-        projects.insert(
-            crate::ingest::cursor_session_id_from_path(path),
-            project.clone(),
-        );
-        projects.insert(crate::ingest::cursor_transcript_id(path), project);
-    }
-    projects
-}
-
-fn scan_cursor_db(path: &Path) -> Result<Vec<UsageEvent>> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    conn.busy_timeout(Duration::from_secs(1))?;
-    for (table, query) in [
-        (
-            "cursorDiskKV",
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' OR key LIKE 'bubbleId:%'",
-        ),
-        (
-            "ItemTable",
-            "SELECT key, value FROM ItemTable WHERE key IN ('aiService.generations', 'workbench.panel.aichat.view.aichat.chatdata')",
-        ),
-    ] {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-            [table],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            continue;
-        }
-        let mut stmt = conn.prepare(query)?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?;
-        for row in rows {
-            let (key, raw) = row?;
-            let Some(raw) = raw else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-                continue;
-            };
-            extract_cursor_objects(&value, &key, table, path, &mut out, &mut seen);
-        }
-    }
-    Ok(out)
-}
-
-fn extract_cursor_objects(
-    value: &Value,
-    fallback_id: &str,
-    table: &str,
-    path: &Path,
-    out: &mut Vec<UsageEvent>,
-    seen: &mut HashSet<String>,
-) {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                extract_cursor_objects(value, fallback_id, table, path, out, seen);
-            }
-        }
-        Value::Object(object) => {
-            let input = nested_u64(object, &["inputTokens", "input_tokens"]);
-            let output = nested_u64(object, &["outputTokens", "output_tokens"]);
-            let session_id = object_string(object, &["sessionId", "composerId"]).or_else(|| {
-                fallback_id
-                    .strip_prefix("composerData:")
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string)
-            });
-            let counted = input > 0 || output > 0;
-            if counted {
-                let id = object_string(
-                    object,
-                    &["generationUUID", "generationId", "bubbleId", "id"],
-                )
-                .unwrap_or_else(|| {
-                    format!(
-                        "{fallback_id}:{}:{}",
-                        object.get("createdAt").unwrap_or(&Value::Null),
-                        input + output
-                    )
-                });
-                let dedupe = format!("{id}:{input}:{output}");
-                if seen.insert(dedupe) {
-                    out.push(UsageEvent {
-                        source: "cursor",
-                        source_path: Arc::from(path.to_string_lossy()),
-                        source_record_id: Some(id),
-                        session_id,
-                        request_id: None,
-                        message_id: None,
-                        timestamp_ms: object
-                            .get("createdAt")
-                            .or_else(|| object.get("timestamp"))
-                            .map(timestamp_ms)
-                            .unwrap_or(0),
-                        // Derived per scan by `apply_cursor_projects`; never cached.
-                        project: None,
-                        provider: None,
-                        model: object_string(object, &["model", "modelName"])
-                            .or_else(|| {
-                                object
-                                    .get("modelInfo")
-                                    .and_then(|v| str_at(v, &["modelName"]))
-                            })
-                            .or_else(|| {
-                                object
-                                    .get("modelConfig")
-                                    .and_then(|v| str_at(v, &["modelName"]))
-                            }),
-                        tokens: TokenBuckets::disjoint(input, 0, 0, output),
-                        source_cost_usd: None,
-                        dedupe_confidence: if table == "cursorDiskKV" {
-                            "exact"
-                        } else {
-                            "strong"
-                        },
-                        conservative_undercount: false,
-                        sidechain: false,
-                        source_order: 0,
-                    });
-                }
-            }
-            for (key, child) in object {
-                if counted && matches!(key.as_str(), "usage" | "tokenCount") {
-                    continue;
-                }
-                if child.is_array() || child.is_object() {
-                    extract_cursor_objects(child, fallback_id, table, path, out, seen);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn nested_u64(object: &Map<String, Value>, aliases: &[&str]) -> u64 {
-    aliases
-        .iter()
-        .find_map(|key| object.get(*key).and_then(Value::as_u64))
-        .or_else(|| {
-            object.get("tokenCount").and_then(|v| {
-                aliases
-                    .iter()
-                    .find_map(|key| v.get(*key).and_then(Value::as_u64))
-            })
-        })
-        .or_else(|| {
-            object.get("usage").and_then(|v| {
-                aliases
-                    .iter()
-                    .find_map(|key| v.get(*key).and_then(Value::as_u64))
-            })
-        })
-        .unwrap_or(0)
-}
-
-fn object_string(object: &Map<String, Value>, aliases: &[&str]) -> Option<String> {
-    aliases
-        .iter()
-        .find_map(|key| object.get(*key).and_then(Value::as_str))
-        .map(str::to_string)
 }
 
 fn scan_copilot(
@@ -2744,209 +1245,20 @@ fn scan_copilot(
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
 ) -> Result<()> {
-    let mut roots = vec![home().join(".copilot/otel")];
-    if let Some(path) = std::env::var_os("COPILOT_OTEL_FILE_EXPORTER_PATH") {
-        roots.push(PathBuf::from(path));
-    }
-    let files = roots
-        .into_iter()
-        .flat_map(|root| {
-            if root.is_file() {
-                vec![root]
-            } else {
-                jsonl_files([root])
-            }
-        })
-        .collect::<Vec<_>>();
+    let files = crate::sources::copilot::usage_files();
     scan_files_cached(
         SourceScan {
             source: "copilot",
-            parser_version: COPILOT_PARSER_VERSION,
+            parser_version: crate::sources::copilot::VERSIONS.usage,
             volatile_reuse_ms: |_| None,
         },
         &files,
         cache,
         warnings,
         out,
-        |path| scan_copilot_file(path).map(FileParse::cacheable),
+        |path| crate::sources::copilot::parse_usage_file(path).map(FileParse::cacheable),
     );
     Ok(())
-}
-
-fn scan_copilot_file(path: &Path) -> Result<Vec<UsageEvent>> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for (index, value) in lines(path)? {
-        extract_otel(&value, path, index, &mut out, &mut seen);
-    }
-    Ok(out)
-}
-
-/// OTel spans can repeat across exporter files (same trace/span or response id). Keep the
-/// first copy in file order, mirroring the shared `seen` set the scanner used before
-/// results were cached per file.
-fn reconcile_copilot_copies(events: &mut Vec<UsageEvent>) {
-    let mut seen = HashSet::new();
-    events.retain(|event| {
-        if event.source != "copilot" {
-            return true;
-        }
-        let Some(record) = &event.source_record_id else {
-            return true;
-        };
-        seen.insert(record.clone())
-    });
-}
-
-fn extract_otel(
-    value: &Value,
-    path: &Path,
-    index: u64,
-    out: &mut Vec<UsageEvent>,
-    seen: &mut HashSet<String>,
-) {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                extract_otel(value, path, index, out, seen);
-            }
-        }
-        Value::Object(object) => {
-            let attrs = otel_attributes(object.get("attributes").unwrap_or(value));
-            let operation = attrs
-                .get("gen_ai.operation.name")
-                .and_then(Value::as_str)
-                .or_else(|| object.get("name").and_then(Value::as_str));
-            let input = attrs
-                .get("gen_ai.usage.input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let output = attrs
-                .get("gen_ai.usage.output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if operation == Some("chat") && (input > 0 || output > 0) {
-                let trace = object
-                    .get("traceId")
-                    .or_else(|| object.get("trace_id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let span = object
-                    .get("spanId")
-                    .or_else(|| object.get("span_id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let response = attrs
-                    .get("gen_ai.response.id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let id = if !trace.is_empty() || !span.is_empty() {
-                    format!("{trace}:{span}")
-                } else if !response.is_empty() {
-                    format!("response:{response}")
-                } else {
-                    format!("{}:{index}:{input}:{output}", path.display())
-                };
-                if seen.insert(id.clone()) {
-                    let cache = attrs
-                        .get("gen_ai.usage.cache_read.input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        .min(input);
-                    out.push(UsageEvent {
-                        source: "copilot",
-                        source_path: Arc::from(path.to_string_lossy()),
-                        source_record_id: Some(id),
-                        session_id: attrs
-                            .get("gen_ai.conversation.id")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        request_id: attrs
-                            .get("gen_ai.response.id")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        message_id: None,
-                        timestamp_ms: object
-                            .get("startTimeUnixNano")
-                            .and_then(Value::as_str)
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .map(|v| v / 1_000_000)
-                            .or_else(|| object.get("timestamp").map(timestamp_ms))
-                            .unwrap_or(0),
-                        project: attrs
-                            .get("copilot_chat.repo.remote_url")
-                            .or_else(|| attrs.get("github.copilot.git.repository"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        provider: Some("github-copilot".into()),
-                        model: attrs
-                            .get("gen_ai.response.model")
-                            .or_else(|| attrs.get("gen_ai.request.model"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        tokens: TokenBuckets::codex(
-                            input,
-                            cache,
-                            output,
-                            attrs
-                                .get("gen_ai.usage.reasoning.output_tokens")
-                                .or_else(|| attrs.get("gen_ai.usage.reasoning_tokens"))
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                        ),
-                        source_cost_usd: None,
-                        dedupe_confidence: "exact",
-                        conservative_undercount: false,
-                        sidechain: false,
-                        source_order: index,
-                    });
-                }
-            }
-            for child in object.values() {
-                if child.is_array() || child.is_object() {
-                    extract_otel(child, path, index, out, seen);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn otel_attributes(value: &Value) -> HashMap<String, Value> {
-    if let Some(object) = value.as_object() {
-        return object
-            .iter()
-            .map(|(k, v)| (k.clone(), unwrap_otel_value(v)))
-            .collect();
-    }
-    let mut out = HashMap::new();
-    if let Some(array) = value.as_array() {
-        for item in array {
-            if let (Some(key), Some(value)) =
-                (item.get("key").and_then(Value::as_str), item.get("value"))
-            {
-                out.insert(key.to_string(), unwrap_otel_value(value));
-            }
-        }
-    }
-    out
-}
-
-fn unwrap_otel_value(value: &Value) -> Value {
-    for key in ["stringValue", "intValue", "doubleValue", "boolValue"] {
-        if let Some(inner) = value.get(key) {
-            if key == "intValue"
-                && let Some(text) = inner.as_str()
-            {
-                return text
-                    .parse::<u64>()
-                    .map(Value::from)
-                    .unwrap_or_else(|_| inner.clone());
-            }
-            return inner.clone();
-        }
-    }
-    value.clone()
 }
 
 // Rates are nano-USD per million tokens. The catalog is deliberately small and versioned:
@@ -3091,41 +1403,40 @@ fn claude_rates(input: u64, write_5m: u64, write_1h: u64, read: u64, output: u64
 mod tests {
     use super::*;
 
-    fn c(input: u64, cached: u64, output: u64) -> CodexTokens {
-        CodexTokens {
-            input,
-            cached,
-            output,
-            reasoning: 0,
-        }
-    }
-
     #[test]
-    fn codex_repeated_total_does_not_repeat_last() {
-        let mut counter = CodexCounter::default();
-        assert_eq!(
-            counter.account(Some(c(100, 20, 10)), Some(c(100, 20, 10))),
-            c(100, 20, 10)
-        );
-        assert_eq!(
-            counter.account(Some(c(100, 20, 10)), Some(c(100, 20, 10))),
-            c(0, 0, 0)
-        );
-    }
+    fn usage_parser_version_change_invalidates_cached_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&path).expect("open cache");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('claude', '/tmp/session.jsonl', 1, 10, 20, 30, ?1, ?2)",
+                params![
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                    postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()
+                ],
+            )
+            .expect("seed stale cache row");
 
-    #[test]
-    fn codex_interleaved_stream_never_recounts_high_water_gap() {
-        let mut counter = CodexCounter::default();
-        assert_eq!(counter.account(None, Some(c(1000, 0, 0))), c(1000, 0, 0));
-        assert_eq!(
-            counter.account(Some(c(200, 0, 0)), Some(c(200, 0, 0))),
-            c(0, 0, 0)
+        assert!(
+            cache
+                .load_source("claude", 2)
+                .expect("load new parser version")
+                .is_empty()
         );
-        assert_eq!(
-            counter.account(Some(c(900, 0, 0)), Some(c(1100, 0, 0))),
-            c(100, 0, 0)
-        );
-        assert_eq!(counter.counted.input, 1100);
+        let rows: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]
@@ -3450,7 +1761,8 @@ mod tests {
         )
         .expect("write transcript");
 
-        let events = scan_claude_file(&transcript).expect("scan transcript");
+        let events =
+            crate::sources::claude::parse_usage_file(&transcript).expect("scan transcript");
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id.as_deref(), Some("ses-1"));
@@ -3484,7 +1796,7 @@ mod tests {
 
         let parsed =
             parse_missing_usage_files("claude", &missing, &mut warnings, &|path: &Path| {
-                scan_claude_file(path).map(FileParse::cacheable)
+                crate::sources::claude::parse_usage_file(path).map(FileParse::cacheable)
             });
 
         assert_eq!(parsed.len(), 1);
@@ -4064,33 +2376,6 @@ mod tests {
     }
 
     #[test]
-    fn opencode_reasoning_is_included_in_output_and_total() {
-        let value = serde_json::json!({
-            "path": { "cwd": "/repo/memex" },
-            "tokens": {
-                "input": 100,
-                "output": 20,
-                "reasoning": 30,
-                "cache": { "read": 40, "write": 10 }
-            }
-        });
-        let mut events = Vec::new();
-
-        push_opencode_event(
-            &value,
-            Path::new("message.json"),
-            Some("message".into()),
-            &mut events,
-        );
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].tokens.reasoning, 30);
-        assert_eq!(events[0].tokens.output, 50);
-        assert_eq!(events[0].tokens.total(), 200);
-        assert_eq!(events[0].project.as_deref(), Some("opencode"));
-    }
-
-    #[test]
     fn opencode_project_filter_matches_indexed_project() {
         use crate::test_support::{EnvVarGuard, env_lock};
 
@@ -4141,57 +2426,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_nested_token_containers_are_not_recounted() {
-        let value = serde_json::json!([
-            {
-                "generationUUID": "usage-parent",
-                "composerId": "composer-main",
-                "usage": { "inputTokens": 10, "outputTokens": 5 },
-                "children": [
-                    {
-                        "generationId": "nested-request",
-                        "inputTokens": 7,
-                        "outputTokens": 3
-                    }
-                ]
-            },
-            {
-                "generationUUID": "count-parent",
-                "tokenCount": { "input_tokens": 20, "output_tokens": 8 }
-            }
-        ]);
-        let mut events = Vec::new();
-        let mut seen = HashSet::new();
-        let project_by_session =
-            HashMap::from([("composer-main".to_string(), "memex".to_string())]);
-
-        extract_cursor_objects(
-            &value,
-            "fixture",
-            "cursorDiskKV",
-            Path::new("state.vscdb"),
-            &mut events,
-            &mut seen,
-        );
-        apply_cursor_projects(&mut events, &project_by_session);
-
-        assert_eq!(events.len(), 3);
-        let ids: HashSet<_> = events
-            .iter()
-            .filter_map(|event| event.source_record_id.as_deref())
-            .collect();
-        assert_eq!(
-            ids,
-            HashSet::from(["usage-parent", "nested-request", "count-parent"])
-        );
-        assert_eq!(
-            events.iter().map(|event| event.tokens.total()).sum::<u64>(),
-            53
-        );
-        assert_eq!(events[0].project.as_deref(), Some("memex"));
-    }
-
-    #[test]
     fn cursor_project_mapping_is_recomputed_on_cache_hits() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("state.vscdb");
@@ -4212,17 +2446,17 @@ mod tests {
             scan_files_cached(
                 SourceScan {
                     source: "cursor",
-                    parser_version: CURSOR_PARSER_VERSION,
+                    parser_version: crate::sources::cursor::VERSIONS.usage,
                     volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
                 },
                 &files,
                 Some(&mut cache),
                 &mut warnings,
                 &mut events,
-                |path| scan_cursor_db(path).map(FileParse::cacheable),
+                |path| crate::sources::cursor::parse_usage_database(path).map(FileParse::cacheable),
             );
             assert_eq!(warnings, Vec::<String>::new());
-            apply_cursor_projects(&mut events, project_by_session);
+            crate::sources::cursor::apply_projects(&mut events, project_by_session);
             events
         };
 
