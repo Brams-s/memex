@@ -43,7 +43,7 @@ INSERT INTO sessions(
     cache_read_tokens, cache_write_tokens, reasoning_tokens, cwd,
     billing_provider, estimated_cost_usd, actual_cost_usd
 ) VALUES (
-    'hermes-session', 'cli', 'gpt-5.2', 1783000000.0, 1783000009.0,
+    'hermes-session', 'cli', 'gpt-5.2', 1783000000.0, NULL,
     100, 50, 20, 5, 10, '/workspace/demo', 'openai', 0.04, 0.03
 );
 

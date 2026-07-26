@@ -16,7 +16,7 @@ use std::time::Duration;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
-    index: 1,
+    index: 2,
     usage: 1,
 };
 
@@ -609,7 +609,11 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
         "SELECT id, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
          FROM sessions
          ORDER BY started_at, id",
-        expression("ended_at", "started_at"),
+        if columns.contains("ended_at") {
+            "COALESCE(ended_at, started_at)".to_string()
+        } else {
+            "started_at".to_string()
+        },
         expression("cwd", "NULL"),
         expression("billing_provider", "NULL"),
         expression("model", "NULL"),
@@ -732,6 +736,7 @@ mod tests {
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].tokens.total(), 175);
         assert_eq!(usage[0].source_cost_usd, Some(0.03));
+        assert_eq!(usage[0].timestamp_ms, 1_783_000_000_000);
     }
 
     #[test]

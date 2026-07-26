@@ -105,6 +105,11 @@ fn file_identity(path: &Path, metadata: &std::fs::Metadata, prefix_bytes: usize)
         inode: None,
         prefix_sha256,
         prefix_bytes: prefix_bytes as u64,
+        created_ns: metadata
+            .created()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64),
         modified_ns: metadata
             .modified()
             .ok()
@@ -113,7 +118,7 @@ fn file_identity(path: &Path, metadata: &std::fs::Metadata, prefix_bytes: usize)
     }
 }
 
-fn file_was_replaced(previous: &FileIdentity, current: &FileIdentity) -> bool {
+fn stable_file_identity_changed(previous: &FileIdentity, current: &FileIdentity) -> bool {
     previous
         .device
         .zip(previous.inode)
@@ -121,6 +126,14 @@ fn file_was_replaced(previous: &FileIdentity, current: &FileIdentity) -> bool {
         .is_some_and(|((old_device, old_inode), (new_device, new_inode))| {
             old_device != new_device || old_inode != new_inode
         })
+        || previous
+            .created_ns
+            .zip(current.created_ns)
+            .is_some_and(|(old_created_ns, new_created_ns)| old_created_ns != new_created_ns)
+}
+
+fn file_was_replaced(previous: &FileIdentity, current: &FileIdentity) -> bool {
+    stable_file_identity_changed(previous, current)
         || previous
             .prefix_sha256
             .as_ref()
@@ -230,16 +243,8 @@ fn prepare_hermes_task(
         task.pending_tool_calls.clear();
         return (task, false);
     };
-    let inode_changed = previous
-        .identity
-        .device
-        .zip(previous.identity.inode)
-        .zip(task.identity.device.zip(task.identity.inode))
-        .is_some_and(|((old_device, old_inode), (new_device, new_inode))| {
-            old_device != new_device || old_inode != new_inode
-        });
     let invalidated = task.parser_version_invalidated
-        || inode_changed
+        || stable_file_identity_changed(&previous.identity, &task.identity)
         || checkpoint.max_message_id < previous.offset
         || checkpoint.generation != previous.source_generation;
     if invalidated {
@@ -2255,6 +2260,24 @@ mod tests {
         assert!(rewound.delete_first);
         assert_eq!(rewound.offset, 0);
         assert!(rewound.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn hermes_replacement_uses_creation_time_without_device_or_inode() {
+        let previous = FileIdentity {
+            device: None,
+            inode: None,
+            created_ns: Some(100),
+            ..FileIdentity::default()
+        };
+        let replacement = FileIdentity {
+            device: None,
+            inode: None,
+            created_ns: Some(200),
+            ..FileIdentity::default()
+        };
+
+        assert!(stable_file_identity_changed(&previous, &replacement));
     }
 
     #[test]
