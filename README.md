@@ -155,6 +155,53 @@ Human output:
 memex search "your query" -v
 ```
 
+## Multiple machines over SSH
+
+Each machine keeps and updates its own index. The coordinating memex queries configured
+machines concurrently over SSH, merges their rankings, and keeps the originating machine
+attached to every result. The TUI uses the same backend for search, history previews,
+sharing, token charts, and interactive resume.
+
+Install a protocol-compatible memex binary on each machine and configure SSH normally in
+`~/.ssh/config`. Then add machines to `~/.memex/config.toml`:
+
+```toml
+[multi_machine]
+default = ["local", "mini"]
+timeout_seconds = 10
+
+[[machines]]
+id = "mini"
+label = "Mac mini"
+
+[machines.control]
+type = "ssh"
+host = "mini" # SSH config alias
+
+[machines.index]
+type = "remote"
+```
+
+The `ssh = "mini"` field is a shorthand for the `machines.control` table. Set
+`command = "/path/to/memex"` when `memex` is not on the non-interactive SSH `PATH`.
+SSH keys, users, ports, jump hosts, and host-key policy remain in `~/.ssh/config`.
+
+```sh
+memex search "tantivy corruption"             # configured defaults
+memex search "tantivy corruption" --machine mini
+memex usage --machine local --machine mini
+```
+
+Unavailable machines produce partial results with a warning. Remote token usage requires
+`token_usage = true` in that machine's memex config. The index backend is intentionally
+separate from the control transport so an immutable S3 split backend can replace
+`type = "remote"` later while SSH continues to handle indexing and resume.
+
+In the TUI, use the `machines` dropdown (or press `m` while the session list is focused)
+to select the configured default set, `local`, or one remote machine. The machine, source,
+project, and query filters are shared by the session results and token chart; the range
+dropdown bounds the chart.
+
 ## Token usage
 
 Token tracking is disabled by default because it scans and caches local agent logs. Enable it in `~/.memex/config.toml`:

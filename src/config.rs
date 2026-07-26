@@ -1,7 +1,7 @@
 use crate::embed::{EmbedRuntimeConfig, ExecutionProviderChoice, ModelChoice};
 use anyhow::{Result, anyhow};
 use directories::BaseDirs;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -64,7 +64,7 @@ impl Default for IndexedToolContentLimits {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct UserConfig {
     pub embeddings: Option<bool>,
     pub auto_index_on_search: Option<bool>,
@@ -123,6 +123,81 @@ pub struct UserConfig {
     pub pi_resume_cmd: Option<String>,
     /// Resume command template for GitHub Copilot CLI sessions.
     pub copilot_resume_cmd: Option<String>,
+    /// Multi-machine search and control defaults.
+    #[serde(default)]
+    pub multi_machine: MultiMachineConfig,
+    /// Other machines whose indexes can be queried through a backend.
+    #[serde(default)]
+    pub machines: Vec<MachineConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MultiMachineConfig {
+    /// Machines searched when --machine is not supplied. "local" is the current machine.
+    #[serde(default)]
+    pub default: Vec<String>,
+    /// Per-machine SSH request timeout.
+    pub timeout_seconds: Option<u64>,
+}
+
+impl MultiMachineConfig {
+    pub fn timeout_seconds(&self) -> u64 {
+        self.timeout_seconds.unwrap_or(10).max(1)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MachineConfig {
+    pub id: String,
+    pub label: Option<String>,
+    /// Backwards-compatible shorthand for an SSH control transport.
+    pub ssh: Option<String>,
+    /// Executable used by the SSH RPC command. Defaults to "memex".
+    pub command: Option<String>,
+    pub enabled: Option<bool>,
+    pub control: Option<ControlConfig>,
+    pub index: Option<IndexBackendConfig>,
+}
+
+impl MachineConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn ssh_target(&self) -> Option<&str> {
+        self.control
+            .as_ref()
+            .filter(|control| control.kind == "ssh")
+            .map(|control| control.host.as_str())
+            .or(self.ssh.as_deref())
+    }
+
+    pub fn command(&self) -> &str {
+        self.command.as_deref().unwrap_or("memex")
+    }
+
+    pub fn uses_remote_index(&self) -> bool {
+        self.index
+            .as_ref()
+            .map(|index| index.kind == "remote")
+            .unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ControlConfig {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub host: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IndexBackendConfig {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub bucket: Option<String>,
+    pub prefix: Option<String>,
+    pub cache: Option<PathBuf>,
 }
 
 impl UserConfig {
@@ -292,6 +367,34 @@ mod tests {
     #[test]
     fn token_usage_is_disabled_by_default() {
         assert!(!UserConfig::default().token_usage_enabled());
+    }
+
+    #[test]
+    fn parses_ssh_machine_backend_configuration() {
+        let config: UserConfig = toml::from_str(
+            r#"
+                [multi_machine]
+                default = ["local", "mini"]
+                timeout_seconds = 7
+
+                [[machines]]
+                id = "mini"
+                label = "Mac mini"
+
+                [machines.control]
+                type = "ssh"
+                host = "mini.local"
+
+                [machines.index]
+                type = "remote"
+            "#,
+        )
+        .expect("parse config");
+
+        assert_eq!(config.multi_machine.default, ["local", "mini"]);
+        assert_eq!(config.multi_machine.timeout_seconds(), 7);
+        assert_eq!(config.machines[0].ssh_target(), Some("mini.local"));
+        assert!(config.machines[0].uses_remote_index());
     }
 
     #[test]

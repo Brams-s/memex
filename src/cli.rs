@@ -4,6 +4,9 @@ use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt, LeaseHolder};
+use crate::machine::{
+    LocatedRecord, SearchMode, SearchSpec, UsageSpec, federated_search, federated_usage,
+};
 use crate::transfer::{
     TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
     transfer_session,
@@ -157,7 +160,7 @@ TIMESTAMP FORMAT:
     Unix milliseconds: 1705315800000
 
 OUTPUT FIELDS (--fields):
-    score, ts, doc_id, project, role, session_id, source, source_path, text, snippet, matches
+    machine, score, ts, doc_id, project, role, session_id, source, source_path, text, snippet, matches
     event_id, parent_event_id, logical_parent_event_id, parent_session_id, thread_source, conversation_kind
     parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
     Search {
@@ -223,6 +226,9 @@ OUTPUT FIELDS (--fields):
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Machine to search (repeatable). Defaults to multi_machine.default or all configured machines.
+        #[arg(long, value_name = "ID")]
+        machine: Vec<String>,
     },
     /// Interactive terminal UI for browsing sessions
     Tui {
@@ -288,6 +294,9 @@ EXAMPLES:
         /// Cost source: stored source cost, automatic fallback, or API-rate repricing
         #[arg(long, value_enum, default_value = "auto")]
         cost: CostMode,
+        /// Machine to include (repeatable). Defaults to multi_machine.default or all configured machines.
+        #[arg(long, value_name = "ID")]
+        machine: Vec<String>,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -363,6 +372,13 @@ EXAMPLES:
         /// Generate the intermediate transcript without importing into the target
         #[arg(long)]
         dry_run: bool,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Internal versioned RPC endpoint used by remote memex clients
+    #[command(hide = true)]
+    Rpc {
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -461,7 +477,10 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     // Bare `memex` opens the TUI home screen.
     let command = cli.command.unwrap_or(Commands::Tui { root: None });
-    let should_check = !matches!(command, Commands::Tui { .. } | Commands::Update { .. });
+    let should_check = !matches!(
+        command,
+        Commands::Tui { .. } | Commands::Update { .. } | Commands::Rpc { .. }
+    );
     if should_check {
         check_for_update_async(None);
     }
@@ -505,6 +524,7 @@ pub fn run() -> Result<()> {
             sort,
             verbose,
             root,
+            machine,
         } => {
             run_search(
                 query,
@@ -528,6 +548,7 @@ pub fn run() -> Result<()> {
                 sort,
                 verbose,
                 root,
+                machine,
             )?;
         }
         Commands::Tui { root } => {
@@ -593,8 +614,18 @@ pub fn run() -> Result<()> {
             events,
             cost,
             root,
+            machine,
         } => {
-            run_usage(source, since, until, json, events, cost, root)?;
+            run_usage(UsageCommandOptions {
+                source,
+                since,
+                until,
+                json,
+                include_events: events,
+                cost_mode: cost,
+                root,
+                machines: machine,
+            })?;
         }
         Commands::AnalyticsBackfill { root } => {
             run_analytics_backfill(root)?;
@@ -626,6 +657,9 @@ pub fn run() -> Result<()> {
             root,
         } => {
             run_transfer(session_id, source, to, mode, turns, dry_run, root)?;
+        }
+        Commands::Rpc { root } => {
+            crate::machine::run_rpc_stdio(root)?;
         }
     }
     Ok(())
@@ -868,61 +902,10 @@ fn run_search(
     sort: SortBy,
     verbose: bool,
     root: Option<PathBuf>,
+    machines: Vec<String>,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let model_choice = config.resolve_model(None)?;
-    let embed_runtime = config.resolve_embed_runtime()?;
-    let auto_index_on_search = config.auto_index_on_search_default();
-    let embeddings_default = config.embeddings_default();
-    let scan_cache_ttl = config.scan_cache_ttl();
-    let auto_index_options = auto_index_on_search.then(|| {
-        let tool_content_limits = config.indexed_tool_content_limits()?;
-        Ok::<_, anyhow::Error>(IngestOptions {
-            claude_source: default_claude_source(),
-            include_agents: false,
-            include_reasoning: config.include_reasoning_default(),
-            include_codex: true,
-            include_opencode: true,
-            include_cursor: true,
-            include_pi: true,
-            include_openclaw: true,
-            include_copilot: true,
-            embeddings: embeddings_default,
-            backfill_embeddings: false,
-            model: model_choice,
-            embed_runtime: embed_runtime.clone(),
-            tool_content_limits,
-        })
-    });
-    let auto_index_options = auto_index_options.transpose()?;
-    let mut refresh_contended = false;
-    let mut refresh_holder = None;
-    if let Some(options) = auto_index_options.as_ref() {
-        paths.ensure_dirs()?;
-        match IngestLease::try_acquire(&paths, "search auto-index")? {
-            LeaseAttempt::Acquired(lease) => {
-                let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
-                let _ = ingest_if_stale(&paths, &index, options, scan_cache_ttl, &lease)?;
-            }
-            LeaseAttempt::Busy(holder) => {
-                refresh_contended = true;
-                refresh_holder = holder;
-            }
-        }
-    }
-    let index = if refresh_contended {
-        open_index_during_contended_refresh(
-            &paths,
-            auto_index_options.as_ref().expect("auto-index options"),
-            scan_cache_ttl,
-            refresh_holder.as_ref(),
-            semantic || hybrid,
-        )?
-    } else {
-        SearchIndex::open_or_create(&paths.index)?
-    };
-
     let options = QueryOptions {
         query,
         project,
@@ -956,6 +939,89 @@ fn run_search(
         (limit * 5).max(limit + 10)
     } else {
         limit
+    };
+
+    if !machines.is_empty() || !config.machines.is_empty() {
+        let spec = SearchSpec {
+            query: options.query.clone(),
+            project: options.project.clone(),
+            role: options.role.clone(),
+            tool: options.tool.clone(),
+            session_id: options.session_id.clone(),
+            source: options.source,
+            since: options.since,
+            until: options.until,
+            limit: candidate_limit,
+            mode: if hybrid {
+                SearchMode::Hybrid
+            } else if semantic {
+                SearchMode::Semantic
+            } else {
+                SearchMode::Lexical
+            },
+            recency_weight,
+            recency_half_life_days,
+            min_score,
+            project_grouping: None,
+        };
+        let mut federated = federated_search(&paths, &config, &machines, &spec, true)?;
+        for (machine, error) in &federated.failures {
+            eprintln!("Warning: machine '{machine}' unavailable: {error}");
+        }
+        let mut merged_render = render.clone();
+        merged_render.min_score = None;
+        federated.items = apply_post_processing_located(federated.items, &merged_render);
+        return render_located_results(federated.items, &render);
+    }
+
+    let model_choice = config.resolve_model(None)?;
+    let embed_runtime = config.resolve_embed_runtime()?;
+    let scan_cache_ttl = config.scan_cache_ttl();
+    let auto_index_options = config.auto_index_on_search_default().then(|| {
+        let tool_content_limits = config.indexed_tool_content_limits()?;
+        Ok::<_, anyhow::Error>(IngestOptions {
+            claude_source: default_claude_source(),
+            include_agents: false,
+            include_reasoning: config.include_reasoning_default(),
+            include_codex: true,
+            include_opencode: true,
+            include_cursor: true,
+            include_pi: true,
+            include_openclaw: true,
+            include_copilot: true,
+            embeddings: config.embeddings_default(),
+            backfill_embeddings: false,
+            model: model_choice,
+            embed_runtime: embed_runtime.clone(),
+            tool_content_limits,
+        })
+    });
+    let auto_index_options = auto_index_options.transpose()?;
+    let mut refresh_contended = false;
+    let mut refresh_holder = None;
+    if let Some(options) = auto_index_options.as_ref() {
+        paths.ensure_dirs()?;
+        match IngestLease::try_acquire(&paths, "search auto-index")? {
+            LeaseAttempt::Acquired(lease) => {
+                let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+                let _ = ingest_if_stale(&paths, &index, options, scan_cache_ttl, &lease)?;
+            }
+            LeaseAttempt::Busy(holder) => {
+                refresh_contended = true;
+                refresh_holder = holder;
+            }
+        }
+    }
+    let index = if refresh_contended {
+        open_index_during_contended_refresh(
+            &paths,
+            auto_index_options.as_ref().expect("auto-index options"),
+            scan_cache_ttl,
+            refresh_holder.as_ref(),
+            semantic || hybrid,
+        )?
+    } else {
+        SearchIndex::open_or_create(&paths.index)?
     };
 
     if hybrid {
@@ -1271,6 +1337,7 @@ struct MatchSpan {
 
 #[derive(Serialize)]
 struct SearchHit {
+    machine: String,
     score: f32,
     ts: String,
     doc_id: u64,
@@ -1287,20 +1354,44 @@ struct SearchHit {
 }
 
 fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOptions) -> Result<()> {
+    render_located_results(
+        results
+            .into_iter()
+            .map(|(score, record)| LocatedRecord {
+                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
+                score,
+                record,
+            })
+            .collect(),
+        render,
+    )
+}
+
+fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -> Result<()> {
     if render.verbose {
-        for (score, record) in results {
+        for LocatedRecord {
+            machine,
+            score,
+            record,
+        } in results
+        {
             let ts = format_ts(record.ts);
             let text = summarize(&record.text, 200);
             println!(
-                "[{score:.3}] {} {} {} {} {} {}",
-                ts, record.doc_id, record.project, record.role, record.session_id, text
+                "[{score:.3}] {} {} {} {} {} {} {}",
+                machine, ts, record.doc_id, record.project, record.role, record.session_id, text
             );
         }
         return Ok(());
     }
 
     let mut output = Vec::new();
-    for (score, record) in results {
+    for LocatedRecord {
+        machine,
+        score,
+        record,
+    } in results
+    {
         let ts = format_ts(record.ts);
         let text_ref = record.text.as_str();
         let wants_snippet = wants_field(&render.fields, "snippet");
@@ -1326,6 +1417,9 @@ fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOpti
             let mut map = serde_json::Map::new();
             if fields.contains("score") {
                 map.insert("score".to_string(), Value::from(score));
+            }
+            if fields.contains("machine") {
+                map.insert("machine".to_string(), Value::from(machine.clone()));
             }
             if fields.contains("ts") {
                 map.insert("ts".to_string(), Value::from(ts));
@@ -1409,6 +1503,7 @@ fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOpti
             Value::Object(map)
         } else {
             serde_json::to_value(SearchHit {
+                machine,
                 score,
                 ts,
                 doc_id: record.doc_id,
@@ -1502,7 +1597,7 @@ fn run_stats(root: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn run_usage(
+struct UsageCommandOptions {
     source: Option<SourceFilter>,
     since: Option<String>,
     until: Option<String>,
@@ -1510,9 +1605,68 @@ fn run_usage(
     include_events: bool,
     cost_mode: CostMode,
     root: Option<PathBuf>,
-) -> Result<()> {
+    machines: Vec<String>,
+}
+
+fn run_usage(options: UsageCommandOptions) -> Result<()> {
+    let UsageCommandOptions {
+        source,
+        since,
+        until,
+        json,
+        include_events,
+        cost_mode,
+        root,
+        machines,
+    } = options;
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+    let since_ms = parse_ts_millis(since)?;
+    let until_ms = parse_ts_millis(until)?;
+    if !machines.is_empty() || !config.machines.is_empty() {
+        let report = federated_usage(
+            &paths,
+            &config,
+            &machines,
+            &UsageSpec {
+                source,
+                project: None,
+                project_grouping: crate::analytics::ProjectGrouping::Flat,
+                session_keys: None,
+                machine_session_keys: None,
+                since_ms,
+                until_ms,
+                cost_mode,
+                include_events,
+                memo_ttl_ms: 0,
+            },
+        )?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("{}", report.authority);
+            print_usage_rows(
+                report.events,
+                report.total_tokens,
+                report.known_cost_usd,
+                report.priced_events,
+                report.unpriced_events,
+                &report.cache_waste,
+                &report.by_source,
+            );
+            println!(
+                "cost: API-equivalent at {} pricing, catalog {} ({} priced, {} unpriced events)",
+                format!("{:?}", report.cost_mode).to_lowercase(),
+                report.price_catalog,
+                format_count(report.priced_events),
+                format_count(report.unpriced_events),
+            );
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+        }
+        return Ok(());
+    }
     if !config.token_usage_enabled() {
         return Err(anyhow!(
             "token usage tracking is disabled; set `token_usage = true` in {}",
@@ -1524,8 +1678,8 @@ fn run_usage(
         project: None,
         project_grouping: crate::analytics::ProjectGrouping::Flat,
         session_keys: None,
-        since_ms: parse_ts_millis(since)?,
-        until_ms: parse_ts_millis(until)?,
+        since_ms,
+        until_ms,
         cost_mode,
         include_events,
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
@@ -1621,6 +1775,27 @@ fn run_usage(
 }
 
 fn print_usage_table(report: &crate::usage::UsageReport) {
+    print_usage_rows(
+        report.events,
+        report.total_tokens,
+        report.known_cost_usd,
+        report.priced_events,
+        report.unpriced_events,
+        &report.cache_waste,
+        &report.by_source,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_usage_rows(
+    events: u64,
+    total_tokens: u64,
+    known_cost_usd: f64,
+    priced_events: u64,
+    unpriced_events: u64,
+    cache_waste: &crate::usage::CacheWaste,
+    by_source: &[crate::usage::UsageSummary],
+) {
     const HEADERS: [&str; 10] = [
         "source",
         "events",
@@ -1635,15 +1810,15 @@ fn print_usage_table(report: &crate::usage::UsageReport) {
     ];
     let mut totals = crate::usage::UsageSummary {
         source: "total".to_string(),
-        events: report.events,
-        total_tokens: report.total_tokens,
-        known_cost_usd: report.known_cost_usd,
-        priced_events: report.priced_events,
-        unpriced_events: report.unpriced_events,
-        cache_waste: report.cache_waste.clone(),
+        events,
+        total_tokens,
+        known_cost_usd,
+        priced_events,
+        unpriced_events,
+        cache_waste: cache_waste.clone(),
         ..Default::default()
     };
-    for row in &report.by_source {
+    for row in by_source {
         totals.uncached_input += row.uncached_input;
         totals.cache_read += row.cache_read;
         totals.cache_write += row.cache_write;
@@ -1683,7 +1858,7 @@ fn print_usage_table(report: &crate::usage::UsageReport) {
         ]
     };
     let mut table: Vec<[String; 10]> = vec![HEADERS.map(str::to_string)];
-    table.extend(report.by_source.iter().map(cells));
+    table.extend(by_source.iter().map(cells));
     table.push(cells(&totals));
     let mut widths = [0usize; 10];
     for row in &table {
@@ -3057,6 +3232,50 @@ fn apply_post_processing(
     results
 }
 
+fn apply_post_processing_located(
+    mut results: Vec<LocatedRecord>,
+    render: &RenderOptions,
+) -> Vec<LocatedRecord> {
+    if let Some(min_score) = render.min_score {
+        results.retain(|result| result.score >= min_score);
+    }
+
+    match render.sort {
+        SortBy::Score => {
+            results.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        SortBy::Ts => {
+            results.sort_by_key(|result| std::cmp::Reverse(result.record.ts));
+        }
+    }
+
+    if let Some(k) = render.top_n_per_session {
+        let mut per_session: HashMap<(String, String, String), usize> = HashMap::new();
+        results.retain(|result| {
+            let count = per_session
+                .entry((
+                    result.machine.clone(),
+                    result.record.source.storage_label().to_string(),
+                    result.record.session_id.clone(),
+                ))
+                .or_default();
+            if *count >= k {
+                return false;
+            }
+            *count += 1;
+            true
+        });
+    }
+
+    results.truncate(render.limit);
+    results
+}
+
 fn format_ts(ts: u64) -> String {
     if ts == 0 {
         return "-".to_string();
@@ -3491,6 +3710,31 @@ mod tests {
             panic!("expected usage command");
         };
         assert_eq!(root, Some(PathBuf::from("/tmp/custom-memex")));
+    }
+
+    #[test]
+    fn search_and_usage_accept_repeated_machine_filters() {
+        let search = Cli::try_parse_from([
+            "memex",
+            "search",
+            "needle",
+            "--machine",
+            "local",
+            "--machine",
+            "mini",
+        ])
+        .expect("parse search machines");
+        let Some(Commands::Search { machine, .. }) = search.command else {
+            panic!("expected search command");
+        };
+        assert_eq!(machine, ["local", "mini"]);
+
+        let usage =
+            Cli::try_parse_from(["memex", "usage", "--machine", "mini"]).expect("parse usage");
+        let Some(Commands::Usage { machine, .. }) = usage.command else {
+            panic!("expected usage command");
+        };
+        assert_eq!(machine, ["mini"]);
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod embed;
 pub mod index;
 pub mod ingest;
 pub mod lease;
+pub mod machine;
 pub mod progress;
 pub mod sources;
 pub mod state;

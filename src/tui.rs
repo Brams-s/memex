@@ -3,6 +3,11 @@ use crate::config::{Paths, UserConfig, default_claude_source};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
+use crate::machine::{
+    LOCAL_MACHINE_ID, SearchMode, SearchSpec, UsageSpec, federated_recent, federated_search,
+    federated_usage_activity, machine_by_id, remote_shell_command, session_context,
+    session_records,
+};
 use crate::types::{Record, SourceFilter, SourceKind};
 use crate::usage::{CostMode, UsageQuery, scan_usage_activity};
 use anyhow::Result;
@@ -52,6 +57,7 @@ enum SearchUpdate {
     Results {
         request_id: u64,
         sessions: Vec<SessionSummary>,
+        failures: MachineFailures,
     },
     Projects {
         request_id: u64,
@@ -110,6 +116,9 @@ enum SearchUpdate {
     },
 }
 
+type MachineFailures = Vec<(String, String)>;
+type SearchRequestResult = Result<(Vec<SessionSummary>, MachineFailures)>;
+
 #[derive(Clone, Debug)]
 struct DetailRequest {
     request_id: u64,
@@ -124,6 +133,7 @@ struct SearchRequest {
     request_id: u64,
     query: String,
     project: String,
+    machines: Vec<String>,
     source: SourceChoice,
     since: Option<u64>,
     grouping: ProjectGrouping,
@@ -381,6 +391,7 @@ impl ProjectDisplayMode {
 enum HomeDropdown {
     None,
     Range,
+    Machine,
     Source,
     Project,
 }
@@ -436,10 +447,23 @@ impl SourceChoice {
             SourceChoice::Copilot => "copilot",
         }
     }
+
+    fn from_source(source: SourceKind) -> Self {
+        match source {
+            SourceKind::Claude => SourceChoice::Claude,
+            SourceKind::Codex => SourceChoice::Codex,
+            SourceKind::Opencode => SourceChoice::Opencode,
+            SourceKind::Cursor => SourceChoice::Cursor,
+            SourceKind::Pi => SourceChoice::Pi,
+            SourceKind::OpenClaw => SourceChoice::OpenClaw,
+            SourceKind::Copilot => SourceChoice::Copilot,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct SessionSummary {
+    machine: String,
     session_id: String,
     project: String,
     source: SourceKind,
@@ -476,6 +500,8 @@ struct App {
     focus: Focus,
     query: String,
     project: String,
+    machine: String,
+    home_machines: Vec<String>,
     source: SourceChoice,
     all_projects: Vec<String>,
     project_options: Vec<String>,
@@ -517,6 +543,7 @@ struct App {
     home_dropdown_state: ListState,
     home_dropdown_area: Rect,
     home_range_area: Rect,
+    home_machine_area: Rect,
     home_source_area: Rect,
     home_project_area: Rect,
     home_sources: Vec<SourceChoice>,
@@ -746,11 +773,12 @@ pub fn run(
     let (detail_tx, detail_rx) = std::sync::mpsc::channel();
     spawn_search_worker(
         paths.clone(),
+        config.clone(),
         index.clone(),
         search_request_rx,
         search_tx.clone(),
     );
-    spawn_detail_worker(index.clone(), detail_rx, search_tx.clone());
+    spawn_detail_worker(paths.clone(), config.clone(), detail_rx, search_tx.clone());
 
     let mut app = App::new(
         paths,
@@ -782,6 +810,14 @@ pub fn run(
 
 impl App {
     fn new(paths: Paths, config: UserConfig, index: SearchIndex, channels: AppChannels) -> Self {
+        let mut home_machines = vec![LOCAL_MACHINE_ID.to_string()];
+        home_machines.extend(
+            config
+                .machines
+                .iter()
+                .filter(|machine| machine.enabled())
+                .map(|machine| machine.id.clone()),
+        );
         Self {
             paths,
             config,
@@ -789,6 +825,8 @@ impl App {
             focus: Focus::Query,
             query: String::new(),
             project: String::new(),
+            machine: String::new(),
+            home_machines,
             home_activity: Vec::new(),
             home_result_activity: Vec::new(),
             home_activity_range: TimelineRange::Month,
@@ -805,6 +843,7 @@ impl App {
             home_dropdown_state: ListState::default(),
             home_dropdown_area: Rect::default(),
             home_range_area: Rect::default(),
+            home_machine_area: Rect::default(),
             home_source_area: Rect::default(),
             home_project_area: Rect::default(),
             home_sources: Vec::new(),
@@ -879,7 +918,9 @@ impl App {
     }
 
     fn home_chart_is_filtered(&self) -> bool {
-        !self.query.trim().is_empty()
+        !self.config.machines.is_empty()
+            || !self.query.trim().is_empty()
+            || !self.machine.is_empty()
             || self.source != SourceChoice::All
             || !self.project.trim().is_empty()
     }
@@ -997,7 +1038,7 @@ impl App {
         let session_changed = self
             .last_detail_session
             .as_ref()
-            .map(|s| s != &session.session_id)
+            .map(|s| s != &format!("{}:{}", session.machine, session.session_id))
             .unwrap_or(true);
         let query_changed = self
             .last_detail_query
@@ -1024,7 +1065,7 @@ impl App {
         self.detail_state = LoadState::Loading;
         self.detail_lines.clear();
         self.detail_scroll = 0;
-        self.last_detail_session = Some(session.session_id.clone());
+        self.last_detail_session = Some(format!("{}:{}", session.machine, session.session_id));
         self.last_detail_query = Some(query_now);
         self.last_detail_mode = self.preview_mode;
         self.last_detail_find = Some(find_now);
@@ -1069,6 +1110,7 @@ impl App {
             request_id,
             query,
             project: self.project.trim().to_string(),
+            machines: self.selected_machines(),
             source: self.source,
             since: self.sessions_since,
             grouping: self.project_display.grouping(),
@@ -1220,7 +1262,7 @@ impl App {
     }
 
     fn kickoff_home_token_activity(&mut self) {
-        if !self.config.token_usage_enabled() {
+        if !self.config.token_usage_enabled() && self.config.machines.is_empty() {
             self.invalidate_home_token_activity();
             return;
         }
@@ -1230,16 +1272,76 @@ impl App {
         self.home_token_activity_state = LoadState::Loading;
         self.home_token_activity_partial = false;
         let tx = self.search_tx.clone();
+        let paths = self.paths.clone();
+        let config = self.config.clone();
+        let machines = self.selected_machines();
+        let source = self.source.as_filter();
+        let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
+        let project_grouping = self.project_display.grouping();
+        let session_keys = home_token_session_keys(&self.query, &self.results);
+        let local_session_keys = session_keys.as_ref().map(|keys| {
+            keys.iter()
+                .filter(|(machine, _, _)| machine == LOCAL_MACHINE_ID)
+                .map(|(_, source, session_id)| (source.clone(), session_id.clone()))
+                .collect()
+        });
         let query = home_token_usage_query(
             self.source,
             &self.project,
             self.project_display.grouping(),
-            home_token_session_keys(&self.query, &self.results),
+            local_session_keys,
             self.home_activity_range,
             now_ms(),
             self.paths.state.join("usage-cache.sqlite3"),
         );
         std::thread::spawn(move || {
+            if !config.machines.is_empty() {
+                let result = federated_usage_activity(
+                    &paths,
+                    &config,
+                    &machines,
+                    &UsageSpec {
+                        source,
+                        project,
+                        project_grouping,
+                        session_keys: None,
+                        machine_session_keys: session_keys.map(|keys| keys.into_iter().collect()),
+                        since_ms: query.since_ms,
+                        until_ms: query.until_ms,
+                        cost_mode: query.cost_mode,
+                        include_events: false,
+                        memo_ttl_ms: query.memo_ttl_ms,
+                    },
+                )
+                .map(|(events, partial)| {
+                    let points = events
+                        .into_iter()
+                        .filter_map(|event| {
+                            let source = SourceKind::from_label(&event.source)?;
+                            (event.timestamp_ms > 0 && event.total_tokens > 0).then_some(
+                                HomeChartPoint {
+                                    source,
+                                    timestamp_ms: event.timestamp_ms,
+                                    value: event.total_tokens,
+                                },
+                            )
+                        })
+                        .collect();
+                    (points, partial)
+                });
+                let _ = match result {
+                    Ok((points, partial)) => tx.send(SearchUpdate::HomeTokenActivity {
+                        request_id,
+                        points,
+                        partial,
+                    }),
+                    Err(error) => tx.send(SearchUpdate::HomeTokenActivityError {
+                        request_id,
+                        message: error.to_string(),
+                    }),
+                };
+                return;
+            }
             let result = scan_usage_activity(&query).map(|(events, partial)| {
                 let points = events
                     .into_iter()
@@ -1325,6 +1427,11 @@ impl App {
                 .iter()
                 .map(|range| range.short_label().to_string())
                 .collect(),
+            HomeDropdown::Machine => {
+                let mut options = vec!["default machines".to_string()];
+                options.extend(self.home_machines.iter().cloned());
+                options
+            }
             HomeDropdown::Source => {
                 let mut options = vec!["all".to_string()];
                 options.extend(self.home_sources.iter().map(|s| s.label().to_string()));
@@ -1347,6 +1454,12 @@ impl App {
             HomeDropdown::Range => TimelineRange::ALL
                 .iter()
                 .position(|range| *range == self.home_activity_range)
+                .unwrap_or(0),
+            HomeDropdown::Machine => self
+                .home_machines
+                .iter()
+                .position(|machine| *machine == self.machine)
+                .map(|idx| idx + 1)
                 .unwrap_or(0),
             HomeDropdown::Source => self
                 .home_sources
@@ -1387,6 +1500,8 @@ impl App {
             return;
         };
         let refresh_activity = self.home_dropdown == HomeDropdown::Range;
+        let machine_selection = self.home_dropdown == HomeDropdown::Machine;
+        let previous_machine = self.machine.clone();
         let source_selection = self.home_dropdown == HomeDropdown::Source;
         let previous_source = self.source;
         let project_selection = self.home_dropdown == HomeDropdown::Project;
@@ -1398,6 +1513,14 @@ impl App {
                     .copied()
                     .unwrap_or(TimelineRange::Month);
                 false
+            }
+            HomeDropdown::Machine => {
+                self.machine = if idx == 0 {
+                    String::new()
+                } else {
+                    self.home_machines.get(idx - 1).cloned().unwrap_or_default()
+                };
+                true
             }
             HomeDropdown::Source => {
                 self.source = if idx == 0 {
@@ -1423,7 +1546,8 @@ impl App {
         self.close_home_dropdown();
         let source_changed = source_selection && self.source != previous_source;
         let project_changed = project_selection && self.project != previous_project;
-        let token_filter_changed = source_changed || project_changed;
+        let machine_changed = machine_selection && self.machine != previous_machine;
+        let token_filter_changed = machine_changed || source_changed || project_changed;
         if token_filter_changed {
             self.invalidate_home_token_activity();
         }
@@ -1431,6 +1555,14 @@ impl App {
             self.kickoff_search();
         } else if refresh_activity {
             self.kickoff_home_activity();
+        }
+    }
+
+    fn selected_machines(&self) -> Vec<String> {
+        if self.machine.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.machine.clone()]
         }
     }
 
@@ -1469,7 +1601,7 @@ impl App {
     }
 
     fn toggle_home_chart_mode(&mut self) {
-        if !self.config.token_usage_enabled() {
+        if !self.config.token_usage_enabled() && self.config.machines.is_empty() {
             return;
         }
         self.home_chart_mode = self.home_chart_mode.toggle();
@@ -1563,7 +1695,19 @@ impl App {
             SearchUpdate::Results {
                 request_id,
                 sessions,
+                failures,
             } if request_id == self.active_search_request => {
+                for session in &sessions {
+                    let source = SourceChoice::from_source(session.source);
+                    if !self.home_sources.contains(&source) {
+                        self.home_sources.push(source);
+                    }
+                    if !session.project.is_empty() && !self.home_projects.contains(&session.project)
+                    {
+                        self.home_projects.push(session.project.clone());
+                    }
+                }
+                self.home_projects.sort();
                 self.home_result_activity = session_activity(&sessions);
                 self.results = sessions;
                 self.sessions_state = if self.results.is_empty() {
@@ -1582,7 +1726,19 @@ impl App {
                 self.last_detail_session = None;
                 self.detail_scroll = 0;
                 if !self.results.is_empty() || self.index_state != IndexState::Loading {
-                    self.set_status(format!("{} sessions", self.results.len()));
+                    if failures.is_empty() {
+                        self.set_status(format!("{} sessions", self.results.len()));
+                    } else {
+                        let machines = failures
+                            .iter()
+                            .map(|(machine, _)| machine.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.set_status(format!(
+                            "{} sessions; unavailable: {machines}",
+                            self.results.len()
+                        ));
+                    }
                 }
                 self.update_detail();
                 if self.layout_mode == LayoutMode::Home
@@ -2068,49 +2224,70 @@ impl App {
             self.set_status("no session selected");
             return Ok(());
         };
-        let Some(session) = self.results.get(idx) else {
+        let Some(session) = self.results.get(idx).cloned() else {
             self.set_status("no session selected");
             return Ok(());
         };
+        let remote = session.machine != LOCAL_MACHINE_ID;
         let template = match session.source {
             SourceKind::Claude => self
                 .config
                 .claude_resume_cmd
                 .clone()
-                .or_else(|| default_resume_template("claude")),
+                .or_else(|| default_resume_template("claude", remote)),
             SourceKind::Codex => self
                 .config
                 .codex_resume_cmd
                 .clone()
-                .or_else(|| default_resume_template("codex")),
+                .or_else(|| default_resume_template("codex", remote)),
             SourceKind::Opencode => self
                 .config
                 .opencode_resume_cmd
                 .clone()
-                .or_else(|| default_resume_template("opencode")),
+                .or_else(|| default_resume_template("opencode", remote)),
             SourceKind::Cursor => self
                 .config
                 .cursor_resume_cmd
                 .clone()
-                .or_else(|| default_resume_template("cursor")),
+                .or_else(|| default_resume_template("cursor", remote)),
             SourceKind::Pi => self
                 .config
                 .pi_resume_cmd
                 .clone()
-                .or_else(|| default_resume_template("pi")),
+                .or_else(|| default_resume_template("pi", remote)),
             SourceKind::OpenClaw => None,
             SourceKind::Copilot => self
                 .config
                 .copilot_resume_cmd
                 .clone()
-                .or_else(|| default_resume_template("copilot")),
+                .or_else(|| default_resume_template("copilot", remote)),
         };
         let Some(template) = template else {
             self.set_status("resume command not configured in config.toml");
             return Ok(());
         };
-        let cwd = resolve_session_cwd(session).unwrap_or_else(|| session.source_dir.clone());
-        let command = expand_resume_template(&template, session, &cwd);
+        let cwd = if remote {
+            session_context(
+                &self.paths,
+                &self.config,
+                &session.machine,
+                &session.session_id,
+                &session.source_path,
+            )
+            .ok()
+            .and_then(|context| context.cwd)
+        } else {
+            resolve_session_cwd(&session)
+        }
+        .unwrap_or_else(|| session.source_dir.clone());
+        let local_command = expand_resume_template(&template, &session, &cwd);
+        let command = if remote {
+            let machine = machine_by_id(&self.config, &session.machine)
+                .ok_or_else(|| anyhow::anyhow!("unknown machine '{}'", session.machine))?;
+            remote_shell_command(machine, &local_command)?
+        } else {
+            local_command
+        };
         run_external_command(self, terminal, &command)?;
         self.set_status(format!("ran: {command}"));
         Ok(())
@@ -2121,13 +2298,13 @@ impl App {
             self.set_status("no session selected");
             return Ok(());
         };
-        let Some(session) = self.results.get(idx) else {
+        let Some(session) = self.results.get(idx).cloned() else {
             self.set_status("no session selected");
             return Ok(());
         };
 
         // Check if agentexport is installed
-        if find_in_path("agentexport").is_none() {
+        if session.machine == LOCAL_MACHINE_ID && find_in_path("agentexport").is_none() {
             self.set_status("agentexport not found (brew install nicosuave/tap/agentexport)");
             return Ok(());
         }
@@ -2146,9 +2323,31 @@ impl App {
         self.set_status("sharing...");
 
         // Run agentexport in background
-        let output = std::process::Command::new("agentexport")
-            .args(["publish", "--tool", tool, "--transcript", &source_path])
-            .output();
+        let output = if session.machine == LOCAL_MACHINE_ID {
+            std::process::Command::new("agentexport")
+                .args(["publish", "--tool", tool, "--transcript", &source_path])
+                .output()
+        } else {
+            let Some(machine) = machine_by_id(&self.config, &session.machine) else {
+                self.set_status(format!("unknown machine '{}'", session.machine));
+                return Ok(());
+            };
+            let Some(target) = machine.ssh_target() else {
+                self.set_status(format!(
+                    "machine '{}' has no SSH transport",
+                    session.machine
+                ));
+                return Ok(());
+            };
+            let command = format!(
+                "agentexport publish --tool {} --transcript {}",
+                shell_quote(tool),
+                shell_quote(&source_path)
+            );
+            std::process::Command::new("ssh")
+                .args(["-T", "--", target, &command])
+                .output()
+        };
 
         match output {
             Ok(output) if output.status.success() => {
@@ -2578,6 +2777,9 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
             KeyCode::Char('t') if app.home_dropdown == HomeDropdown::Range => {
                 app.close_home_dropdown();
             }
+            KeyCode::Char('m') if app.home_dropdown == HomeDropdown::Machine => {
+                app.close_home_dropdown();
+            }
             KeyCode::Char('s') if app.home_dropdown == HomeDropdown::Source => {
                 app.close_home_dropdown();
             }
@@ -2657,6 +2859,9 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
         }
         KeyCode::Char('t') if app.home_range_area.width > 0 => {
             app.open_home_dropdown(HomeDropdown::Range);
+        }
+        KeyCode::Char('m') if app.home_machine_area.width > 0 => {
+            app.open_home_dropdown(HomeDropdown::Machine);
         }
         KeyCode::Char('s') => {
             app.open_home_dropdown(HomeDropdown::Source);
@@ -2751,6 +2956,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     app.home_input_area = Rect::default();
     app.home_list_area = Rect::default();
     app.home_range_area = Rect::default();
+    app.home_machine_area = Rect::default();
     app.home_source_area = Rect::default();
     app.home_project_area = Rect::default();
     app.home_dropdown_area = Rect::default();
@@ -2920,7 +3126,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     );
     y += 4;
 
-    // Header row: label on the left, source/project dropdown anchors on the right.
+    // Header row: label on the left, machine/source/project dropdown anchors on the right.
     let searching = !app.query.trim().is_empty();
     let header_area = col(y, 1);
     let mut header_spans = vec![Span::styled(
@@ -2933,6 +3139,18 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     if app.sessions_state == LoadState::Loading && !app.results.is_empty() {
         header_spans.push(Span::styled(format!("  {}", app.spinner()), theme.muted));
     }
+    let machine_word = if app.home_machines.len() > 1 {
+        format!(
+            "{} ▾",
+            if app.machine.is_empty() {
+                "machines".to_string()
+            } else {
+                truncate_end(&app.machine, 12)
+            }
+        )
+    } else {
+        String::new()
+    };
     let source_word = format!("{} ▾", app.source.label());
     let project_word = format!(
         "{} ▾",
@@ -2942,20 +3160,29 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
             truncate_end(&app.project, 16)
         }
     );
+    let machine_width = machine_word.chars().count() as u16;
     let source_width = source_word.chars().count() as u16;
     let project_width_hdr = project_word.chars().count() as u16;
     let header_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(4),
+            Constraint::Length(machine_width),
+            Constraint::Length(if machine_width > 0 { 3 } else { 0 }),
             Constraint::Length(source_width),
             Constraint::Length(3),
             Constraint::Length(project_width_hdr),
         ])
         .split(header_area);
-    app.home_source_area = header_cols[1];
-    app.home_project_area = header_cols[3];
+    app.home_machine_area = header_cols[1];
+    app.home_source_area = header_cols[3];
+    app.home_project_area = header_cols[5];
     frame.render_widget(Paragraph::new(Line::from(header_spans)), header_cols[0]);
+    let machine_style = if app.machine.is_empty() {
+        theme.muted
+    } else {
+        theme.accent
+    };
     let source_style = if app.source == SourceChoice::All {
         theme.muted
     } else {
@@ -2966,13 +3193,19 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     } else {
         theme.accent
     };
+    if machine_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(machine_word, machine_style))),
+            header_cols[1],
+        );
+    }
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(source_word, source_style))),
-        header_cols[1],
+        header_cols[3],
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(project_word, project_style))),
-        header_cols[3],
+        header_cols[5],
     );
     y += 1;
 
@@ -3044,6 +3277,7 @@ fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, 
     }
     let anchor = match app.home_dropdown {
         HomeDropdown::Range => app.home_range_area,
+        HomeDropdown::Machine => app.home_machine_area,
         HomeDropdown::Source => app.home_source_area,
         HomeDropdown::Project => app.home_project_area,
         HomeDropdown::None => Rect::default(),
@@ -3147,12 +3381,13 @@ fn home_token_usage_query(
 fn home_token_session_keys(
     query: &str,
     sessions: &[SessionSummary],
-) -> Option<HashSet<(String, String)>> {
+) -> Option<HashSet<(String, String, String)>> {
     (!query.trim().is_empty()).then(|| {
         sessions
             .iter()
             .map(|session| {
                 (
+                    session.machine.clone(),
                     session.source.label().to_string(),
                     session.session_id.clone(),
                 )
@@ -3534,7 +3769,7 @@ fn results_project_width(results: &[SessionSummary]) -> usize {
     results
         .iter()
         .take(60)
-        .map(|session| session.project.chars().count())
+        .map(|session| displayed_project(session).chars().count())
         .max()
         .unwrap_or(8)
         .clamp(6, 24)
@@ -3569,6 +3804,7 @@ fn session_result_line(
     theme: &Theme,
 ) -> Line<'static> {
     let ts = format_relative_ts(session.last_ts);
+    let project = displayed_project(session);
     let mut spans = vec![
         Span::styled(format!("{ts:>4}"), theme.accent),
         Span::raw("  "),
@@ -3579,7 +3815,7 @@ fn session_result_line(
         Span::styled(
             format!(
                 "{:<width$}",
-                truncate_middle(&session.project, project_width),
+                truncate_middle(&project, project_width),
                 width = project_width
             ),
             theme.text,
@@ -3596,6 +3832,14 @@ fn session_result_line(
         spans.extend(match_context_spans(&snippet, terms, detail_width, theme));
     }
     Line::from(spans)
+}
+
+fn displayed_project(session: &SessionSummary) -> String {
+    if session.machine == LOCAL_MACHINE_ID {
+        session.project.clone()
+    } else {
+        format!("{}:{}", session.machine, session.project)
+    }
 }
 
 fn truncate_end(value: &str, width: usize) -> String {
@@ -4307,7 +4551,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
     if app.layout_mode == LayoutMode::Home {
         right_spans.push(Span::raw("   "));
         right_spans.push(Span::styled("chart", theme.muted));
-        if app.config.token_usage_enabled() {
+        if app.config.token_usage_enabled() || !app.config.machines.is_empty() {
             right_spans.push(Span::styled("(^t) ", theme.accent));
         } else {
             right_spans.push(Span::raw(" "));
@@ -4619,6 +4863,7 @@ fn sessions_from_analytics(
 
 fn session_summary_from_row(row: SessionRow) -> SessionSummary {
     SessionSummary {
+        machine: LOCAL_MACHINE_ID.to_string(),
         session_id: row.session_id,
         project: row.display_project,
         source: row.source,
@@ -4742,6 +4987,7 @@ fn add_record_to_session(
     let entry = sessions
         .entry(record.session_id.clone())
         .or_insert(SessionSummary {
+            machine: LOCAL_MACHINE_ID.to_string(),
             session_id: record.session_id.clone(),
             project: record.project.clone(),
             source: record.source,
@@ -4767,8 +5013,48 @@ fn add_record_to_session(
     }
 }
 
+fn add_located_record_to_session(
+    sessions: &mut HashMap<String, SessionSummary>,
+    located: crate::machine::LocatedRecord,
+) {
+    let machine = located.machine;
+    let score = located.score;
+    let record = located.record;
+    let key = format!(
+        "{}\0{}\0{}\0{}",
+        machine,
+        record.source.storage_label(),
+        record.session_id,
+        record.source_path
+    );
+    let entry = sessions.entry(key).or_insert(SessionSummary {
+        machine,
+        session_id: record.session_id.clone(),
+        project: record.project.clone(),
+        source: record.source,
+        last_ts: record.ts,
+        hit_count: 0,
+        top_score: score,
+        snippet: summarize(&record.text, 160),
+        source_path: record.source_path.clone(),
+        source_dir: parent_dir(&record.source_path),
+    });
+    entry.hit_count += 1;
+    entry.last_ts = entry.last_ts.max(record.ts);
+    if score >= entry.top_score {
+        entry.top_score = score;
+        let snippet = summarize(&record.text, 160);
+        if !snippet.is_empty() {
+            entry.snippet = snippet;
+        }
+        entry.source_path = record.source_path;
+        entry.source_dir = parent_dir(&entry.source_path);
+    }
+}
+
 fn spawn_search_worker(
     paths: Paths,
+    config: UserConfig,
     index: SearchIndex,
     rx: std::sync::mpsc::Receiver<SearchRequest>,
     tx: std::sync::mpsc::Sender<SearchUpdate>,
@@ -4781,10 +5067,11 @@ fn spawn_search_worker(
                 request = newer;
             }
             let request_id = request.request_id;
-            let update = match run_search_request(&paths, &index, request) {
-                Ok(sessions) => SearchUpdate::Results {
+            let update = match run_search_request(&paths, &config, &index, request) {
+                Ok((sessions, failures)) => SearchUpdate::Results {
                     request_id,
                     sessions,
+                    failures,
                 },
                 Err(err) => SearchUpdate::SearchError {
                     request_id,
@@ -4800,10 +5087,83 @@ fn spawn_search_worker(
 
 fn run_search_request(
     paths: &Paths,
+    config: &UserConfig,
     index: &SearchIndex,
     request: SearchRequest,
-) -> Result<Vec<SessionSummary>> {
+) -> SearchRequestResult {
     let project = (!request.project.is_empty()).then_some(request.project.as_str());
+    if !config.machines.is_empty() {
+        let federated = if request.query.is_empty() {
+            federated_recent(
+                paths,
+                config,
+                &request.machines,
+                (RECENT_SESSIONS_LIMIT * RECENT_RECORDS_MULTIPLIER).max(200),
+                Some(request.grouping),
+                false,
+            )?
+        } else {
+            let tantivy_project = if request.grouping == ProjectGrouping::Flat {
+                project.map(str::to_string)
+            } else {
+                None
+            };
+            federated_search(
+                paths,
+                config,
+                &request.machines,
+                &SearchSpec {
+                    query: request.query.clone(),
+                    project: tantivy_project,
+                    role: None,
+                    tool: None,
+                    session_id: None,
+                    source: request.source.as_filter(),
+                    since: request.since,
+                    until: None,
+                    limit: RESULT_LIMIT * 5,
+                    mode: SearchMode::Lexical,
+                    recency_weight: 1.0,
+                    recency_half_life_days: 30.0,
+                    min_score: None,
+                    project_grouping: Some(request.grouping),
+                },
+                false,
+            )?
+        };
+        let failures = federated.failures;
+        let mut by_session = HashMap::new();
+        for located in federated.items {
+            if request.since.is_some_and(|since| located.record.ts < since) {
+                continue;
+            }
+            if request
+                .source
+                .as_filter()
+                .is_some_and(|source| !source.matches(located.record.source))
+            {
+                continue;
+            }
+            add_located_record_to_session(&mut by_session, located);
+        }
+        let mut sessions: Vec<_> = by_session.into_values().collect();
+        if request.query.is_empty() {
+            sessions.sort_by_key(|session| std::cmp::Reverse(session.last_ts));
+        } else {
+            sessions.sort_by(|left, right| {
+                right
+                    .top_score
+                    .partial_cmp(&left.top_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right.last_ts.cmp(&left.last_ts))
+            });
+        }
+        if let Some(project) = project {
+            sessions.retain(|session| session.project == project);
+        }
+        sessions.truncate(RESULT_LIMIT);
+        return Ok((sessions, failures));
+    }
     if request.query.is_empty() {
         return sessions_from_analytics(
             paths,
@@ -4814,7 +5174,8 @@ fn run_search_request(
         )
         .or_else(|_| {
             sessions_from_recent(index, request.source.as_filter(), request.since, project)
-        });
+        })
+        .map(|sessions| (sessions, Vec::new()));
     }
 
     let tantivy_project = if request.grouping == ProjectGrouping::Flat {
@@ -4834,11 +5195,12 @@ fn run_search_request(
     if let Some(project) = project {
         sessions.retain(|session| session.project == project);
     }
-    Ok(sessions)
+    Ok((sessions, Vec::new()))
 }
 
 fn spawn_detail_worker(
-    index: SearchIndex,
+    paths: Paths,
+    config: UserConfig,
     rx: std::sync::mpsc::Receiver<DetailRequest>,
     tx: std::sync::mpsc::Sender<SearchUpdate>,
 ) {
@@ -4847,13 +5209,22 @@ fn spawn_detail_worker(
             while let Ok(newer) = rx.try_recv() {
                 request = newer;
             }
-            let update = match build_detail_lines(
-                &index,
-                &request.session,
-                request.mode,
-                &request.query,
-                request.show_tools,
-            ) {
+            let records = session_records(
+                &paths,
+                &config,
+                &request.session.machine,
+                &request.session.session_id,
+                &request.session.source_path,
+            );
+            let update = match records.and_then(|records| {
+                build_detail_lines_from_records(
+                    records,
+                    &request.session,
+                    request.mode,
+                    &request.query,
+                    request.show_tools,
+                )
+            }) {
                 Ok(lines) => SearchUpdate::DetailResults {
                     request_id: request.request_id,
                     lines,
@@ -4877,7 +5248,18 @@ fn build_detail_lines(
     query: &str,
     show_tools: bool,
 ) -> Result<Vec<PreviewLine>> {
-    let mut records = index.records_by_session_id(&session.session_id)?;
+    let records = index.records_by_session_id(&session.session_id)?;
+    build_detail_lines_from_records(records, session, mode, query, show_tools)
+}
+
+fn build_detail_lines_from_records(
+    mut records: Vec<Record>,
+    session: &SessionSummary,
+    mode: PreviewMode,
+    query: &str,
+    show_tools: bool,
+) -> Result<Vec<PreviewLine>> {
+    records.retain(|record| record.source_path == session.source_path);
     records.sort_by(|a, b| {
         a.turn_id
             .cmp(&b.turn_id)
@@ -4886,7 +5268,11 @@ fn build_detail_lines(
     });
     let mut lines = vec![PreviewLine::SessionHeader {
         project: session.project.clone(),
-        source: session.source.label().to_string(),
+        source: if session.machine == LOCAL_MACHINE_ID {
+            session.source.label().to_string()
+        } else {
+            format!("{}:{}", session.machine, session.source.label())
+        },
         session_id: session.session_id.clone(),
     }];
     if records.is_empty() {
@@ -4993,17 +5379,25 @@ fn expand_resume_template(template: &str, session: &SessionSummary, cwd: &str) -
         .replace("{cwd}", cwd)
 }
 
-fn default_resume_template(cmd: &str) -> Option<String> {
+fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
     match cmd {
-        "claude" => {
-            find_in_path("claude").map(|_| "cd {cwd} && claude --resume {session_id}".to_string())
+        "claude" if remote || find_in_path("claude").is_some() => {
+            Some("cd {cwd_shell} && claude --resume {session_id}".to_string())
         }
-        "codex" => find_in_path("codex").map(|_| "codex resume {session_id}".to_string()),
-        "opencode" => find_in_path("opencode").map(|_| "opencode resume {session_id}".to_string()),
-        "cursor" => {
-            find_in_path("cursor-agent").map(|_| "cursor-agent --resume {session_id}".to_string())
+        "codex" if remote || find_in_path("codex").is_some() => {
+            Some("codex resume {session_id}".to_string())
         }
-        "pi" => find_in_path("pi").map(|_| "pi --session {source_path_shell}".to_string()),
+        "opencode" if remote || find_in_path("opencode").is_some() => {
+            Some("opencode resume {session_id}".to_string())
+        }
+        "cursor" => (remote || find_in_path("cursor-agent").is_some())
+            .then(|| "cursor-agent --resume {session_id}".to_string()),
+        "pi" if remote || find_in_path("pi").is_some() => {
+            Some("pi --session {source_path_shell}".to_string())
+        }
+        "copilot" if remote || find_in_path("copilot").is_some() => {
+            Some("copilot --resume {session_id}".to_string())
+        }
         _ => None,
     }
 }
@@ -5811,6 +6205,8 @@ fn handle_home_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut Ap
             let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
             if app.home_range_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Range);
+            } else if app.home_machine_area.contains(pos) {
+                app.open_home_dropdown(HomeDropdown::Machine);
             } else if app.home_source_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Source);
             } else if app.home_project_area.contains(pos) {
@@ -6091,6 +6487,7 @@ mod tests {
         let (detail_tx, _detail_rx) = std::sync::mpsc::channel();
         spawn_search_worker(
             paths.clone(),
+            UserConfig::default(),
             index.clone(),
             search_request_rx,
             search_tx.clone(),
@@ -6152,6 +6549,7 @@ mod tests {
     fn enter_browse_switches_to_split_and_selects_first() {
         let (_tmp, mut app) = test_app();
         app.results.push(SessionSummary {
+            machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "session".to_string(),
             project: "project".to_string(),
             source: SourceKind::Claude,
@@ -6287,6 +6685,7 @@ mod tests {
         app.handle_search_update(SearchUpdate::Results {
             request_id: 3,
             sessions: vec![SessionSummary {
+                machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "session".to_string(),
                 project: "project".to_string(),
                 source: SourceKind::Pi,
@@ -6297,6 +6696,7 @@ mod tests {
                 source_path: "source.jsonl".to_string(),
                 source_dir: String::new(),
             }],
+            failures: Vec::new(),
         });
 
         assert_eq!(
@@ -6469,6 +6869,7 @@ mod tests {
     fn token_session_filter_uses_accepted_source_qualified_results() {
         let sessions = vec![
             SessionSummary {
+                machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "shared".into(),
                 project: "memex".into(),
                 source: SourceKind::Codex,
@@ -6480,6 +6881,7 @@ mod tests {
                 source_dir: String::new(),
             },
             SessionSummary {
+                machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "shared".into(),
                 project: "memex".into(),
                 source: SourceKind::Claude,
@@ -6490,13 +6892,26 @@ mod tests {
                 source_path: "claude.jsonl".into(),
                 source_dir: String::new(),
             },
+            SessionSummary {
+                machine: "mini".into(),
+                session_id: "shared".into(),
+                project: "memex".into(),
+                source: SourceKind::Codex,
+                last_ts: 1,
+                hit_count: 1,
+                top_score: 1.0,
+                snippet: String::new(),
+                source_path: "remote-codex.jsonl".into(),
+                source_dir: String::new(),
+            },
         ];
 
         let keys = home_token_session_keys("needle", &sessions).expect("session keys");
 
-        assert!(keys.contains(&("codex".into(), "shared".into())));
-        assert!(keys.contains(&("claude".into(), "shared".into())));
-        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&("local".into(), "codex".into(), "shared".into())));
+        assert!(keys.contains(&("local".into(), "claude".into(), "shared".into())));
+        assert!(keys.contains(&("mini".into(), "codex".into(), "shared".into())));
+        assert_eq!(keys.len(), 3);
         assert!(home_token_session_keys("  ", &sessions).is_none());
     }
 
@@ -6590,6 +7005,20 @@ mod tests {
     }
 
     #[test]
+    fn machine_dropdown_applies_to_search_and_chart_filter() {
+        let (_tmp, mut app) = test_app();
+        app.home_machines = vec!["local".to_string(), "mini".to_string()];
+        app.open_home_dropdown(HomeDropdown::Machine);
+        assert_eq!(app.home_dropdown_state.selected(), Some(0));
+        app.move_home_dropdown_selection(2);
+        app.apply_home_dropdown();
+        assert_eq!(app.machine, "mini");
+        assert_eq!(app.selected_machines(), vec!["mini"]);
+        assert!(app.home_chart_is_filtered());
+        assert_eq!(app.home_dropdown, HomeDropdown::None);
+    }
+
+    #[test]
     fn project_dropdown_first_entry_clears_filter() {
         let (_tmp, mut app) = test_app();
         app.home_projects = vec!["memex".to_string()];
@@ -6650,6 +7079,7 @@ mod tests {
         app.handle_search_update(SearchUpdate::Results {
             request_id: 1,
             sessions: Vec::new(),
+            failures: Vec::new(),
         });
 
         assert_eq!(app.sessions_state, LoadState::Loading);
