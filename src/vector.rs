@@ -23,6 +23,14 @@ pub struct VectorIndex {
 }
 
 impl VectorIndex {
+    pub fn reset(dir: &Path) -> Result<()> {
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+        fs::create_dir_all(dir)?;
+        Ok(())
+    }
+
     pub fn open_or_create(dir: &Path, dimensions: usize, model: Option<&str>) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let index_path = dir.join("usearch.index");
@@ -262,6 +270,22 @@ mod tests {
         assert!(idx.contains(1));
         assert!(!idx.contains(2));
         assert_eq!(idx.dimensions(), 64);
+    }
+
+    #[test]
+    fn reset_removes_all_existing_vector_state() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("test")).unwrap();
+        idx.add(1, &make_vector(64, 1.0)).unwrap();
+        idx.save().unwrap();
+        assert!(tmp.path().join("usearch.index").exists());
+
+        VectorIndex::reset(tmp.path()).unwrap();
+
+        assert!(tmp.path().exists());
+        assert!(!tmp.path().join("usearch.index").exists());
+        assert!(!tmp.path().join("doc_ids.bin").exists());
+        assert!(!tmp.path().join("meta.json").exists());
     }
 
     #[test]

@@ -58,6 +58,7 @@ struct FileTask {
     size: u64,
     mtime: i64,
     delete_first: bool,
+    parser_version_invalidated: bool,
     pending_tool_calls: HashMap<String, PendingToolCall>,
     identity: FileIdentity,
     parser_version: u32,
@@ -146,6 +147,8 @@ fn prepare_file_task(
         .min(size) as usize;
     let identity = file_identity(&path, metadata, prefix_bytes);
     let parser_version = crate::sources::index_state_version(source);
+    let parser_version_invalidated =
+        previous.is_some_and(|previous| previous.parser_version != parser_version);
     let (offset, turn_id, delete_first, pending_tool_calls, skip) = match previous {
         None => (0, 0, false, HashMap::new(), false),
         Some(previous)
@@ -188,6 +191,7 @@ fn prepare_file_task(
             size,
             mtime,
             delete_first,
+            parser_version_invalidated,
             pending_tool_calls,
             identity,
             parser_version,
@@ -234,12 +238,41 @@ impl RecordSender {
 struct WriterContext {
     embeddings: bool,
     do_backfill_embeddings: bool,
+    reset_vector_store: bool,
     vector_dir: PathBuf,
     analytics_path: PathBuf,
     progress: Arc<Progress>,
     model: ModelChoice,
     embed_runtime: EmbedRuntimeConfig,
     tool_content_limits: IndexedToolContentLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VectorMigration {
+    rebuild: bool,
+    model: ModelChoice,
+}
+
+fn vector_migration(
+    vector_dir: &Path,
+    tasks: &[FileTask],
+    configured_model: ModelChoice,
+) -> VectorMigration {
+    let rebuild = tasks.iter().any(|task| task.parser_version_invalidated)
+        && vector_dir.join("usearch.index").exists();
+    let model = if rebuild {
+        crate::vector::VectorIndex::open(vector_dir)
+            .ok()
+            .and_then(|index| {
+                index
+                    .model()
+                    .and_then(|model| ModelChoice::parse(model).ok())
+            })
+            .unwrap_or(configured_model)
+    } else {
+        configured_model
+    };
+    VectorMigration { rebuild, model }
 }
 
 fn record_channel() -> (Sender<Record>, Receiver<Record>) {
@@ -445,7 +478,9 @@ pub fn ingest_all(
         });
     }
 
-    let progress = Arc::new(Progress::new(totals, file_totals, options.embeddings));
+    let vector_migration = vector_migration(&paths.vectors, &tasks, options.model);
+    let embeddings = options.embeddings || vector_migration.rebuild;
+    let progress = Arc::new(Progress::new(totals, file_totals, embeddings));
 
     let (raw_tx_record, rx_record) = record_channel();
     let tx_record = RecordSender::new(raw_tx_record, options.tool_content_limits);
@@ -456,15 +491,15 @@ pub fn ingest_all(
         .filter(|t| t.delete_first)
         .map(|t| t.path.to_string_lossy().to_string())
         .collect();
-
     let writer_index = index.clone();
     let writer_ctx = WriterContext {
-        embeddings: options.embeddings,
-        do_backfill_embeddings: options.backfill_embeddings,
+        embeddings,
+        do_backfill_embeddings: options.backfill_embeddings || vector_migration.rebuild,
+        reset_vector_store: vector_migration.rebuild,
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_db.clone(),
         progress: progress.clone(),
-        model: options.model,
+        model: vector_migration.model,
         embed_runtime: options.embed_runtime.clone(),
         tool_content_limits: options.tool_content_limits,
     };
@@ -620,6 +655,7 @@ fn writer_loop(
     let WriterContext {
         embeddings,
         do_backfill_embeddings,
+        reset_vector_store,
         vector_dir,
         analytics_path,
         progress,
@@ -643,6 +679,9 @@ fn writer_loop(
     if embeddings {
         let handle = EmbedderHandle::with_model_and_runtime(model, &embed_runtime)?;
         let dims = handle.dims;
+        if reset_vector_store {
+            crate::vector::VectorIndex::reset(&vector_dir)?;
+        }
         vector_index = Some(crate::vector::VectorIndex::open_or_create(
             &vector_dir,
             dims,
@@ -663,7 +702,11 @@ fn writer_loop(
             progress.add_indexed(record.source, index_pending[source_idx]);
             index_pending[source_idx] = 0;
         }
-        if embeddings && is_embedding_role(&record.role) && !record.text.is_empty() {
+        if embeddings
+            && !reset_vector_store
+            && is_embedding_role(&record.role)
+            && !record.text.is_empty()
+        {
             let text = truncate_for_embedding(std::mem::take(&mut record.text));
             if let Some(vindex) = vector_index.as_ref()
                 && !vindex.contains(record.doc_id)
@@ -1223,6 +1266,7 @@ mod tests {
                 .map(|duration| duration.as_secs() as i64)
                 .unwrap_or(0),
             delete_first: false,
+            parser_version_invalidated: false,
             pending_tool_calls,
             identity: file_identity(
                 path,
@@ -1821,8 +1865,40 @@ mod tests {
         let (task, skip) = prepare_file_task(path, SourceKind::Claude, &metadata, Some(&previous));
         assert!(!skip);
         assert!(task.delete_first);
+        assert!(task.parser_version_invalidated);
         assert_eq!(task.offset, 0);
         assert!(task.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parser_version_migration_rebuilds_vectors_with_the_existing_model() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "bge", 384);
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(&transcript, "{}\n").expect("transcript");
+        let mut task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
+        task.parser_version_invalidated = true;
+
+        let migration = vector_migration(&paths.vectors, &[task], ModelChoice::Gemma);
+
+        assert!(migration.rebuild);
+        assert_eq!(migration.model, ModelChoice::BGESmall);
+    }
+
+    #[test]
+    fn ordinary_file_replacement_does_not_rebuild_the_vector_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "bge", 384);
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(&transcript, "{}\n").expect("transcript");
+        let task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
+
+        let migration = vector_migration(&paths.vectors, &[task], ModelChoice::Gemma);
+
+        assert!(!migration.rebuild);
+        assert_eq!(migration.model, ModelChoice::Gemma);
     }
 
     #[test]
@@ -2343,6 +2419,7 @@ mod tests {
             size: (existing.len() + appended.len()) as u64,
             mtime: 0,
             delete_first: false,
+            parser_version_invalidated: false,
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Pi),
@@ -2413,6 +2490,7 @@ mod tests {
             size: meta.len(),
             mtime: 0,
             delete_first: false,
+            parser_version_invalidated: false,
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Copilot),
@@ -2504,6 +2582,7 @@ mod tests {
         let ctx = WriterContext {
             embeddings: false,
             do_backfill_embeddings: false,
+            reset_vector_store: false,
             vector_dir,
             analytics_path: tmp.path().join("state").join("analytics.sqlite"),
             progress,
