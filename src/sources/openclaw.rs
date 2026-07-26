@@ -2,6 +2,7 @@ use super::{IndexParseOutput, IndexParseState, ParserVersions, SourceFile};
 use crate::types::{Record, SourceKind};
 use crate::usage::UsageEvent;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 
@@ -19,22 +20,29 @@ pub fn matches_path(path: &str) -> bool {
         || (path.contains(".clawdbot/agents") || path.contains(".clawdbot\\agents"))
 }
 
-pub fn state_dir() -> PathBuf {
+pub fn state_dirs() -> Vec<PathBuf> {
     if let Some(path) =
         std::env::var_os("OPENCLAW_STATE_DIR").or_else(|| std::env::var_os("CLAWDBOT_STATE_DIR"))
     {
-        return PathBuf::from(path);
+        return vec![PathBuf::from(path)];
     }
-    let current = super::common::home().join(".openclaw");
-    if current.exists() {
-        current
-    } else {
-        super::common::home().join(".clawdbot")
-    }
+    let home = super::common::home();
+    vec![home.join(".openclaw"), home.join(".clawdbot")]
 }
 
 pub fn discover() -> Vec<SourceFile> {
-    discover_from_state_dir(&state_dir())
+    discover_from_state_dirs(&state_dirs())
+}
+
+fn discover_from_state_dirs(roots: &[PathBuf]) -> Vec<SourceFile> {
+    let mut seen = HashSet::new();
+    let mut files = roots
+        .iter()
+        .flat_map(|root| discover_from_state_dir(root))
+        .filter(|file| seen.insert(file.path.clone()))
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files
 }
 
 fn discover_from_state_dir(root: &Path) -> Vec<SourceFile> {
@@ -105,6 +113,27 @@ mod tests {
             files[0].path.file_name().and_then(|name| name.to_str()),
             Some("one.jsonl")
         );
+    }
+
+    #[test]
+    fn discovery_scans_current_and_legacy_stores_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join(".openclaw");
+        let legacy = temp.path().join(".clawdbot");
+        for (root, name) in [(&current, "current.jsonl"), (&legacy, "legacy.jsonl")] {
+            let sessions = root.join("agents/main/sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            fs::write(sessions.join(name), "{}\n").unwrap();
+        }
+
+        let files = discover_from_state_dirs(&[current, legacy]);
+        assert_eq!(files.len(), 2);
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path.ends_with("current.jsonl"))
+        );
+        assert!(files.iter().any(|file| file.path.ends_with("legacy.jsonl")));
     }
 
     #[test]
