@@ -1,6 +1,6 @@
 use super::{
-    ConversationKind, IndexParseOutput, IndexParseState, ParserVersions, SessionIdentity,
-    SourceFile, SourceMetadata, UsageDependency, UsageParseOutput,
+    ConversationKind, IndexParseOutput, IndexParseState, ParseDiagnostics, ParserVersions,
+    SessionIdentity, SourceFile, SourceMetadata, UsageDependency, UsageParseOutput,
 };
 use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 2,
+    index: 3,
     usage: 4,
 };
 
@@ -229,6 +229,7 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
 pub(crate) fn parse_index_records(
     path: &Path,
     state: IndexParseState,
+    include_reasoning: bool,
     next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
@@ -240,6 +241,7 @@ pub(crate) fn parse_index_records(
     let source_path = path.to_string_lossy().to_string();
     let mut metadata = read_meta_until(path, state.offset)?;
     let mut buffer = Vec::new();
+    let mut diagnostics = ParseDiagnostics::default();
 
     while start < mmap.len() {
         let slice = &mmap[start..];
@@ -251,10 +253,15 @@ pub(crate) fn parse_index_records(
         }
         buffer.clear();
         buffer.extend_from_slice(line);
-        let Ok(value) = simd_json::to_borrowed_value(&mut buffer) else {
-            continue;
+        let value = match simd_json::to_borrowed_value(&mut buffer) {
+            Ok(value) => value,
+            Err(_) => {
+                diagnostics.malformed_json_lines += 1;
+                continue;
+            }
         };
         let Some(object) = value.as_object() else {
+            diagnostics.non_object_json_lines += 1;
             continue;
         };
         let entry_type = object
@@ -272,7 +279,46 @@ pub(crate) fn parse_index_records(
             }
             continue;
         }
+        if entry_type == "turn_context" {
+            continue;
+        }
+        if entry_type == "event_msg" {
+            let Some(payload) = object.get("payload").and_then(|value| value.as_object()) else {
+                continue;
+            };
+            if payload.get("type").and_then(|value| value.as_str()) == Some("agent_reasoning")
+                && include_reasoning
+                && let Some(text) = payload
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+            {
+                let mut links = metadata.links.record_links();
+                links.event_id = super::common::borrowed_string(payload, "id");
+                emit(Record {
+                    source: SourceKind::CodexSession,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: metadata.project.clone(),
+                    session_id: metadata.session_id.clone(),
+                    turn_id,
+                    role: "reasoning".to_string(),
+                    text: text.to_string(),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links,
+                    source_path: source_path.clone(),
+                })?;
+                turn_id += 1;
+            }
+            continue;
+        }
         if entry_type != "response_item" {
+            if !matches!(entry_type, "compacted" | "world_state" | "ghost_snapshot") {
+                diagnostics.increment_unknown_top_level(entry_type);
+            }
             continue;
         }
         let Some(payload) = object.get("payload").and_then(|value| value.as_object()) else {
@@ -345,7 +391,7 @@ pub(crate) fn parse_index_records(
                 }
                 let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
                 if let Some(call_id) = call_id {
-                    pending_tool_calls.insert(
+                    let replaced = pending_tool_calls.insert(
                         call_id.clone(),
                         super::common::pending_tool_call(
                             tool_name.clone(),
@@ -357,6 +403,9 @@ pub(crate) fn parse_index_records(
                             &metadata.session_id,
                         ),
                     );
+                    if replaced.is_some() {
+                        diagnostics.duplicate_tool_calls += 1;
+                    }
                 }
                 emit(Record {
                     source: SourceKind::CodexSession,
@@ -380,14 +429,14 @@ pub(crate) fn parse_index_records(
                     .get("call_id")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                let tool_name = (!call_id.is_empty())
+                let pending = (!call_id.is_empty())
                     .then(|| pending_tool_calls.remove(call_id))
-                    .flatten()
-                    .and_then(|call| call.tool_name);
-                let tool_output = payload
-                    .get("output")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string);
+                    .flatten();
+                if !call_id.is_empty() && pending.is_none() {
+                    diagnostics.orphan_tool_results += 1;
+                }
+                let tool_name = pending.and_then(|call| call.tool_name);
+                let tool_output = payload.get("output").and_then(value_text);
                 let text = tool_output.clone().unwrap_or_default();
                 if text.is_empty() {
                     continue;
@@ -413,7 +462,160 @@ pub(crate) fn parse_index_records(
                 })?;
                 turn_id += 1;
             }
-            _ => {}
+            "custom_tool_call" => {
+                let tool_name = payload
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let tool_input = payload.get("input").and_then(value_text);
+                let call_id = payload
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                if let Some(call_id) = &call_id {
+                    links.event_id = Some(call_id.clone());
+                }
+                let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
+                if let Some(call_id) = call_id {
+                    let replaced = pending_tool_calls.insert(
+                        call_id.clone(),
+                        super::common::pending_tool_call(
+                            tool_name.clone(),
+                            Some(call_id),
+                            doc_id,
+                            timestamp,
+                            tool_input.as_deref(),
+                            &links,
+                            &metadata.session_id,
+                        ),
+                    );
+                    if replaced.is_some() {
+                        diagnostics.duplicate_tool_calls += 1;
+                    }
+                }
+                emit(Record {
+                    source: SourceKind::CodexSession,
+                    doc_id,
+                    ts: timestamp,
+                    project: metadata.project.clone(),
+                    session_id: metadata.session_id.clone(),
+                    turn_id,
+                    role: "tool_use".to_string(),
+                    text: tool_input.clone().unwrap_or_default(),
+                    tool_name,
+                    tool_input,
+                    tool_output: None,
+                    links,
+                    source_path: source_path.clone(),
+                })?;
+                turn_id += 1;
+            }
+            "web_search_call" | "tool_search_call" => {
+                let tool_name = if payload_type == "web_search_call" {
+                    "web_search"
+                } else {
+                    "tool_search"
+                };
+                let tool_input = if payload_type == "web_search_call" {
+                    payload
+                        .get("action")
+                        .or_else(|| payload.get("query"))
+                        .and_then(value_text)
+                } else {
+                    payload.get("arguments").and_then(value_text)
+                };
+                let call_id = payload
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                if let Some(call_id) = &call_id {
+                    links.event_id = Some(call_id.clone());
+                }
+                let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
+                if let Some(call_id) = call_id {
+                    let replaced = pending_tool_calls.insert(
+                        call_id.clone(),
+                        super::common::pending_tool_call(
+                            Some(tool_name.to_string()),
+                            Some(call_id),
+                            doc_id,
+                            timestamp,
+                            tool_input.as_deref(),
+                            &links,
+                            &metadata.session_id,
+                        ),
+                    );
+                    if replaced.is_some() {
+                        diagnostics.duplicate_tool_calls += 1;
+                    }
+                }
+                emit(Record {
+                    source: SourceKind::CodexSession,
+                    doc_id,
+                    ts: timestamp,
+                    project: metadata.project.clone(),
+                    session_id: metadata.session_id.clone(),
+                    turn_id,
+                    role: "tool_use".to_string(),
+                    text: tool_input.clone().unwrap_or_default(),
+                    tool_name: Some(tool_name.to_string()),
+                    tool_input,
+                    tool_output: None,
+                    links,
+                    source_path: source_path.clone(),
+                })?;
+                turn_id += 1;
+            }
+            "custom_tool_call_output" | "tool_search_output" => {
+                let call_id = payload
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let pending = (!call_id.is_empty())
+                    .then(|| pending_tool_calls.remove(call_id))
+                    .flatten();
+                if !call_id.is_empty() && pending.is_none() {
+                    diagnostics.orphan_tool_results += 1;
+                }
+                let tool_name = pending.and_then(|call| call.tool_name).or_else(|| {
+                    (payload_type == "tool_search_output").then(|| "tool_search".to_string())
+                });
+                let tool_output = if payload_type == "tool_search_output" {
+                    payload.get("tools").and_then(value_text)
+                } else {
+                    payload.get("output").and_then(value_text)
+                };
+                let text = tool_output.clone().unwrap_or_default();
+                if text.is_empty() {
+                    continue;
+                }
+                if !call_id.is_empty() {
+                    links.parent_event_id = Some(call_id.to_string());
+                    links.parent_tool_use_id = Some(call_id.to_string());
+                }
+                emit(Record {
+                    source: SourceKind::CodexSession,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: metadata.project.clone(),
+                    session_id: metadata.session_id.clone(),
+                    turn_id,
+                    role: "tool_result".to_string(),
+                    text,
+                    tool_name,
+                    tool_input: None,
+                    tool_output,
+                    links,
+                    source_path: source_path.clone(),
+                })?;
+                turn_id += 1;
+            }
+            "reasoning" => {
+                if payload.contains_key("encrypted_content") {
+                    diagnostics.encrypted_reasoning_dropped += 1;
+                }
+            }
+            _ => diagnostics.increment_unknown_semantic(payload_type),
         }
     }
 
@@ -422,7 +624,29 @@ pub(crate) fn parse_index_records(
         turn_id,
         pending_tool_calls,
         session_id: Some(metadata.session_id),
+        diagnostics,
     })
+}
+
+fn value_text(value: &BorrowedValue<'_>) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(array) = value.as_array() {
+        let text = array
+            .iter()
+            .filter_map(|item| {
+                item.as_object()
+                    .and_then(|object| object.get("text").or_else(|| object.get("content")))
+                    .and_then(|value| value.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    Some(value.to_string())
 }
 
 pub(crate) fn parse_history_records(
@@ -500,6 +724,7 @@ pub(crate) fn parse_history_records(
         turn_id,
         pending_tool_calls: state.pending_tool_calls,
         session_id: None,
+        diagnostics: Default::default(),
     })
 }
 
@@ -1167,5 +1392,80 @@ mod tests {
             ConversationKind::Subagent
         );
         assert_eq!(metadata.project.as_deref(), Some("memex"));
+    }
+
+    #[test]
+    fn parity_fixture_indexes_semantic_tools_and_filters_encrypted_reasoning() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codex.jsonl");
+        fs::write(
+            &path,
+            include_str!("../../fixtures/trajectory_parity/codex.jsonl"),
+        )
+        .unwrap();
+
+        let mut without_reasoning = Vec::new();
+        let parsed = parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                without_reasoning.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            !without_reasoning
+                .iter()
+                .any(|record| record.role == "reasoning")
+        );
+        assert_eq!(parsed.diagnostics.encrypted_reasoning_dropped, 1);
+        assert_eq!(parsed.diagnostics.malformed_json_lines, 1);
+        assert_eq!(
+            parsed
+                .diagnostics
+                .unknown_semantic_types
+                .get("future_semantic_event"),
+            Some(&1)
+        );
+
+        let mut with_reasoning = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            true,
+            &AtomicU64::new(1),
+            |record| {
+                with_reasoning.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(with_reasoning
+            .iter()
+            .any(|record| record.role == "reasoning"
+                && record.text == "Plaintext summary only"));
+        assert!(
+            with_reasoning
+                .iter()
+                .any(|record| record.tool_name.as_deref() == Some("apply_patch"))
+        );
+        assert!(
+            with_reasoning
+                .iter()
+                .any(|record| record.tool_name.as_deref() == Some("web_search"))
+        );
+        assert!(
+            with_reasoning
+                .iter()
+                .any(|record| record.tool_name.as_deref() == Some("tool_search"))
+        );
+        assert!(
+            !with_reasoning
+                .iter()
+                .any(|record| { record.text.contains("ciphertext-must-never-be-indexed") })
+        );
     }
 }

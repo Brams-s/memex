@@ -392,6 +392,7 @@ enum SourceChoice {
     Opencode,
     Cursor,
     Pi,
+    OpenClaw,
     Copilot,
 }
 
@@ -403,7 +404,8 @@ impl SourceChoice {
             SourceChoice::Codex => SourceChoice::Opencode,
             SourceChoice::Opencode => SourceChoice::Cursor,
             SourceChoice::Cursor => SourceChoice::Pi,
-            SourceChoice::Pi => SourceChoice::Copilot,
+            SourceChoice::Pi => SourceChoice::OpenClaw,
+            SourceChoice::OpenClaw => SourceChoice::Copilot,
             SourceChoice::Copilot => SourceChoice::All,
         }
     }
@@ -416,6 +418,7 @@ impl SourceChoice {
             SourceChoice::Opencode => Some(SourceFilter::Opencode),
             SourceChoice::Cursor => Some(SourceFilter::Cursor),
             SourceChoice::Pi => Some(SourceFilter::Pi),
+            SourceChoice::OpenClaw => Some(SourceFilter::OpenClaw),
             SourceChoice::Copilot => Some(SourceFilter::Copilot),
         }
     }
@@ -428,6 +431,7 @@ impl SourceChoice {
             SourceChoice::Opencode => "opencode",
             SourceChoice::Cursor => "cursor",
             SourceChoice::Pi => "pi",
+            SourceChoice::OpenClaw => "openclaw",
             SourceChoice::Copilot => "copilot",
         }
     }
@@ -916,10 +920,12 @@ impl App {
                 let opts = IngestOptions {
                     claude_source: default_claude_source(),
                     include_agents: false,
+                    include_reasoning: config.include_reasoning_default(),
                     include_codex: true,
                     include_opencode: true,
                     include_cursor: true,
                     include_pi: true,
+                    include_openclaw: true,
                     include_copilot: true,
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
@@ -2066,6 +2072,7 @@ impl App {
                 .pi_resume_cmd
                 .clone()
                 .or_else(|| default_resume_template("pi")),
+            SourceKind::OpenClaw => None,
             SourceKind::Copilot => self
                 .config
                 .copilot_resume_cmd
@@ -2105,6 +2112,7 @@ impl App {
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
+            SourceKind::OpenClaw => "pi",
             SourceKind::Copilot => "copilot",
         };
         let source_path = session.source_path.clone();
@@ -3476,6 +3484,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Opencode => label == "opencode",
         SourceChoice::Cursor => label == "cursor",
         SourceChoice::Pi => label == "pi",
+        SourceChoice::OpenClaw => label == "openclaw",
         SourceChoice::Copilot => label == "copilot",
         SourceChoice::All => false,
     }
@@ -3488,6 +3497,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Opencode => Color::Rgb(150, 180, 150),
         SourceKind::Cursor => Color::Rgb(170, 150, 200),
         SourceKind::Pi => Color::Rgb(120, 190, 190),
+        SourceKind::OpenClaw => Color::Rgb(235, 160, 110),
         SourceKind::Copilot => Color::Rgb(140, 160, 220),
     }
 }

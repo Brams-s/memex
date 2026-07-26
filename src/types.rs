@@ -10,17 +10,19 @@ pub enum SourceKind {
     Opencode,
     Cursor,
     Pi,
+    OpenClaw,
     Copilot,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 7] = [
+    pub const ALL: [SourceKind; 8] = [
         SourceKind::Claude,
         SourceKind::CodexSession,
         SourceKind::CodexHistory,
         SourceKind::Opencode,
         SourceKind::Cursor,
         SourceKind::Pi,
+        SourceKind::OpenClaw,
         SourceKind::Copilot,
     ];
     pub const COUNT: usize = Self::ALL.len();
@@ -33,7 +35,8 @@ impl SourceKind {
             SourceKind::Opencode => 3,
             SourceKind::Cursor => 4,
             SourceKind::Pi => 5,
-            SourceKind::Copilot => 6,
+            SourceKind::OpenClaw => 6,
+            SourceKind::Copilot => 7,
         }
     }
 
@@ -45,7 +48,8 @@ impl SourceKind {
             3 => Some(SourceKind::Opencode),
             4 => Some(SourceKind::Cursor),
             5 => Some(SourceKind::Pi),
-            6 => Some(SourceKind::Copilot),
+            6 => Some(SourceKind::OpenClaw),
+            7 => Some(SourceKind::Copilot),
             _ => None,
         }
     }
@@ -57,6 +61,7 @@ impl SourceKind {
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
+            SourceKind::OpenClaw => "openclaw",
             SourceKind::Copilot => "copilot",
         }
     }
@@ -69,6 +74,7 @@ impl SourceKind {
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
+            SourceKind::OpenClaw => "openclaw",
             SourceKind::Copilot => "copilot",
         }
     }
@@ -85,6 +91,7 @@ impl SourceKind {
             "opencode" => Some(SourceKind::Opencode),
             "cursor" => Some(SourceKind::Cursor),
             "pi" => Some(SourceKind::Pi),
+            "openclaw" => Some(SourceKind::OpenClaw),
             "copilot" => Some(SourceKind::Copilot),
             _ => None,
         }
@@ -99,6 +106,8 @@ pub enum SourceFilter {
     Opencode,
     Cursor,
     Pi,
+    #[value(name = "openclaw", alias = "open-claw")]
+    OpenClaw,
     Copilot,
 }
 
@@ -112,6 +121,7 @@ impl SourceFilter {
             SourceFilter::Opencode => source == SourceKind::Opencode,
             SourceFilter::Cursor => source == SourceKind::Cursor,
             SourceFilter::Pi => source == SourceKind::Pi,
+            SourceFilter::OpenClaw => source == SourceKind::OpenClaw,
             SourceFilter::Copilot => source == SourceKind::Copilot,
         }
     }
@@ -123,6 +133,7 @@ impl SourceFilter {
             SourceFilter::Opencode => &["opencode"],
             SourceFilter::Cursor => &["cursor"],
             SourceFilter::Pi => &["pi"],
+            SourceFilter::OpenClaw => &["openclaw"],
             SourceFilter::Copilot => &["copilot"],
         }
     }
@@ -134,6 +145,7 @@ impl SourceFilter {
             SourceFilter::Opencode => "opencode",
             SourceFilter::Cursor => "cursor",
             SourceFilter::Pi => "pi",
+            SourceFilter::OpenClaw => "openclaw",
             SourceFilter::Copilot => "copilot",
         }
     }
@@ -185,7 +197,8 @@ pub struct Record {
 
 #[cfg(test)]
 mod tests {
-    use super::SourceKind;
+    use super::{SourceFilter, SourceKind};
+    use clap::ValueEnum;
     use std::collections::HashSet;
 
     #[test]
@@ -198,6 +211,18 @@ mod tests {
             assert!(labels.insert(source.storage_label()));
             assert_eq!(SourceKind::from_label(source.storage_label()), Some(source));
         }
+    }
+
+    #[test]
+    fn openclaw_source_filter_uses_unhyphenated_cli_name() {
+        assert_eq!(
+            SourceFilter::from_str("openclaw", true),
+            Ok(SourceFilter::OpenClaw)
+        );
+        assert_eq!(
+            SourceFilter::from_str("open-claw", true),
+            Ok(SourceFilter::OpenClaw)
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::{IndexParseOutput, IndexParseState, ParserVersions, SourceFile};
+use super::{IndexParseOutput, IndexParseState, ParseDiagnostics, ParserVersions, SourceFile};
 use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 2,
-    usage: 3,
+    index: 3,
+    usage: 4,
 };
 
 pub fn matches_path(path: &str) -> bool {
@@ -156,6 +156,9 @@ fn content_text(content: Option<&BorrowedValue<'_>>) -> String {
             let Some(object) = item.as_object() else {
                 continue;
             };
+            if object.contains_key("encrypted_content") {
+                continue;
+            }
             match object
                 .get("type")
                 .and_then(|value| value.as_str())
@@ -166,10 +169,9 @@ fn content_text(content: Option<&BorrowedValue<'_>>) -> String {
                         parts.push(text.to_string());
                     }
                 }
-                "thinking" => {
-                    if let Some(text) = object.get("thinking").and_then(|value| value.as_str()) {
-                        parts.push(format!("Thinking:\n{text}"));
-                    }
+                "thinking" | "redacted_thinking" | "encrypted_reasoning" => {
+                    // Plaintext reasoning is projected separately as role=reasoning so it
+                    // remains BM25-only and is never embedded as assistant prose.
                 }
                 "toolCall" => {}
                 _ => {
@@ -218,6 +220,25 @@ fn bash_text(command: &str, output: &str, exit_code: Option<i64>) -> String {
 pub(crate) fn parse_index_records(
     path: &Path,
     state: IndexParseState,
+    include_reasoning: bool,
+    next_doc_id: &AtomicU64,
+    emit: impl FnMut(Record) -> Result<()>,
+) -> Result<IndexParseOutput> {
+    parse_index_records_for(
+        path,
+        state,
+        SourceKind::Pi,
+        include_reasoning,
+        next_doc_id,
+        emit,
+    )
+}
+
+pub(crate) fn parse_index_records_for(
+    path: &Path,
+    state: IndexParseState,
+    source: SourceKind,
+    include_reasoning: bool,
     next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
@@ -227,9 +248,10 @@ pub(crate) fn parse_index_records(
     let mut turn_id = state.turn_id;
 
     let source_path = path.to_string_lossy().to_string();
-    let mut session_id = crate::sources::pi::session_id_from_path(path);
-    let mut project = crate::sources::pi::project_from_path(path);
+    let mut session_id = session_id_from_path(path);
+    let mut project = project_from_path(path);
     let mut pending_tool_calls = state.pending_tool_calls;
+    let mut diagnostics = ParseDiagnostics::default();
 
     let mut buf = Vec::new();
     if start > 0 && !mmap.is_empty() {
@@ -258,18 +280,20 @@ pub(crate) fn parse_index_records(
         buf.extend_from_slice(line);
         let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                diagnostics.malformed_json_lines += 1;
+                continue;
+            }
         };
         let obj = match value.as_object() {
             Some(o) => o,
-            None => continue,
+            None => {
+                diagnostics.non_object_json_lines += 1;
+                continue;
+            }
         };
         let entry_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp = obj
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .and_then(super::common::parse_iso_millis)
-            .unwrap_or(0);
+        let timestamp = obj.get("timestamp").map(timestamp_millis).unwrap_or(0);
         let conversation_kind = match entry_type {
             "branch_summary" => "branch",
             "compaction" => "compaction",
@@ -292,7 +316,7 @@ pub(crate) fn parse_index_records(
                 continue;
             }
             let record = Record {
-                source: SourceKind::Pi,
+                source,
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
                 project: project.clone(),
@@ -323,7 +347,7 @@ pub(crate) fn parse_index_records(
                 format!("custom_message({custom_type})")
             };
             let record = Record {
-                source: SourceKind::Pi,
+                source,
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
                 project: project.clone(),
@@ -343,6 +367,12 @@ pub(crate) fn parse_index_records(
         }
 
         if entry_type != "message" {
+            if !matches!(
+                entry_type,
+                "model_change" | "thinking_level_change" | "session_info" | "label" | "custom"
+            ) {
+                diagnostics.increment_unknown_top_level(entry_type);
+            }
             continue;
         }
         let message = match obj.get("message").and_then(|v| v.as_object()) {
@@ -350,11 +380,7 @@ pub(crate) fn parse_index_records(
             None => continue,
         };
         let timestamp = if timestamp == 0 {
-            message
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .and_then(super::common::parse_iso_millis)
-                .unwrap_or(0)
+            message.get("timestamp").map(timestamp_millis).unwrap_or(0)
         } else {
             timestamp
         };
@@ -383,7 +409,56 @@ pub(crate) fn parse_index_records(
                         let Some(block_obj) = block.as_object() else {
                             continue;
                         };
-                        if block_obj.get("type").and_then(|v| v.as_str()) != Some("toolCall") {
+                        let block_type = block_obj
+                            .get("type")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        if block_type == "thinking" {
+                            let thinking = block_obj
+                                .get("thinking")
+                                .and_then(|value| value.as_str())
+                                .map(str::trim)
+                                .filter(|text| !text.is_empty());
+                            if let Some(thinking) = thinking {
+                                if include_reasoning {
+                                    let mut links = base_links.clone();
+                                    links.event_id = base_links
+                                        .event_id
+                                        .as_ref()
+                                        .map(|id| format!("{id}:reasoning"));
+                                    emit(Record {
+                                        source,
+                                        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                                        ts: timestamp,
+                                        project: project.clone(),
+                                        session_id: session_id.clone(),
+                                        turn_id,
+                                        role: "reasoning".to_string(),
+                                        text: thinking.to_string(),
+                                        tool_name: None,
+                                        tool_input: None,
+                                        tool_output: None,
+                                        links,
+                                        source_path: source_path.clone(),
+                                    })?;
+                                    turn_id += 1;
+                                }
+                            } else if block_obj.contains_key("encrypted_content")
+                                || block_obj.contains_key("data")
+                                || block_obj.contains_key("signature")
+                            {
+                                diagnostics.encrypted_reasoning_dropped += 1;
+                            }
+                            continue;
+                        }
+                        if matches!(block_type, "redacted_thinking" | "encrypted_reasoning") {
+                            diagnostics.encrypted_reasoning_dropped += 1;
+                            continue;
+                        }
+                        if block_type != "toolCall" {
+                            if !matches!(block_type, "text" | "image") {
+                                diagnostics.increment_unknown_semantic(block_type);
+                            }
                             continue;
                         }
                         let tool_name = block_obj
@@ -402,7 +477,7 @@ pub(crate) fn parse_index_records(
                         }
                         let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
                         if let Some(tool_call_id) = tool_call_id {
-                            pending_tool_calls.insert(
+                            let replaced = pending_tool_calls.insert(
                                 tool_call_id.clone(),
                                 super::common::pending_tool_call(
                                     tool_name.clone(),
@@ -414,9 +489,12 @@ pub(crate) fn parse_index_records(
                                     &session_id,
                                 ),
                             );
+                            if replaced.is_some() {
+                                diagnostics.duplicate_tool_calls += 1;
+                            }
                         }
                         let record = Record {
-                            source: SourceKind::Pi,
+                            source,
                             doc_id,
                             ts: timestamp,
                             project: project.clone(),
@@ -440,7 +518,7 @@ pub(crate) fn parse_index_records(
                     continue;
                 }
                 let record = Record {
-                    source: SourceKind::Pi,
+                    source,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -457,7 +535,7 @@ pub(crate) fn parse_index_records(
                 emit(record)?;
                 turn_id += 1;
             }
-            "toolResult" => {
+            "toolResult" | "tool" => {
                 let tool_call_id = message
                     .get("toolCallId")
                     .and_then(|v| v.as_str())
@@ -472,10 +550,19 @@ pub(crate) fn parse_index_records(
                             .flatten()
                             .and_then(|call| call.tool_name.clone())
                     });
-                if !tool_call_id.is_empty() {
-                    pending_tool_calls.remove(tool_call_id);
+                if !tool_call_id.is_empty() && pending_tool_calls.remove(tool_call_id).is_none() {
+                    diagnostics.orphan_tool_results += 1;
                 }
-                let tool_output = Some(content_text(message.get("content")));
+                let mut output = content_text(message.get("content"));
+                if message
+                    .get("isError")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                    && !output.to_ascii_lowercase().starts_with("error")
+                {
+                    output = format!("Error: {output}");
+                }
+                let tool_output = Some(output);
                 let text = tool_output.clone().unwrap_or_default();
                 if text.trim().is_empty() {
                     continue;
@@ -485,7 +572,7 @@ pub(crate) fn parse_index_records(
                     links.parent_tool_use_id = Some(tool_call_id.to_string());
                 }
                 let record = Record {
-                    source: SourceKind::Pi,
+                    source,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -526,7 +613,7 @@ pub(crate) fn parse_index_records(
                     continue;
                 }
                 let record = Record {
-                    source: SourceKind::Pi,
+                    source,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -557,7 +644,7 @@ pub(crate) fn parse_index_records(
                     continue;
                 }
                 let record = Record {
-                    source: SourceKind::Pi,
+                    source,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -574,7 +661,7 @@ pub(crate) fn parse_index_records(
                 emit(record)?;
                 turn_id += 1;
             }
-            _ => {}
+            _ => diagnostics.increment_unknown_semantic(role),
         }
     }
 
@@ -583,10 +670,19 @@ pub(crate) fn parse_index_records(
         turn_id,
         pending_tool_calls,
         session_id: Some(session_id),
+        diagnostics,
     })
 }
 
 pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
+    parse_usage_file_for(path, "pi", &[])
+}
+
+pub(crate) fn parse_usage_file_for(
+    path: &Path,
+    source: &'static str,
+    excluded_models: &[&str],
+) -> Result<Vec<UsageEvent>> {
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let source_path: Arc<str> = Arc::from(path.to_string_lossy());
@@ -683,7 +779,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
         );
         if tokens.additive_total() > 0 {
             events.push(UsageEvent {
-                source: "pi",
+                source,
                 source_path: source_path.clone(),
                 source_record_id: Some(format!("line:{index}")),
                 session_id: Some(session.clone()),
@@ -696,7 +792,8 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                     .or_else(|| current_provider.clone()),
                 model: borrowed_string(message, &["model", "modelId"])
                     .or_else(|| borrowed_string(&value, &["model", "modelId"]))
-                    .or_else(|| current_model.clone()),
+                    .or_else(|| current_model.clone())
+                    .filter(|model| !excluded_models.contains(&model.as_str())),
                 tokens,
                 source_cost_usd: usage
                     .get("cost")
@@ -739,4 +836,74 @@ fn timestamp_millis(value: &BorrowedValue<'_>) -> u64 {
         })
         .or_else(|| value.as_str().and_then(super::common::parse_iso_millis))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn parity_fixture_supports_aliases_errors_numeric_timestamps_and_opt_in_reasoning() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pi.jsonl");
+        fs::write(
+            &path,
+            include_str!("../../fixtures/trajectory_parity/pi.jsonl"),
+        )
+        .unwrap();
+
+        let mut without_reasoning = Vec::new();
+        let parsed = parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                without_reasoning.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            !without_reasoning
+                .iter()
+                .any(|record| record.role == "reasoning")
+        );
+        let result = without_reasoning
+            .iter()
+            .find(|record| record.role == "tool_result")
+            .unwrap();
+        assert_eq!(result.ts, 1_782_864_002_000);
+        assert_eq!(result.text, "Error: permission denied");
+        assert_eq!(parsed.diagnostics.malformed_json_lines, 1);
+        assert_eq!(parsed.diagnostics.encrypted_reasoning_dropped, 1);
+        assert_eq!(
+            parsed.diagnostics.unknown_semantic_types.get("futureRole"),
+            Some(&1)
+        );
+
+        let mut with_reasoning = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            true,
+            &AtomicU64::new(1),
+            |record| {
+                with_reasoning.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            with_reasoning.iter().any(|record| {
+                record.role == "reasoning" && record.text == "Plain Pi reasoning"
+            })
+        );
+        assert!(
+            !with_reasoning
+                .iter()
+                .any(|record| record.text.contains("ciphertext-must-never-be-indexed"))
+        );
+    }
 }
