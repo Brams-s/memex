@@ -1,6 +1,6 @@
 use super::{
-    ConversationKind, IndexParseOutput, IndexParseState, ParserVersions, SessionIdentity,
-    SourceFile, SourceMetadata,
+    ConversationKind, IndexParseOutput, IndexParseState, ParseDiagnostics, ParserVersions,
+    SessionIdentity, SourceFile, SourceMetadata,
 };
 use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
-    identity: 1,
-    index: 2,
+    identity: 2,
+    index: 3,
     usage: 4,
 };
 
@@ -30,12 +30,23 @@ pub fn discover(root: &Path, include_agents: bool) -> Result<Vec<SourceFile>> {
         {
             continue;
         }
-        if !include_agents
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with("agent-"))
-        {
+        let name = entry.file_name().to_string_lossy();
+        let is_agent = name.starts_with("agent-");
+        let under_subagents = entry.path().ancestors().any(|ancestor| {
+            ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents")
+        });
+        if is_agent && !include_agents {
+            continue;
+        }
+        if under_subagents && (!include_agents || !is_agent) {
+            continue;
+        }
+        let relative_depth = entry
+            .path()
+            .strip_prefix(root)
+            .map(|path| path.components().count())
+            .unwrap_or(0);
+        if relative_depth > 2 && !under_subagents {
             continue;
         }
         files.push(SourceFile {
@@ -221,6 +232,7 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
 pub(crate) fn parse_index_records(
     path: &Path,
     state: IndexParseState,
+    include_reasoning: bool,
     next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
@@ -238,6 +250,7 @@ pub(crate) fn parse_index_records(
     let is_agent_file = is_subagent_path(path);
     let source_path = path.to_string_lossy().to_string();
     let mut buffer = Vec::new();
+    let mut diagnostics = ParseDiagnostics::default();
 
     while start < mmap.len() {
         let slice = &mmap[start..];
@@ -249,10 +262,15 @@ pub(crate) fn parse_index_records(
         }
         buffer.clear();
         buffer.extend_from_slice(line);
-        let Ok(value) = simd_json::to_borrowed_value(&mut buffer) else {
-            continue;
+        let value = match simd_json::to_borrowed_value(&mut buffer) {
+            Ok(value) => value,
+            Err(_) => {
+                diagnostics.malformed_json_lines += 1;
+                continue;
+            }
         };
         let Some(object) = value.as_object() else {
+            diagnostics.non_object_json_lines += 1;
             continue;
         };
         let entry_type = object
@@ -260,6 +278,24 @@ pub(crate) fn parse_index_records(
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if entry_type != "user" && entry_type != "assistant" {
+            if !matches!(
+                entry_type,
+                "progress"
+                    | "summary"
+                    | "system"
+                    | "file-history-snapshot"
+                    | "queue-operation"
+                    | "pr-link"
+                    | "last-prompt"
+                    | "custom-title"
+                    | "ai-title"
+                    | "agent-name"
+                    | "permission-mode"
+                    | "attachment"
+                    | "mode"
+            ) {
+                diagnostics.increment_unknown_top_level(entry_type);
+            }
             continue;
         }
         let entry_uuid = super::common::borrowed_string(object, "uuid");
@@ -300,6 +336,7 @@ pub(crate) fn parse_index_records(
         };
         let content = message.get("content");
         let mut text_parts = Vec::new();
+        let mut content_index = 0usize;
         if let Some(content) = content {
             if let Some(text) = content.as_str() {
                 text_parts.push(text);
@@ -339,7 +376,7 @@ pub(crate) fn parse_index_records(
                             }
                             let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
                             if let Some(tool_id) = tool_id {
-                                pending_tool_calls.insert(
+                                let replaced = pending_tool_calls.insert(
                                     tool_id.clone(),
                                     super::common::pending_tool_call(
                                         tool_name.clone(),
@@ -351,6 +388,9 @@ pub(crate) fn parse_index_records(
                                         &session_id,
                                     ),
                                 );
+                                if replaced.is_some() {
+                                    diagnostics.duplicate_tool_calls += 1;
+                                }
                             }
                             emit(Record {
                                 source: SourceKind::Claude,
@@ -369,8 +409,48 @@ pub(crate) fn parse_index_records(
                             })?;
                             turn_id += 1;
                         }
-                        _ => {}
+                        "thinking" => {
+                            let thinking = block_object
+                                .get("thinking")
+                                .and_then(|value| value.as_str())
+                                .map(str::trim)
+                                .filter(|text| !text.is_empty());
+                            if let Some(thinking) = thinking {
+                                if include_reasoning {
+                                    let mut links = entry_links.clone();
+                                    links.event_id = entry_uuid
+                                        .as_ref()
+                                        .map(|uuid| format!("{uuid}:reasoning:{content_index}"));
+                                    emit(Record {
+                                        source: SourceKind::Claude,
+                                        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                                        ts: timestamp,
+                                        project: project.clone(),
+                                        session_id: session_id.clone(),
+                                        turn_id,
+                                        role: "reasoning".to_string(),
+                                        text: thinking.to_string(),
+                                        tool_name: None,
+                                        tool_input: None,
+                                        tool_output: None,
+                                        links,
+                                        source_path: source_path.clone(),
+                                    })?;
+                                    turn_id += 1;
+                                }
+                            } else if block_object.contains_key("signature")
+                                || block_object.contains_key("data")
+                            {
+                                diagnostics.encrypted_reasoning_dropped += 1;
+                            }
+                        }
+                        "redacted_thinking" => {
+                            diagnostics.encrypted_reasoning_dropped += 1;
+                        }
+                        "tool_result" | "image" => {}
+                        unknown => diagnostics.increment_unknown_semantic(unknown),
                     }
+                    content_index += 1;
                 }
             }
         }
@@ -397,10 +477,13 @@ pub(crate) fn parse_index_records(
                     .get("tool_use_id")
                     .and_then(|value| value.as_str())
                     .map(str::to_string);
-                let tool_name = tool_use_id
+                let pending = tool_use_id
                     .as_ref()
-                    .and_then(|id| pending_tool_calls.remove(id))
-                    .and_then(|call| call.tool_name);
+                    .and_then(|id| pending_tool_calls.remove(id));
+                if tool_use_id.is_some() && pending.is_none() {
+                    diagnostics.orphan_tool_results += 1;
+                }
+                let tool_name = pending.and_then(|call| call.tool_name);
                 let mut links = entry_links.clone();
                 if let Some(tool_use_id) = &tool_use_id {
                     links.event_id = entry_uuid
@@ -454,6 +537,7 @@ pub(crate) fn parse_index_records(
         turn_id,
         pending_tool_calls,
         session_id: Some(session_id),
+        diagnostics,
     })
 }
 
@@ -664,6 +748,22 @@ mod tests {
     }
 
     #[test]
+    fn discovery_excludes_nested_workflow_journals() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("project/session/subagents/workflows/run");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(subagents.join("agent-child.jsonl"), "{}\n").unwrap();
+        fs::write(subagents.join("journal.jsonl"), "{}\n").unwrap();
+
+        let files = discover(temp.path(), true).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path.file_name().and_then(|name| name.to_str()),
+            Some("agent-child.jsonl")
+        );
+    }
+
+    #[test]
     fn probe_shares_sidechain_session_and_project_identity() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("-Users-nico-Code-memex");
@@ -733,5 +833,56 @@ mod tests {
         let events = parse_usage_file(&path).unwrap();
         assert_eq!(events[0].timestamp_ms, 1_776_386_452_000);
         assert_eq!(events[1].timestamp_ms, 1_776_386_452_437);
+    }
+
+    #[test]
+    fn parity_fixture_makes_plain_reasoning_opt_in_and_drops_redacted_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claude.jsonl");
+        fs::write(
+            &path,
+            include_str!("../../fixtures/trajectory_parity/claude.jsonl"),
+        )
+        .unwrap();
+
+        let mut without_reasoning = Vec::new();
+        let parsed = parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                without_reasoning.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            !without_reasoning
+                .iter()
+                .any(|record| record.role == "reasoning")
+        );
+        assert_eq!(parsed.diagnostics.encrypted_reasoning_dropped, 1);
+        assert_eq!(parsed.diagnostics.malformed_json_lines, 1);
+
+        let mut with_reasoning = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            true,
+            &AtomicU64::new(1),
+            |record| {
+                with_reasoning.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(with_reasoning.iter().any(|record| {
+            record.role == "reasoning" && record.text == "Plain Claude reasoning"
+        }));
+        assert!(!with_reasoning.iter().any(|record| {
+            record.text.contains("ciphertext-must-never-be-indexed")
+                || record.text.contains("signature-must-never-be-indexed")
+        }));
     }
 }

@@ -28,7 +28,7 @@ use std::time::Duration;
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, and Copilot",
+    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, OpenClaw, and Copilot",
     after_help = "\
 QUICK START:
     memex                           # Browse sessions interactively
@@ -52,6 +52,9 @@ struct IndexArgs {
     /// Include agent subprocess conversations (Claude Code subagents)
     #[arg(long)]
     include_agents: bool,
+    /// Index plaintext reasoning as BM25-only records (encrypted/redacted reasoning is always dropped)
+    #[arg(long)]
+    include_reasoning: bool,
     /// Index Codex sessions from ~/.codex [default: true]
     #[arg(long, default_value_t = true)]
     codex: bool,
@@ -73,6 +76,12 @@ struct IndexArgs {
     /// Skip indexing Pi sessions
     #[arg(long = "no-pi", default_value_t = false)]
     no_pi: bool,
+    /// Index OpenClaw sessions from ~/.openclaw or ~/.clawdbot [default: true]
+    #[arg(long, default_value_t = true)]
+    openclaw: bool,
+    /// Skip indexing OpenClaw sessions
+    #[arg(long = "no-openclaw", default_value_t = false)]
+    no_openclaw: bool,
     /// Index GitHub Copilot CLI sessions from ~/.copilot [default: true]
     #[arg(long, default_value_t = true)]
     copilot: bool,
@@ -91,12 +100,15 @@ struct IndexArgs {
     /// Path to memex data directory [default: ~/.memex]
     #[arg(long)]
     root: Option<PathBuf>,
+    /// Print aggregate parser diagnostics without transcript content
+    #[arg(long)]
+    diagnostics: bool,
 }
 
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Index Claude, Codex, Cursor, OpenCode, Pi, and Copilot conversation history
+    /// Index Claude, Codex, Cursor, OpenCode, Pi, OpenClaw, and Copilot conversation history
     #[command(after_help = "\
 EXAMPLES:
     memex index                         # Index all supported local history
@@ -162,7 +174,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -257,7 +269,7 @@ EXAMPLES:
     memex usage --source codex --since 2026-07-01
     memex usage --json")]
     Usage {
-        /// Filter by source: claude, codex, cursor, opencode, pi, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include events on or after this date/timestamp
@@ -285,6 +297,13 @@ EXAMPLES:
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    /// Report privacy-safe transcript structure and producer-version counts
+    #[command(hide = true)]
+    SourceAudit {
+        /// Limit the audit to one source
+        #[arg(long)]
+        source: Option<SourceFilter>,
     },
     /// Install the memex-search skill for Claude, Codex, Opencode, and/or Pi
     Setup {
@@ -579,6 +598,10 @@ pub fn run() -> Result<()> {
         Commands::AnalyticsBackfill { root } => {
             run_analytics_backfill(root)?;
         }
+        Commands::SourceAudit { source } => {
+            let audits = crate::sources::audit::audit_installed_sources(source)?;
+            println!("{}", serde_json::to_string_pretty(&audits)?);
+        }
         Commands::Setup { force } => {
             run_setup(force)?;
         }
@@ -619,16 +642,19 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
     run_index(
         index.source.clone(),
         index.include_agents,
+        index.include_reasoning,
         index.codex && !index.no_codex,
         index.opencode && !index.no_opencode,
         index.cursor,
         index.pi && !index.no_pi,
+        index.openclaw && !index.no_openclaw,
         index.copilot && !index.no_copilot,
         index.embeddings,
         index.no_embeddings,
         index.model.clone(),
         index.root.clone(),
         reindex,
+        index.diagnostics,
     )
 }
 
@@ -636,16 +662,19 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
 fn run_index(
     source: Option<PathBuf>,
     include_agents: bool,
+    include_reasoning: bool,
     codex: bool,
     opencode: bool,
     cursor: bool,
     pi: bool,
+    openclaw: bool,
     copilot: bool,
     embeddings_flag: bool,
     no_embeddings: bool,
     model: Option<String>,
     root: Option<PathBuf>,
     reindex: bool,
+    print_diagnostics: bool,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
@@ -654,6 +683,7 @@ fn run_index(
     let model_choice = config.resolve_model(model)?;
     let embed_runtime = config.resolve_embed_runtime()?;
     let tool_content_limits = config.indexed_tool_content_limits()?;
+    let include_reasoning = include_reasoning || config.include_reasoning_default();
     let embeddings = resolve_flag(
         config.embeddings_default(),
         embeddings_flag,
@@ -669,10 +699,12 @@ fn run_index(
     let opts = IngestOptions {
         claude_source: source.unwrap_or_else(default_claude_source),
         include_agents,
+        include_reasoning,
         include_codex: codex,
         include_opencode: opencode,
         include_cursor: cursor,
         include_pi: pi,
+        include_openclaw: openclaw,
         include_copilot: copilot,
         embeddings,
         backfill_embeddings: false,
@@ -694,6 +726,12 @@ fn run_index(
         println!(
             "indexed {} records across {} files (skipped {})",
             report.records_added, report.files_scanned, report.files_skipped
+        );
+    }
+    if print_diagnostics && !report.diagnostics.is_empty() {
+        println!(
+            "parser diagnostics:\n{}",
+            serde_json::to_string_pretty(&report.diagnostics)?
         );
     }
     Ok(())
@@ -788,7 +826,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     vector.save()?;
     progress.finish();
     println!(
-        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {}, pi {}, copilot {})",
+        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {})",
         embedded_total,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
         embedded_counts[crate::types::SourceKind::CodexSession.idx()],
@@ -796,6 +834,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
         embedded_counts[crate::types::SourceKind::Opencode.idx()],
         embedded_counts[crate::types::SourceKind::Cursor.idx()],
         embedded_counts[crate::types::SourceKind::Pi.idx()],
+        embedded_counts[crate::types::SourceKind::OpenClaw.idx()],
         embedded_counts[crate::types::SourceKind::Copilot.idx()],
     );
 
@@ -841,10 +880,12 @@ fn run_search(
         let opts = IngestOptions {
             claude_source: default_claude_source(),
             include_agents: false,
+            include_reasoning: config.include_reasoning_default(),
             include_codex: true,
             include_opencode: true,
             include_cursor: true,
             include_pi: true,
+            include_openclaw: true,
             include_copilot: true,
             embeddings: embeddings_default,
             backfill_embeddings: false,
@@ -1953,6 +1994,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Opencode => "opencode",
         crate::types::SourceKind::Cursor => "cursor",
         crate::types::SourceKind::Pi => "pi",
+        crate::types::SourceKind::OpenClaw => "openclaw",
         crate::types::SourceKind::Copilot => "copilot",
     };
     let source_path = &record.source_path;
@@ -2564,6 +2606,9 @@ fn build_index_command_args(
     if index.include_agents {
         args.push("--include-agents".to_string());
     }
+    if index.include_reasoning {
+        args.push("--include-reasoning".to_string());
+    }
     if !index.codex || index.no_codex {
         args.push("--no-codex".to_string());
     }
@@ -2576,6 +2621,9 @@ fn build_index_command_args(
     if !index.pi || index.no_pi {
         args.push("--no-pi".to_string());
     }
+    if !index.openclaw || index.no_openclaw {
+        args.push("--no-openclaw".to_string());
+    }
     if !index.copilot || index.no_copilot {
         args.push("--no-copilot".to_string());
     }
@@ -2584,6 +2632,9 @@ fn build_index_command_args(
     }
     if index.no_embeddings {
         args.push("--no-embeddings".to_string());
+    }
+    if index.diagnostics {
+        args.push("--diagnostics".to_string());
     }
     if continuous {
         args.push("--watch".to_string());
@@ -3272,19 +3323,23 @@ mod tests {
         let index = IndexArgs {
             source: None,
             include_agents: false,
+            include_reasoning: false,
             codex: false,
             opencode: false,
             cursor: false,
             pi: false,
+            openclaw: false,
             copilot: false,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
+            no_openclaw: false,
             no_copilot: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
             root: None,
+            diagnostics: false,
         };
 
         let args = build_index_command_args(&index, false, 30);
@@ -3293,6 +3348,7 @@ mod tests {
         assert!(args.contains(&"--no-opencode".to_string()));
         assert!(args.contains(&"--no-cursor".to_string()));
         assert!(args.contains(&"--no-pi".to_string()));
+        assert!(args.contains(&"--no-openclaw".to_string()));
         assert!(args.contains(&"--no-copilot".to_string()));
     }
 

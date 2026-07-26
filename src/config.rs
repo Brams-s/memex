@@ -68,6 +68,8 @@ impl Default for IndexedToolContentLimits {
 pub struct UserConfig {
     pub embeddings: Option<bool>,
     pub auto_index_on_search: Option<bool>,
+    /// Index plaintext model reasoning. Encrypted/redacted reasoning is always excluded.
+    pub include_reasoning: Option<bool>,
     /// Reconstruct token usage from local agent logs (disabled by default).
     pub token_usage: Option<bool>,
     /// Embedding model: minilm, bge, nomic, gemma (default), potion
@@ -140,6 +142,10 @@ impl UserConfig {
 
     pub fn auto_index_on_search_default(&self) -> bool {
         self.auto_index_on_search.unwrap_or(true)
+    }
+
+    pub fn include_reasoning_default(&self) -> bool {
+        self.include_reasoning.unwrap_or(false)
     }
 
     pub fn token_usage_enabled(&self) -> bool {
@@ -286,6 +292,18 @@ mod tests {
     #[test]
     fn token_usage_is_disabled_by_default() {
         assert!(!UserConfig::default().token_usage_enabled());
+    }
+
+    #[test]
+    fn reasoning_is_opt_in() {
+        assert!(!UserConfig::default().include_reasoning_default());
+        assert!(
+            UserConfig {
+                include_reasoning: Some(true),
+                ..UserConfig::default()
+            }
+            .include_reasoning_default()
+        );
     }
 
     #[test]

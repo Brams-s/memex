@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, and GitHub Copilot CLI logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, OpenClaw, and GitHub Copilot CLI logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
@@ -83,6 +83,7 @@ Configure memex declaratively (generates `~/.memex/config.toml`):
           enable = true;
           settings = {
             embeddings = true;
+            include_reasoning = false;
             model = "minilm";
             execution_provider = "auto"; # coreml on macOS, cpu elsewhere
             cuda_device_id = 0; # optional when execution_provider = "cuda"
@@ -116,6 +117,10 @@ Index (incremental):
 ```
 memex index
 ```
+
+Plaintext reasoning is excluded by default because it is usually low-value search noise. Opt
+in with `memex index --include-reasoning`; reasoning records remain BM25-only. Encrypted and
+redacted payloads, along with reasoning signature fields, are always excluded.
 
 Search (JSONL default):
 ```
@@ -154,7 +159,7 @@ Token tracking is disabled by default because it scans and caches local agent lo
 token_usage = true
 ```
 
-Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, and Copilot logs:
+Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, OpenClaw, and Copilot logs:
 
 ```
 memex usage
@@ -210,7 +215,7 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents a
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|copilot`
+- `--source claude|codex|cursor|opencode|pi|openclaw|copilot`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
@@ -303,6 +308,7 @@ Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 ```toml
 embeddings = true
 auto_index_on_search = true
+include_reasoning = false  # opt in to plaintext reasoning; encrypted/redacted payloads stay excluded
 token_usage = false  # opt in to local token and cost tracking
 model = "minilm"  # minilm, bge, nomic, gemma, potion
 execution_provider = "auto"  # auto, cpu, coreml, cuda
@@ -329,6 +335,9 @@ pi_resume_cmd = "pi --session {source_path_shell}"
 Service logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.
 
 `scan_cache_ttl` controls how long auto-indexing considers scans fresh.
+`include_reasoning` defaults to false. Set it to true (or pass `memex index
+--include-reasoning`) to add plaintext reasoning as BM25-only records. Encrypted
+and redacted reasoning payloads are always excluded.
 `max_indexed_tool_*_bytes` limits oversized tool payloads while leaving user and assistant text
 unchanged. memex keeps roughly the first three quarters and final quarter, with a marker reporting
 the omitted middle. Each value must be at least 1024 bytes. Run `memex index --reindex` to apply

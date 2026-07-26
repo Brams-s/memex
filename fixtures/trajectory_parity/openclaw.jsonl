@@ -1,0 +1,2 @@
+{"type":"session","id":"openclaw-session","timestamp":"2026-07-01T00:00:00Z","cwd":"/workspace/openclaw"}
+{"type":"message","id":"assistant-1","timestamp":1782864001000,"message":{"role":"assistant","model":"delivery-mirror","content":[{"type":"text","text":"Mirrored assistant prose"}],"usage":{"input":2,"output":3}}}

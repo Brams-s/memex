@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 const EMBED_BATCH_SIZE: usize = 64;
 const EMBED_MAX_CHARS: usize = 8192;
@@ -29,10 +29,12 @@ const RECORD_CHANNEL_CAPACITY: usize = 8;
 pub struct IngestOptions {
     pub claude_source: PathBuf,
     pub include_agents: bool,
+    pub include_reasoning: bool,
     pub include_codex: bool,
     pub include_opencode: bool,
     pub include_cursor: bool,
     pub include_pi: bool,
+    pub include_openclaw: bool,
     pub include_copilot: bool,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
@@ -47,6 +49,7 @@ pub struct IngestReport {
     pub records_embedded: usize,
     pub files_scanned: usize,
     pub files_skipped: usize,
+    pub diagnostics: crate::sources::ParseDiagnostics,
 }
 
 #[derive(Debug)]
@@ -69,6 +72,7 @@ struct FileUpdate {
     path: String,
     state: FileState,
     session_id: Option<String>,
+    diagnostics: crate::sources::ParseDiagnostics,
 }
 
 const FILE_IDENTITY_PREFIX_BYTES: usize = 4096;
@@ -125,6 +129,7 @@ fn file_was_replaced(previous: &FileIdentity, current: &FileIdentity) -> bool {
 fn prepare_file_task(
     path: PathBuf,
     source: SourceKind,
+    include_reasoning: bool,
     metadata: &std::fs::Metadata,
     previous: Option<&FileState>,
 ) -> (FileTask, bool) {
@@ -146,7 +151,7 @@ fn prepare_file_task(
         .unwrap_or_else(|| size.min(FILE_IDENTITY_PREFIX_BYTES as u64))
         .min(size) as usize;
     let identity = file_identity(&path, metadata, prefix_bytes);
-    let parser_version = crate::sources::index_state_version(source);
+    let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
     let parser_version_invalidated =
         previous.is_some_and(|previous| previous.parser_version != parser_version);
     let (offset, turn_id, delete_first, pending_tool_calls, skip) = match previous {
@@ -221,15 +226,39 @@ fn completed_file_state(
 struct RecordSender {
     sender: Sender<Record>,
     limits: IndexedToolContentLimits,
+    diagnostics: Arc<Mutex<crate::sources::ParseDiagnostics>>,
 }
 
 impl RecordSender {
+    #[cfg(test)]
     fn new(sender: Sender<Record>, limits: IndexedToolContentLimits) -> Self {
-        Self { sender, limits }
+        Self::with_diagnostics(
+            sender,
+            limits,
+            Arc::new(Mutex::new(crate::sources::ParseDiagnostics::default())),
+        )
+    }
+
+    fn with_diagnostics(
+        sender: Sender<Record>,
+        limits: IndexedToolContentLimits,
+        diagnostics: Arc<Mutex<crate::sources::ParseDiagnostics>>,
+    ) -> Self {
+        Self {
+            sender,
+            limits,
+            diagnostics,
+        }
     }
 
     fn send(&self, mut record: Record) -> Result<()> {
-        limit_record_tool_content(&mut record, self.limits);
+        let (input_truncated, output_truncated) =
+            limit_record_tool_content(&mut record, self.limits);
+        if input_truncated || output_truncated {
+            let mut diagnostics = self.diagnostics.lock().unwrap();
+            diagnostics.truncated_tool_inputs += u64::from(input_truncated);
+            diagnostics.truncated_tool_outputs += u64::from(output_truncated);
+        }
         self.sender.send(record)?;
         Ok(())
     }
@@ -330,8 +359,13 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let (task, skip) =
-                prepare_file_task(path, SourceKind::Claude, &meta, state.files.get(&key));
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Claude,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
             if skip {
                 files_skipped += 1;
                 continue;
@@ -352,8 +386,13 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let (task, skip) =
-                prepare_file_task(path, SourceKind::CodexSession, &meta, state.files.get(&key));
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::CodexSession,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
             if skip {
                 files_skipped += 1;
                 continue;
@@ -371,6 +410,7 @@ pub fn ingest_all(
             let (task, skip) = prepare_file_task(
                 history_path,
                 SourceKind::CodexHistory,
+                options.include_reasoning,
                 &meta,
                 state.files.get(&key),
             );
@@ -390,8 +430,13 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let (task, skip) =
-                prepare_file_task(path, SourceKind::Opencode, &meta, state.files.get(&key));
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Opencode,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
             if skip {
                 files_skipped += 1;
                 continue;
@@ -408,8 +453,13 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let (task, skip) =
-                prepare_file_task(path, SourceKind::Cursor, &meta, state.files.get(&key));
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Cursor,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
             if skip {
                 files_skipped += 1;
                 continue;
@@ -426,8 +476,35 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let (task, skip) =
-                prepare_file_task(path, SourceKind::Pi, &meta, state.files.get(&key));
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Pi,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+
+    if options.include_openclaw {
+        for source_file in crate::sources::openclaw::discover() {
+            let path = source_file.path;
+            let meta = path.metadata()?;
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::OpenClaw,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
             if skip {
                 files_skipped += 1;
                 continue;
@@ -444,8 +521,13 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let (task, skip) =
-                prepare_file_task(path, SourceKind::Copilot, &meta, state.files.get(&key));
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Copilot,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
             if skip {
                 files_skipped += 1;
                 continue;
@@ -475,6 +557,7 @@ pub fn ingest_all(
             records_embedded: 0,
             files_scanned,
             files_skipped,
+            diagnostics: Default::default(),
         });
     }
 
@@ -483,7 +566,12 @@ pub fn ingest_all(
     let progress = Arc::new(Progress::new(totals, file_totals, embeddings));
 
     let (raw_tx_record, rx_record) = record_channel();
-    let tx_record = RecordSender::new(raw_tx_record, options.tool_content_limits);
+    let shared_diagnostics = Arc::new(Mutex::new(crate::sources::ParseDiagnostics::default()));
+    let tx_record = RecordSender::with_diagnostics(
+        raw_tx_record,
+        options.tool_content_limits,
+        shared_diagnostics.clone(),
+    );
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
 
     let delete_paths: Vec<String> = tasks
@@ -509,12 +597,22 @@ pub fn ingest_all(
     let tasks_arc = Arc::new(tasks);
     tasks_arc.par_iter().try_for_each(|task| -> Result<()> {
         match task.source {
-            SourceKind::Claude => {
-                parse_claude_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?
-            }
-            SourceKind::CodexSession => {
-                parse_codex_session(task, &tx_record, &tx_update, &next_doc_id, &progress)?
-            }
+            SourceKind::Claude => parse_claude_file(
+                task,
+                options.include_reasoning,
+                &tx_record,
+                &tx_update,
+                &next_doc_id,
+                &progress,
+            )?,
+            SourceKind::CodexSession => parse_codex_session(
+                task,
+                options.include_reasoning,
+                &tx_record,
+                &tx_update,
+                &next_doc_id,
+                &progress,
+            )?,
             SourceKind::CodexHistory => parse_codex_history(
                 task,
                 &tx_record,
@@ -534,7 +632,22 @@ pub fn ingest_all(
             SourceKind::Cursor => {
                 parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?
             }
-            SourceKind::Pi => parse_pi_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?,
+            SourceKind::Pi => parse_pi_file(
+                task,
+                options.include_reasoning,
+                &tx_record,
+                &tx_update,
+                &next_doc_id,
+                &progress,
+            )?,
+            SourceKind::OpenClaw => parse_openclaw_file(
+                task,
+                options.include_reasoning,
+                &tx_record,
+                &tx_update,
+                &next_doc_id,
+                &progress,
+            )?,
             SourceKind::Copilot => {
                 parse_copilot_session(task, &tx_record, &tx_update, &next_doc_id, &progress)?
             }
@@ -556,9 +669,11 @@ pub fn ingest_all(
         AnalyticsStore::open(&analytics_db)?.mark_complete()?;
     }
 
+    let mut diagnostics = shared_diagnostics.lock().unwrap().clone();
     let mut updated_files = HashMap::new();
     while let Ok(update) = rx_update.recv() {
         updated_files.insert(update.path.clone(), update.state.clone());
+        diagnostics.merge(update.diagnostics);
         let _ = update.session_id;
     }
 
@@ -575,6 +690,7 @@ pub fn ingest_all(
         records_embedded,
         files_scanned,
         files_skipped,
+        diagnostics,
     })
 }
 
@@ -693,7 +809,7 @@ fn writer_loop(
 
     for mut record in rx.iter() {
         // Parsers apply the limit before queueing; enforce it here as a defensive boundary too.
-        limit_record_tool_content(&mut record, tool_content_limits);
+        let _ = limit_record_tool_content(&mut record, tool_content_limits);
         analytics.record(&record)?;
         index.add_record(&mut writer, &record)?;
         let source_idx = record.source.idx();
@@ -812,6 +928,7 @@ fn backfill_embeddings(
 
 fn parse_claude_file(
     task: &FileTask,
+    include_reasoning: bool,
     tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
@@ -825,6 +942,7 @@ fn parse_claude_file(
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
+        include_reasoning,
         next_doc_id,
         |record| {
             progress.add_produced(SourceKind::Claude, 1);
@@ -843,6 +961,7 @@ fn parse_claude_file(
 
 fn parse_codex_session(
     task: &FileTask,
+    include_reasoning: bool,
     tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
@@ -856,6 +975,7 @@ fn parse_codex_session(
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
+        include_reasoning,
         next_doc_id,
         |record| {
             progress.add_produced(SourceKind::CodexSession, 1);
@@ -925,6 +1045,7 @@ fn finish_source_parse(
         path: source_path,
         state,
         session_id: parsed.session_id,
+        diagnostics: parsed.diagnostics,
     })?;
     Ok(())
 }
@@ -994,6 +1115,7 @@ fn parse_cursor_file(
 }
 fn parse_pi_file(
     task: &FileTask,
+    include_reasoning: bool,
     tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
@@ -1007,6 +1129,7 @@ fn parse_pi_file(
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
+        include_reasoning,
         next_doc_id,
         |record| {
             progress.add_produced(SourceKind::Pi, 1);
@@ -1018,6 +1141,38 @@ fn parse_pi_file(
         tx_update,
         progress,
         SourceKind::Pi,
+        source_path,
+        parsed,
+    )
+}
+fn parse_openclaw_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::openclaw::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::OpenClaw, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::OpenClaw,
         source_path,
         parsed,
     )
@@ -1117,7 +1272,12 @@ fn truncate_for_embedding(mut text: String) -> String {
     text
 }
 
-fn limit_record_tool_content(record: &mut Record, limits: IndexedToolContentLimits) {
+fn limit_record_tool_content(
+    record: &mut Record,
+    limits: IndexedToolContentLimits,
+) -> (bool, bool) {
+    let original_input_len = record.tool_input.as_ref().map(String::len);
+    let original_output_len = record.tool_output.as_ref().map(String::len);
     let text_limit = match record.role.as_str() {
         "tool_use" => Some(limits.input_bytes),
         "tool_result" => Some(limits.output_bytes),
@@ -1134,6 +1294,14 @@ fn limit_record_tool_content(record: &mut Record, limits: IndexedToolContentLimi
     if let Some(tool_output) = record.tool_output.as_mut() {
         truncate_for_index(tool_output, limits.output_bytes);
     }
+    (
+        original_input_len
+            .zip(record.tool_input.as_ref().map(String::len))
+            .is_some_and(|(before, after)| after < before),
+        original_output_len
+            .zip(record.tool_output.as_ref().map(String::len))
+            .is_some_and(|(before, after)| after < before),
+    )
 }
 
 fn truncate_for_index(text: &mut String, max_bytes: usize) {
@@ -1203,10 +1371,12 @@ mod tests {
         IngestOptions {
             claude_source: PathBuf::from("/does/not/exist"),
             include_agents: false,
+            include_reasoning: false,
             include_codex: false,
             include_opencode: false,
             include_cursor: false,
             include_pi: false,
+            include_openclaw: false,
             include_copilot: false,
             embeddings,
             backfill_embeddings: false,
@@ -1610,8 +1780,15 @@ mod tests {
         let next_doc_id = AtomicU64::new(1);
         let (tx_record, rx_record, tx_update, rx_update) = parser_channels();
         let first = incremental_task(&path, SourceKind::Claude, 0, 0, HashMap::new());
-        parse_claude_file(&first, &tx_record, &tx_update, &next_doc_id, &progress)
-            .expect("parse calls");
+        parse_claude_file(
+            &first,
+            false,
+            &tx_record,
+            &tx_update,
+            &next_doc_id,
+            &progress,
+        )
+        .expect("parse calls");
         let first_records: Vec<_> = rx_record.try_iter().collect();
         let first_state = rx_update.try_recv().expect("first state").state;
         assert_eq!(first_records.len(), 2);
@@ -1640,8 +1817,15 @@ mod tests {
             first_state.turn_id,
             first_state.pending_tool_calls,
         );
-        parse_claude_file(&second, &tx_record, &tx_update, &next_doc_id, &progress)
-            .expect("parse results");
+        parse_claude_file(
+            &second,
+            false,
+            &tx_record,
+            &tx_update,
+            &next_doc_id,
+            &progress,
+        )
+        .expect("parse results");
         let second_records: Vec<_> = rx_record.try_iter().collect();
         let second_state = rx_update.try_recv().expect("second state").state;
 
@@ -1683,8 +1867,15 @@ mod tests {
         let next_doc_id = AtomicU64::new(10);
         let (tx_record, rx_record, tx_update, rx_update) = parser_channels();
         let first = incremental_task(&path, SourceKind::CodexSession, 0, 0, HashMap::new());
-        parse_codex_session(&first, &tx_record, &tx_update, &next_doc_id, &progress)
-            .expect("parse call");
+        parse_codex_session(
+            &first,
+            false,
+            &tx_record,
+            &tx_update,
+            &next_doc_id,
+            &progress,
+        )
+        .expect("parse call");
         let call_record = rx_record.try_recv().expect("call record");
         let first_state = rx_update.try_recv().expect("first state").state;
         assert_eq!(call_record.tool_name.as_deref(), Some("shell"));
@@ -1710,8 +1901,15 @@ mod tests {
             first_state.turn_id,
             first_state.pending_tool_calls,
         );
-        parse_codex_session(&second, &tx_record, &tx_update, &next_doc_id, &progress)
-            .expect("parse result");
+        parse_codex_session(
+            &second,
+            false,
+            &tx_record,
+            &tx_update,
+            &next_doc_id,
+            &progress,
+        )
+        .expect("parse result");
         let result_record = rx_record.try_recv().expect("result record");
         let second_state = rx_update.try_recv().expect("second state").state;
 
@@ -1741,7 +1939,7 @@ mod tests {
         fs::write(&path, "original transcript with a pending call\n").expect("write original");
         let metadata = path.metadata().expect("original metadata");
         let (mut original, _) =
-            prepare_file_task(path.clone(), SourceKind::Claude, &metadata, None);
+            prepare_file_task(path.clone(), SourceKind::Claude, false, &metadata, None);
         original.pending_tool_calls.insert(
             "stale".to_string(),
             PendingToolCall {
@@ -1761,6 +1959,7 @@ mod tests {
         let (truncated, skip) = prepare_file_task(
             path.clone(),
             SourceKind::Claude,
+            false,
             &truncated_meta,
             Some(&prior),
         );
@@ -1777,8 +1976,13 @@ mod tests {
         .expect("write replacement");
         fs::rename(&replacement, &path).expect("replace path");
         let replacement_meta = path.metadata().expect("replacement metadata");
-        let (replaced, skip) =
-            prepare_file_task(path, SourceKind::Claude, &replacement_meta, Some(&prior));
+        let (replaced, skip) = prepare_file_task(
+            path,
+            SourceKind::Claude,
+            false,
+            &replacement_meta,
+            Some(&prior),
+        );
         assert!(!skip);
         assert!(replaced.delete_first);
         assert_eq!(replaced.offset, 0);
@@ -1793,7 +1997,8 @@ mod tests {
         let path = temp.path().join("session.jsonl");
         fs::write(&path, "tool call\n").expect("write call");
         let metadata = path.metadata().expect("call metadata");
-        let (mut first, _) = prepare_file_task(path.clone(), SourceKind::Claude, &metadata, None);
+        let (mut first, _) =
+            prepare_file_task(path.clone(), SourceKind::Claude, false, &metadata, None);
         first.pending_tool_calls.insert(
             "call-1".to_string(),
             PendingToolCall {
@@ -1814,6 +2019,7 @@ mod tests {
         let (appended, skip) = prepare_file_task(
             path,
             SourceKind::Claude,
+            false,
             &appended_metadata,
             Some(&previous),
         );
@@ -1862,7 +2068,8 @@ mod tests {
             )]),
             identity,
         };
-        let (task, skip) = prepare_file_task(path, SourceKind::Claude, &metadata, Some(&previous));
+        let (task, skip) =
+            prepare_file_task(path, SourceKind::Claude, false, &metadata, Some(&previous));
         assert!(!skip);
         assert!(task.delete_first);
         assert!(task.parser_version_invalidated);
@@ -1923,10 +2130,12 @@ mod tests {
         let options = IngestOptions {
             claude_source: claude_root,
             include_agents: false,
+            include_reasoning: false,
             include_codex: false,
             include_opencode: false,
             include_cursor: false,
             include_pi: false,
+            include_openclaw: false,
             include_copilot: false,
             embeddings: false,
             backfill_embeddings: false,
@@ -2297,10 +2506,12 @@ mod tests {
         let options = IngestOptions {
             claude_source: tmp.path().join("missing-claude"),
             include_agents: false,
+            include_reasoning: false,
             include_codex: false,
             include_opencode: false,
             include_cursor: false,
             include_pi: true,
+            include_openclaw: false,
             include_copilot: false,
             embeddings: false,
             backfill_embeddings: false,
@@ -2337,7 +2548,7 @@ mod tests {
         assert_eq!(records[1].links.parent_event_id.as_deref(), Some("a1"));
         assert_eq!(records[2].role, "assistant");
         assert!(records[2].text.contains("I will run a command"));
-        assert!(records[2].text.contains("Thinking:"));
+        assert!(!records[2].text.contains("considering options"));
         assert_eq!(records[2].links.event_id.as_deref(), Some("a1"));
         assert_eq!(records[2].links.parent_event_id.as_deref(), Some("u1"));
         assert_eq!(records[3].role, "tool_result");
@@ -2427,7 +2638,15 @@ mod tests {
         let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
         let next_doc_id = AtomicU64::new(1);
 
-        parse_pi_file(&task, &tx_record, &tx_update, &next_doc_id, &progress).expect("parse pi");
+        parse_pi_file(
+            &task,
+            false,
+            &tx_record,
+            &tx_update,
+            &next_doc_id,
+            &progress,
+        )
+        .expect("parse pi");
         drop(tx_record);
         let records: Vec<_> = rx_record.try_iter().collect();
 
@@ -2500,8 +2719,8 @@ mod tests {
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
         let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, meta.len()],
-            [0, 0, 0, 0, 0, 0, 1],
+            [0, 0, 0, 0, 0, 0, 0, meta.len()],
+            [0, 0, 0, 0, 0, 0, 0, 1],
             false,
         ));
 
