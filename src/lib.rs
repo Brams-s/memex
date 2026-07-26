@@ -5,6 +5,7 @@ pub mod embed;
 pub mod index;
 pub mod ingest;
 pub mod progress;
+pub mod sources;
 pub mod state;
 pub mod transfer;
 pub mod tui;

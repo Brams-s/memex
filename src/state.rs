@@ -4,12 +4,62 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileIdentity {
+    /// Stable filesystem identity when the platform exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inode: Option<u64>,
+    /// Hash of a bounded prefix, used to detect in-place replacement without rescanning a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_sha256: Option<String>,
+    /// Number of leading bytes covered by `prefix_sha256`. Keeping this stable across appends
+    /// prevents a short file's fingerprint from changing merely because its prefix grew.
+    #[serde(default)]
+    pub prefix_bytes: u64,
+    /// Nanosecond-resolution modification marker for detecting same-size rewrites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_ns: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_doc_id: Option<u64>,
+    #[serde(default)]
+    pub timestamp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_bytes: Option<u64>,
+    /// Source-native parent event for formats whose result event does not repeat it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool_assistant_uuid: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileState {
     pub size: u64,
     pub mtime: i64,
     pub offset: u64,
     pub turn_id: u32,
+    #[serde(default)]
+    pub parser_version: u32,
+    #[serde(default)]
+    pub pending_tool_calls: HashMap<String, PendingToolCall>,
+    #[serde(default)]
+    pub identity: FileIdentity,
 }
 
 /// Tracks when we last scanned for changes, allowing us to skip

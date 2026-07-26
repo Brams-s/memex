@@ -74,38 +74,7 @@ impl SourceKind {
     }
 
     pub fn from_path(path: &str) -> Self {
-        if path.contains(".codex/sessions")
-            || path.contains(".codex\\sessions")
-            || path.contains(".codex/archived_sessions")
-            || path.contains(".codex\\archived_sessions")
-        {
-            SourceKind::CodexSession
-        } else if path.contains(".codex/history.jsonl") || path.contains(".codex\\history.jsonl") {
-            SourceKind::CodexHistory
-        } else if path.contains("opencode/storage/message")
-            || path.contains("opencode\\storage\\message")
-        {
-            SourceKind::Opencode
-        } else if path.contains(".cursor/projects")
-            || path.contains(".cursor\\projects")
-            || path.contains("agent-transcripts")
-        {
-            SourceKind::Cursor
-        } else if path.contains(".pi/agent/sessions")
-            || path.contains(".pi\\agent\\sessions")
-            || path.contains("pi/agent/sessions")
-            || path.contains("pi\\agent\\sessions")
-        {
-            SourceKind::Pi
-        } else if path.contains(".copilot/session-state")
-            || path.contains(".copilot\\session-state")
-            || path.contains("/session-state/")
-            || path.contains("\\session-state\\")
-        {
-            SourceKind::Copilot
-        } else {
-            SourceKind::Claude
-        }
+        crate::sources::classify_path(path)
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
