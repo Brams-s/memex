@@ -59,6 +59,30 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+  transcript-markdown-performance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-transcript-markdown-perf-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Compare transcript Markdown performance
+        run: >-
+          cargo test --release --lib transcript_markdown_perf --
+          --ignored --nocapture --test-threads=1
+
   fmt:
     runs-on: ubuntu-latest
     steps:

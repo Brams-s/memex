@@ -27,6 +27,7 @@ use std::io::Stdout;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tui_markdown::{AlertKind, Options as MarkdownOptions, StyleSheet, from_str_with_options};
 
 #[cfg(unix)]
 use std::ffi::CString;
@@ -525,10 +526,16 @@ struct App {
     quick_popup: bool,
     quick_scroll: usize,
     quick_lines: Vec<PreviewLine>,
+    quick_rendered_height: usize,
+    quick_layout_width: u16,
+    quick_line_offsets: Vec<usize>,
     preview_mode: PreviewMode,
     show_tools: bool,
     find_query: String,
     detail_lines: Vec<PreviewLine>,
+    detail_rendered_height: usize,
+    detail_layout_width: u16,
+    detail_line_offsets: Vec<usize>,
     detail_state: LoadState,
     active_detail_request: u64,
     detail_scroll: usize,
@@ -573,7 +580,80 @@ enum PreviewLine {
         highlight: bool,
     },
     Text(String),
+    Styled {
+        spans: Vec<PreviewSpan>,
+        alignment: Option<Alignment>,
+    },
     Empty,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewSpan {
+    content: String,
+    style: Style,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TranscriptMarkdownStyle;
+
+impl StyleSheet for TranscriptMarkdownStyle {
+    fn heading(&self, level: u8) -> Style {
+        let mut style = Style::default()
+            .fg(if level <= 2 { COLOR_ACCENT } else { COLOR_TEXT })
+            .add_modifier(Modifier::BOLD);
+        if level == 1 {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        style
+    }
+
+    fn code(&self) -> Style {
+        Style::default().fg(Color::Rgb(185, 185, 185))
+    }
+
+    fn link(&self) -> Style {
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::default()
+            .fg(COLOR_MUTED)
+            .add_modifier(Modifier::ITALIC)
+    }
+
+    fn heading_meta(&self) -> Style {
+        Style::default().fg(COLOR_MUTED).add_modifier(Modifier::DIM)
+    }
+
+    fn metadata_block(&self) -> Style {
+        Style::default().fg(COLOR_MUTED)
+    }
+
+    fn html(&self) -> Style {
+        Style::default().fg(COLOR_MUTED).add_modifier(Modifier::DIM)
+    }
+
+    fn alert(&self, _kind: AlertKind) -> Style {
+        Style::default().fg(COLOR_ACCENT)
+    }
+
+    fn table_header(&self) -> Style {
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn table_border(&self) -> Style {
+        Style::default().fg(COLOR_DIVIDER)
+    }
+
+    fn image_alt(&self) -> Style {
+        Style::default()
+            .fg(COLOR_MUTED)
+            .add_modifier(Modifier::ITALIC)
+    }
 }
 
 struct Theme {
@@ -838,10 +918,16 @@ impl App {
             quick_popup: false,
             quick_scroll: 0,
             quick_lines: Vec::new(),
+            quick_rendered_height: 0,
+            quick_layout_width: 0,
+            quick_line_offsets: Vec::new(),
             preview_mode: PreviewMode::Matches,
             show_tools: false,
             find_query: String::new(),
             detail_lines: Vec::new(),
+            detail_rendered_height: 0,
+            detail_layout_width: 0,
+            detail_line_offsets: Vec::new(),
             detail_state: LoadState::Idle,
             active_detail_request: 0,
             detail_scroll: 0,
@@ -1023,6 +1109,9 @@ impl App {
         self.active_detail_request = request_id;
         self.detail_state = LoadState::Loading;
         self.detail_lines.clear();
+        self.detail_rendered_height = 0;
+        self.detail_layout_width = 0;
+        self.detail_line_offsets.clear();
         self.detail_scroll = 0;
         self.last_detail_session = Some(session.session_id.clone());
         self.last_detail_query = Some(query_now);
@@ -1043,6 +1132,9 @@ impl App {
     fn clear_detail(&mut self, message: &str) {
         self.active_detail_request = self.next_request_id();
         self.detail_lines = vec![PreviewLine::Text(message.to_string())];
+        self.detail_rendered_height = 0;
+        self.detail_layout_width = 0;
+        self.detail_line_offsets.clear();
         self.detail_state = LoadState::Empty;
         self.detail_scroll = 0;
         self.last_detail_session = None;
@@ -1671,6 +1763,9 @@ impl App {
                 if request_id == self.active_detail_request =>
             {
                 self.detail_lines = lines;
+                self.detail_rendered_height = 0;
+                self.detail_layout_width = 0;
+                self.detail_line_offsets.clear();
                 self.detail_state = if self.detail_lines.is_empty() {
                     LoadState::Empty
                 } else {
@@ -1684,6 +1779,9 @@ impl App {
             } if request_id == self.active_detail_request => {
                 self.detail_state = LoadState::Error(message.clone());
                 self.detail_lines = vec![PreviewLine::Text(format!("preview error: {message}"))];
+                self.detail_rendered_height = 0;
+                self.detail_layout_width = 0;
+                self.detail_line_offsets.clear();
                 self.detail_scroll = 0;
             }
             SearchUpdate::HomeActivity { request_id, points }
@@ -1833,10 +1931,11 @@ impl App {
             return;
         }
         let view_height = self.preview_area.height as usize;
+        let line_count = self.detail_rendered_height.max(self.detail_lines.len());
         let max_scroll = if view_height == 0 {
-            self.detail_lines.len().saturating_sub(1)
+            line_count.saturating_sub(1)
         } else {
-            self.detail_lines.len().saturating_sub(view_height)
+            line_count.saturating_sub(view_height)
         };
         let next = (self.detail_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
         self.detail_scroll = next;
@@ -1847,10 +1946,11 @@ impl App {
             return;
         }
         let view_height = quick_popup_content_height(self.body_area) as usize;
+        let line_count = self.quick_rendered_height.max(self.quick_lines.len());
         let max_scroll = if view_height == 0 {
-            self.quick_lines.len().saturating_sub(1)
+            line_count.saturating_sub(1)
         } else {
-            self.quick_lines.len().saturating_sub(view_height)
+            line_count.saturating_sub(view_height)
         };
         let next = (self.quick_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
         self.quick_scroll = next;
@@ -1987,6 +2087,9 @@ impl App {
     }
 
     fn update_quick_lines(&mut self) {
+        self.quick_rendered_height = 0;
+        self.quick_layout_width = 0;
+        self.quick_line_offsets.clear();
         let Some(idx) = self.selected.selected() else {
             self.quick_lines = vec![PreviewLine::Text("no session selected".to_string())];
             return;
@@ -4138,20 +4241,28 @@ fn draw_preview_panel(
         );
         return content;
     }
-    let view_height = content.height as usize;
-    let start = app.detail_scroll.min(app.detail_lines.len());
-    let end = if view_height == 0 {
-        start
-    } else {
-        (start + view_height).min(app.detail_lines.len())
-    };
-    let visible_lines: Vec<Line> = app.detail_lines[start..end]
+    if app.detail_layout_width != content.width {
+        app.detail_line_offsets = preview_line_offsets(&app.detail_lines, theme, content.width);
+        app.detail_rendered_height = app.detail_line_offsets.last().copied().unwrap_or(0);
+        app.detail_layout_width = content.width;
+    }
+    let max_scroll = app
+        .detail_rendered_height
+        .saturating_sub(content.height as usize);
+    app.detail_scroll = app.detail_scroll.min(max_scroll);
+    let (visible_range, local_scroll) = preview_line_window(
+        &app.detail_line_offsets,
+        app.detail_scroll,
+        content.height as usize,
+    );
+    let rendered_lines: Vec<Line> = app.detail_lines[visible_range]
         .iter()
         .map(|line| render_preview_line(line, theme))
         .collect();
-    let detail = Paragraph::new(visible_lines)
+    let detail = Paragraph::new(rendered_lines)
         .style(theme.text)
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: true })
+        .scroll((local_scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(detail, content);
     content
 }
@@ -4181,20 +4292,28 @@ fn draw_quick_popup(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, ar
     ]);
     frame.render_widget(Paragraph::new(title), header);
 
-    let view_height = content.height as usize;
-    let start = app.quick_scroll.min(app.quick_lines.len());
-    let end = if view_height == 0 {
-        start
-    } else {
-        (start + view_height).min(app.quick_lines.len())
-    };
-    let visible_lines: Vec<Line> = app.quick_lines[start..end]
+    if app.quick_layout_width != content.width {
+        app.quick_line_offsets = preview_line_offsets(&app.quick_lines, theme, content.width);
+        app.quick_rendered_height = app.quick_line_offsets.last().copied().unwrap_or(0);
+        app.quick_layout_width = content.width;
+    }
+    let max_scroll = app
+        .quick_rendered_height
+        .saturating_sub(content.height as usize);
+    app.quick_scroll = app.quick_scroll.min(max_scroll);
+    let (visible_range, local_scroll) = preview_line_window(
+        &app.quick_line_offsets,
+        app.quick_scroll,
+        content.height as usize,
+    );
+    let rendered_lines: Vec<Line> = app.quick_lines[visible_range]
         .iter()
         .map(|line| render_preview_line(line, theme))
         .collect();
-    let detail = Paragraph::new(visible_lines)
+    let detail = Paragraph::new(rendered_lines)
         .style(theme.text)
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: true })
+        .scroll((local_scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(detail, content);
     content
 }
@@ -5340,6 +5459,15 @@ where
 }
 
 fn append_record(lines: &mut Vec<PreviewLine>, record: &Record, highlight: bool) {
+    append_record_with_markdown(lines, record, highlight, true);
+}
+
+fn append_record_with_markdown(
+    lines: &mut Vec<PreviewLine>,
+    record: &Record,
+    highlight: bool,
+    render_markdown: bool,
+) {
     let role = if record.role.is_empty() {
         "unknown"
     } else {
@@ -5361,12 +5489,43 @@ fn append_record(lines: &mut Vec<PreviewLine>, record: &Record, highlight: bool)
     let sanitized = sanitize_preview_lines(&text);
     if sanitized.is_empty() {
         lines.push(PreviewLine::Text("<empty>".to_string()));
+    } else if render_markdown && supports_markdown_preview(role) {
+        append_markdown(lines, &sanitized.join("\n"));
     } else {
         for line in sanitized {
             lines.push(PreviewLine::Text(line));
         }
     }
     lines.push(PreviewLine::Empty);
+}
+
+fn supports_markdown_preview(role: &str) -> bool {
+    matches!(role, "user" | "assistant")
+}
+
+fn append_markdown(lines: &mut Vec<PreviewLine>, markdown: &str) {
+    let options = MarkdownOptions::new(TranscriptMarkdownStyle);
+    let rendered = from_str_with_options(markdown, &options);
+    if rendered.lines.is_empty() {
+        lines.push(PreviewLine::Text("<empty>".to_string()));
+        return;
+    }
+
+    for line in rendered.lines {
+        let line_style = line.style;
+        let spans = line
+            .spans
+            .into_iter()
+            .map(|span| PreviewSpan {
+                content: span.content.into_owned(),
+                style: line_style.patch(span.style),
+            })
+            .collect();
+        lines.push(PreviewLine::Styled {
+            spans,
+            alignment: line.alignment,
+        });
+    }
 }
 
 fn sanitize_preview_lines(text: &str) -> Vec<String> {
@@ -5492,6 +5651,49 @@ fn role_color(role: &str) -> Color {
     }
 }
 
+fn preview_line_offsets(lines: &[PreviewLine], theme: &Theme, width: u16) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(lines.len().saturating_add(1));
+    offsets.push(0);
+    for line in lines {
+        let rendered = render_preview_line(line, theme);
+        let height = Paragraph::new(rendered)
+            .style(theme.text)
+            .wrap(Wrap { trim: true })
+            .line_count(width)
+            .max(1);
+        offsets.push(
+            offsets
+                .last()
+                .copied()
+                .unwrap_or(0usize)
+                .saturating_add(height),
+        );
+    }
+    offsets
+}
+
+fn preview_line_window(
+    offsets: &[usize],
+    scroll: usize,
+    viewport_height: usize,
+) -> (std::ops::Range<usize>, usize) {
+    let line_count = offsets.len().saturating_sub(1);
+    if line_count == 0 {
+        return (0..0, 0);
+    }
+
+    let first = offsets[1..]
+        .partition_point(|end| *end <= scroll)
+        .min(line_count.saturating_sub(1));
+    let local_scroll = scroll.saturating_sub(offsets[first]);
+    let viewport_end = scroll.saturating_add(viewport_height.max(1));
+    let end = offsets[..line_count]
+        .partition_point(|start| *start < viewport_end)
+        .max(first.saturating_add(1))
+        .min(line_count);
+    (first..end, local_scroll)
+}
+
 fn render_preview_line<'a>(line: &'a PreviewLine, theme: &Theme) -> Line<'a> {
     match line {
         PreviewLine::SessionHeader {
@@ -5529,6 +5731,18 @@ fn render_preview_line<'a>(line: &'a PreviewLine, theme: &Theme) -> Line<'a> {
             ])
         }
         PreviewLine::Text(text) => Line::from(Span::raw(text.as_str())),
+        PreviewLine::Styled { spans, alignment } => {
+            let mut line = Line::from(
+                spans
+                    .iter()
+                    .map(|span| Span::styled(span.content.as_str(), span.style))
+                    .collect::<Vec<_>>(),
+            );
+            if let Some(alignment) = alignment {
+                line = line.alignment(*alignment);
+            }
+            line
+        }
         PreviewLine::Empty => Line::from(""),
     }
 }
@@ -6069,6 +6283,8 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 mod tests {
     use super::*;
     use crate::types::{RecordLinks, SourceKind};
+    use ratatui::{backend::TestBackend, buffer::Buffer, widgets::Widget};
+    use std::hint::black_box;
 
     fn create_stale_schema_index(dir: &std::path::Path) {
         std::fs::create_dir_all(dir).expect("create index dir");
@@ -6139,6 +6355,171 @@ mod tests {
             links: RecordLinks::default(),
             source_path: "source.jsonl".to_string(),
         }
+    }
+
+    fn markdown_perf_records() -> Vec<Record> {
+        (0..96)
+            .map(|idx| {
+                record(
+                    if idx % 4 == 0 { "user" } else { "assistant" },
+                    &format!(
+                        "## Transcript item {idx}\n\n\
+                         This message contains **strong text**, _emphasis_, an \
+                         [external link](https://example.com/{idx}), and `inline_code({idx})`.\n\n\
+                         - first list item with enough prose to wrap in a narrow preview\n\
+                         - second list item with ~~removed~~ and ==highlighted== content\n\n\
+                         ```rust\n\
+                         fn transcript_item_{idx}() -> usize {{\n    {idx}\n}}\n\
+                         ```\n\n\
+                         | field | value |\n\
+                         | --- | ---: |\n\
+                         | item | {idx} |"
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn build_perf_preview(records: &[Record], render_markdown: bool) -> Vec<PreviewLine> {
+        let mut lines = Vec::new();
+        for record in records {
+            append_record_with_markdown(&mut lines, record, false, render_markdown);
+        }
+        lines
+    }
+
+    fn median_duration(mut operation: impl FnMut()) -> Duration {
+        const SAMPLE_COUNT: usize = 5;
+        const SAMPLE_TIME: Duration = Duration::from_millis(60);
+
+        operation();
+        let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            let started = Instant::now();
+            let mut iterations = 0u32;
+            while started.elapsed() < SAMPLE_TIME {
+                operation();
+                iterations = iterations.saturating_add(1);
+            }
+            samples.push(started.elapsed() / iterations.max(1));
+        }
+        samples.sort_unstable();
+        samples[SAMPLE_COUNT / 2]
+    }
+
+    fn assert_perf_bound(
+        label: &str,
+        markdown: Duration,
+        plain: Duration,
+        max_ratio: u32,
+        slack: Duration,
+    ) {
+        let budget = plain.saturating_mul(max_ratio).saturating_add(slack);
+        let ratio = markdown.as_secs_f64() / plain.as_secs_f64().max(f64::EPSILON);
+        eprintln!(
+            "{label}: markdown={markdown:?}/iter plain={plain:?}/iter ratio={ratio:.2}x \
+             budget={budget:?}"
+        );
+        assert!(
+            markdown <= budget,
+            "{label} Markdown path took {markdown:?}; expected <= {budget:?} \
+             ({max_ratio}x plain {plain:?} plus {slack:?})"
+        );
+    }
+
+    fn render_perf_viewports(
+        lines: &[PreviewLine],
+        offsets: &[usize],
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) {
+        let total_height = offsets.last().copied().unwrap_or(0);
+        let max_scroll = total_height.saturating_sub(height as usize);
+        for scroll in [
+            0,
+            max_scroll / 4,
+            max_scroll / 2,
+            max_scroll.saturating_mul(3) / 4,
+            max_scroll,
+        ] {
+            let (range, local_scroll) = preview_line_window(offsets, scroll, height as usize);
+            let rendered = lines[range]
+                .iter()
+                .map(|line| render_preview_line(line, theme))
+                .collect::<Vec<_>>();
+            let paragraph = Paragraph::new(rendered)
+                .style(theme.text)
+                .wrap(Wrap { trim: true })
+                .scroll((local_scroll.min(u16::MAX as usize) as u16, 0));
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = Buffer::empty(area);
+            Widget::render(paragraph, area, &mut buffer);
+            black_box(buffer);
+        }
+    }
+
+    #[test]
+    #[ignore = "CI-only Markdown performance comparison"]
+    fn transcript_markdown_perf_build() {
+        let records = markdown_perf_records();
+        let plain = median_duration(|| {
+            black_box(build_perf_preview(black_box(&records), false));
+        });
+        let markdown = median_duration(|| {
+            black_box(build_perf_preview(black_box(&records), true));
+        });
+
+        // Parsing Markdown is expected to be slower than copying plain lines. This broad ceiling
+        // catches accidental repeated parsing or superlinear behavior without making shared CI
+        // runners fail over ordinary scheduling noise.
+        assert_perf_bound(
+            "transcript build",
+            markdown,
+            plain,
+            40,
+            Duration::from_millis(2),
+        );
+    }
+
+    #[test]
+    #[ignore = "CI-only Markdown performance comparison"]
+    fn transcript_markdown_perf_viewport() {
+        let records = markdown_perf_records();
+        let plain_lines = build_perf_preview(&records, false);
+        let markdown_lines = build_perf_preview(&records, true);
+        let theme = Theme::new();
+        let width = 80;
+        let height = 24;
+        let plain_offsets = preview_line_offsets(&plain_lines, &theme, width);
+        let markdown_offsets = preview_line_offsets(&markdown_lines, &theme, width);
+
+        let plain = median_duration(|| {
+            render_perf_viewports(
+                black_box(&plain_lines),
+                black_box(&plain_offsets),
+                &theme,
+                width,
+                height,
+            );
+        });
+        let markdown = median_duration(|| {
+            render_perf_viewports(
+                black_box(&markdown_lines),
+                black_box(&markdown_offsets),
+                &theme,
+                width,
+                height,
+            );
+        });
+
+        assert_perf_bound(
+            "cached viewport render",
+            markdown,
+            plain,
+            12,
+            Duration::from_micros(500),
+        );
     }
 
     #[test]
@@ -6721,6 +7102,118 @@ mod tests {
             record_preview_text(&record),
             "{\n  \"cmd\": \"pwd && rg --files\",\n  \"workdir\": \"/tmp/app\",\n  \"yield_time_ms\": 1000\n}"
         );
+    }
+
+    #[test]
+    fn assistant_preview_renders_markdown_to_styled_lines() {
+        let record = record(
+            "assistant",
+            "# Result\n\nUse **bold text** and `inline_code()`.",
+        );
+        let mut lines = Vec::new();
+
+        append_record(&mut lines, &record, false);
+
+        let rendered_text = lines
+            .iter()
+            .filter_map(|line| match line {
+                PreviewLine::Styled { spans, .. } => Some(
+                    spans
+                        .iter()
+                        .map(|span| span.content.as_str())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered_text.contains("Result"));
+        assert!(rendered_text.contains("bold text"));
+        assert!(!rendered_text.contains("**"));
+        assert!(lines.iter().any(|line| match line {
+            PreviewLine::Styled { spans, .. } => spans.iter().any(|span| {
+                span.content.contains("bold text")
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn tool_preview_keeps_markdown_markers_as_plain_text() {
+        let record = record("tool_result", "status: **literal marker**");
+        let mut lines = Vec::new();
+
+        append_record(&mut lines, &record, false);
+
+        assert!(lines.iter().any(
+            |line| matches!(line, PreviewLine::Text(text) if text == "status: **literal marker**")
+        ));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| matches!(line, PreviewLine::Styled { .. }))
+        );
+    }
+
+    #[test]
+    fn markdown_parsing_is_isolated_per_transcript_message() {
+        let mut lines = Vec::new();
+        append_record(
+            &mut lines,
+            &record("assistant", "```rust\nlet unfinished = true;"),
+            false,
+        );
+        append_record(
+            &mut lines,
+            &record("assistant", "# Independent heading"),
+            false,
+        );
+
+        assert!(lines.iter().any(|line| match line {
+            PreviewLine::Styled { spans, .. } => spans.iter().any(|span| {
+                span.content.contains("Independent heading")
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn preview_scroll_uses_wrapped_markdown_height() {
+        let (_tmp, mut app) = test_app();
+        app.detail_state = LoadState::Loaded;
+        append_markdown(
+            &mut app.detail_lines,
+            &format!("**wrapped** {}", "transcript prose ".repeat(100)),
+        );
+        let logical_height = app.detail_lines.len();
+        let backend = TestBackend::new(32, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let theme = Theme::new();
+        let mut content_area = Rect::default();
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                content_area = draw_preview_panel(frame, &mut app, &theme, area);
+            })
+            .expect("draw preview");
+        app.preview_area = content_area;
+
+        assert!(app.detail_rendered_height > logical_height);
+        assert!(app.detail_rendered_height > content_area.height as usize);
+        app.scroll_detail(1);
+        assert_eq!(app.detail_scroll, 1);
+    }
+
+    #[test]
+    fn preview_window_skips_offscreen_logical_lines() {
+        let offsets = vec![0, 10, 11, 21];
+
+        assert_eq!(preview_line_window(&offsets, 5, 3), (0..1, 5));
+        assert_eq!(preview_line_window(&offsets, 10, 5), (1..3, 0));
+        assert_eq!(preview_line_window(&offsets, 20, 5), (2..3, 9));
     }
 
     #[test]
