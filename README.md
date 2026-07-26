@@ -135,6 +135,10 @@ memex tui
 Notes:
 - Embeddings are enabled by default.
 - Searches run an incremental reindex by default (configurable).
+- Concurrent searches coalesce stale auto-index work: one process refreshes while other lexical
+  searches query the last committed index. Semantic and hybrid searches wait for vector writes to
+  finish. Explicit `index`, `reindex`, `embed`, and analytics backfill commands wait up to 30
+  seconds for another index mutation to finish and report its holder on timeout.
 
 Full transcript:
 ```

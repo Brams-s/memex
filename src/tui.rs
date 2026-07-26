@@ -2,6 +2,7 @@ use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionRow, analytics_pa
 use crate::config::{Paths, UserConfig, default_claude_source};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
+use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
 use crate::types::{Record, SourceFilter, SourceKind};
 use crate::usage::{CostMode, UsageQuery, scan_usage_activity};
 use anyhow::Result;
@@ -712,11 +713,19 @@ pub fn run(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let index = if config.auto_index_on_search_default() {
+    if config.auto_index_on_search_default() {
         paths.ensure_dirs()?;
-        SearchIndex::open_or_create_for_ingest(&paths.index)?
-    } else {
+    }
+    let index = if paths.index.join("meta.json").exists() {
         SearchIndex::open_or_create(&paths.index)?
+    } else {
+        let _lease =
+            IngestLease::acquire(&paths, "TUI index initialization", INGEST_LEASE_TIMEOUT)?;
+        if config.auto_index_on_search_default() {
+            SearchIndex::open_or_create_for_ingest(&paths.index)?
+        } else {
+            SearchIndex::open_or_create(&paths.index)?
+        }
     };
     let (index_tx, index_rx) = std::sync::mpsc::channel();
     let (search_tx, search_rx) = std::sync::mpsc::channel();
@@ -913,6 +922,10 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(IndexUpdate::Started);
             let result = (|| -> Result<Option<crate::ingest::IngestReport>> {
+                let lease = match IngestLease::try_acquire(&paths, "TUI auto-index")? {
+                    LeaseAttempt::Acquired(lease) => lease,
+                    LeaseAttempt::Busy(_) => return Ok(None),
+                };
                 let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
                 let embeddings_default = config.embeddings_default();
                 let model_choice = config.resolve_model(None)?;
@@ -933,7 +946,7 @@ impl App {
                     embed_runtime: config.resolve_embed_runtime()?,
                     tool_content_limits,
                 };
-                ingest_if_stale(&paths, &index, &opts, config.scan_cache_ttl())
+                ingest_if_stale(&paths, &index, &opts, config.scan_cache_ttl(), &lease)
             })();
             match result {
                 Ok(Some(report)) => {

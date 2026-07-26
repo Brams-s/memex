@@ -2,12 +2,13 @@ use crate::analytics::{AnalyticsStore, AnalyticsWriter, analytics_path, backfill
 use crate::config::{IndexedToolContentLimits, Paths};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
+use crate::lease::IngestLease;
 use crate::progress::{Progress, SOURCE_COUNT};
 use crate::state::{FileIdentity, FileState, IngestState, PendingToolCall, ScanCache};
 #[cfg(test)]
 use crate::types::RecordLinks;
 use crate::types::{Record, SourceKind};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -315,6 +316,7 @@ pub fn ingest_if_stale(
     index: &SearchIndex,
     options: &IngestOptions,
     ttl_seconds: u64,
+    lease: &IngestLease,
 ) -> Result<Option<IngestReport>> {
     let cache_path = paths.state.join("scan_cache.json");
     let cache = ScanCache::load(&cache_path)?;
@@ -323,7 +325,7 @@ pub fn ingest_if_stale(
         return Ok(None);
     }
 
-    let report = ingest_all(paths, index, options)?;
+    let report = ingest_all(paths, index, options, lease)?;
     Ok(Some(report))
 }
 
@@ -331,6 +333,7 @@ pub fn ingest_all(
     paths: &Paths,
     index: &SearchIndex,
     options: &IngestOptions,
+    _lease: &IngestLease,
 ) -> Result<IngestReport> {
     // Apply additive analytics migrations even when the scan finds no changed files.
     drop(AnalyticsStore::open(analytics_path(&paths.state))?);
@@ -551,7 +554,7 @@ pub fn ingest_all(
         if analytics_needs_backfill {
             backfill_from_index(&analytics_db, index)?;
         }
-        update_scan_cache(paths, files_scanned, total_bytes);
+        update_scan_cache(paths, files_scanned, total_bytes)?;
         return Ok(IngestReport {
             records_added: 0,
             records_embedded: 0,
@@ -579,6 +582,9 @@ pub fn ingest_all(
         .filter(|t| t.delete_first)
         .map(|t| t.path.to_string_lossy().to_string())
         .collect();
+    let writer = index
+        .writer()
+        .context("failed to initialize the Tantivy index writer")?;
     let writer_index = index.clone();
     let writer_ctx = WriterContext {
         embeddings,
@@ -591,11 +597,12 @@ pub fn ingest_all(
         embed_runtime: options.embed_runtime.clone(),
         tool_content_limits: options.tool_content_limits,
     };
-    let writer_handle =
-        std::thread::spawn(move || writer_loop(writer_index, rx_record, delete_paths, writer_ctx));
+    let writer_handle = std::thread::spawn(move || {
+        writer_loop(writer_index, writer, rx_record, delete_paths, writer_ctx)
+    });
 
     let tasks_arc = Arc::new(tasks);
-    tasks_arc.par_iter().try_for_each(|task| -> Result<()> {
+    let parser_result = tasks_arc.par_iter().try_for_each(|task| -> Result<()> {
         match task.source {
             SourceKind::Claude => parse_claude_file(
                 task,
@@ -653,7 +660,7 @@ pub fn ingest_all(
             }
         }
         Ok(())
-    })?;
+    });
 
     drop(tx_record);
     drop(tx_update);
@@ -662,7 +669,9 @@ pub fn ingest_all(
         .join()
         .map_err(|_| anyhow!("writer thread panicked"))?;
     progress.finish();
-    let (records_added, records_embedded) = writer_result?;
+    let (records_added, records_embedded) =
+        writer_result.context("index writer stopped before ingestion completed")?;
+    parser_result?;
     if analytics_needs_backfill {
         backfill_from_index(&analytics_db, index)?;
     } else {
@@ -683,7 +692,7 @@ pub fn ingest_all(
     state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
     state.save(&state_path)?;
 
-    update_scan_cache(paths, files_scanned, total_bytes);
+    update_scan_cache(paths, files_scanned, total_bytes)?;
 
     Ok(IngestReport {
         records_added,
@@ -694,11 +703,11 @@ pub fn ingest_all(
     })
 }
 
-fn update_scan_cache(paths: &Paths, files_scanned: usize, total_bytes: u64) {
+fn update_scan_cache(paths: &Paths, files_scanned: usize, total_bytes: u64) -> Result<()> {
     let cache_path = paths.state.join("scan_cache.json");
-    let mut cache = ScanCache::load(&cache_path).unwrap_or_default();
+    let mut cache = ScanCache::load(&cache_path)?;
     cache.update(files_scanned, total_bytes);
-    let _ = cache.save(&cache_path);
+    cache.save(&cache_path)
 }
 
 fn can_skip_fresh_scan(
@@ -764,6 +773,7 @@ fn record_needs_embedding(record: &Record) -> bool {
 
 fn writer_loop(
     index: SearchIndex,
+    mut writer: tantivy::IndexWriter,
     rx: Receiver<Record>,
     delete_paths: Vec<String>,
     ctx: WriterContext,
@@ -779,7 +789,6 @@ fn writer_loop(
         embed_runtime,
         tool_content_limits,
     } = ctx;
-    let mut writer = index.writer()?;
     let mut analytics = AnalyticsWriter::open(&analytics_path)?;
     for path in delete_paths {
         index.delete_by_source_path(&mut writer, &path);
@@ -1365,7 +1374,7 @@ mod tests {
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         IngestOptions {
@@ -1396,6 +1405,11 @@ mod tests {
     fn open_search_index(paths: &Paths) -> SearchIndex {
         fs::create_dir_all(&paths.index).expect("create index dir");
         SearchIndex::open_or_create(&paths.index).expect("open search index")
+    }
+
+    fn ingest_lease(paths: &Paths) -> IngestLease {
+        IngestLease::acquire(paths, "test ingest", Duration::from_secs(1))
+            .expect("acquire ingest lease")
     }
 
     fn save_search_records(paths: &Paths, records: &[Record]) -> SearchIndex {
@@ -1496,6 +1510,32 @@ mod tests {
             result,
             Err(crossbeam_channel::TrySendError::Full(_))
         ));
+    }
+
+    #[test]
+    fn writer_initialization_error_is_not_masked_by_disconnected_channel() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let claude_root = temp.path().join("claude");
+        let project = claude_root.join("-tmp-project");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            project.join("session.jsonl"),
+            r#"{"type":"user","uuid":"u1","sessionId":"session","timestamp":"2026-07-26T17:00:00Z","message":{"content":"hello"}}"#,
+        )
+        .expect("write transcript");
+        let index = SearchIndex::open_or_create(&paths.index).expect("index");
+        let _existing_writer = index.writer().expect("existing writer");
+        let lease = ingest_lease(&paths);
+        let mut options = ingest_options(false, ModelChoice::default());
+        options.claude_source = claude_root;
+
+        let error = ingest_all(&paths, &index, &options, &lease).expect_err("writer collision");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to initialize the Tantivy index writer"));
+        assert!(!message.contains("disconnected channel"));
     }
 
     #[test]
@@ -2144,7 +2184,8 @@ mod tests {
             tool_content_limits: IndexedToolContentLimits::default(),
         };
 
-        let report = ingest_all(&paths, &index, &options).expect("ingest");
+        let lease = ingest_lease(&paths);
+        let report = ingest_all(&paths, &index, &options, &lease).expect("ingest");
         assert_eq!(report.records_added, 4);
 
         let mut records = index
@@ -2520,7 +2561,8 @@ mod tests {
             tool_content_limits: IndexedToolContentLimits::default(),
         };
 
-        let report = ingest_all(&paths, &index, &options).expect("ingest");
+        let lease = ingest_lease(&paths);
+        let report = ingest_all(&paths, &index, &options, &lease).expect("ingest");
         assert_eq!(report.records_added, 10);
 
         let mut records = index
@@ -2810,8 +2852,9 @@ mod tests {
             tool_content_limits: IndexedToolContentLimits::default(),
         };
 
+        let writer = index.writer().expect("open writer");
         let (records_added, records_embedded) =
-            writer_loop(index, rx_record, Vec::new(), ctx).expect("write copilot record");
+            writer_loop(index, writer, rx_record, Vec::new(), ctx).expect("write copilot record");
 
         assert_eq!(records_added, 1);
         assert_eq!(records_embedded, 0);
