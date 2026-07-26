@@ -59,11 +59,20 @@ pub fn usage_files() -> Vec<PathBuf> {
         .map(|root| {
             root.to_string_lossy()
                 .split(',')
-                .map(|path| PathBuf::from(path.trim()).join("projects"))
+                .map(expand_usage_root)
                 .collect()
         })
         .unwrap_or_else(default_usage_roots);
     super::common::jsonl_files(roots)
+}
+
+fn expand_usage_root(path: &str) -> PathBuf {
+    let path = PathBuf::from(path.trim());
+    if path.file_name().and_then(|name| name.to_str()) == Some("projects") {
+        path
+    } else {
+        path.join("projects")
+    }
 }
 
 pub fn session_id_from_path(path: &Path) -> String {
@@ -516,13 +525,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                     .map(str::to_string);
                 let timestamp_ms = value
                     .get("timestamp")
-                    .and_then(|timestamp| {
-                        timestamp
-                            .as_str()
-                            .and_then(super::common::parse_iso_millis)
-                            .or_else(|| timestamp.as_u64())
-                            .or_else(|| timestamp.as_i64().map(|value| value.max(0) as u64))
-                    })
+                    .map(usage_timestamp_millis)
                     .unwrap_or(0);
                 events.push(UsageEvent {
                     source: "claude",
@@ -554,6 +557,26 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
         index += 1;
     }
     Ok(events)
+}
+
+fn usage_timestamp_millis(timestamp: &simd_json::BorrowedValue<'_>) -> u64 {
+    timestamp
+        .as_u64()
+        .map(|value| {
+            if value < 10_000_000_000 {
+                value.saturating_mul(1_000)
+            } else {
+                value
+            }
+        })
+        .or_else(|| {
+            timestamp
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .map(|value| value as u64)
+        })
+        .or_else(|| timestamp.as_str().and_then(super::common::parse_iso_millis))
+        .unwrap_or(0)
 }
 
 pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
@@ -678,5 +701,37 @@ mod tests {
         let events = parse_usage_file(&path).unwrap();
         assert_eq!(events[0].project.as_deref(), Some("/Users/nico/Code/memex"));
         assert_eq!(events[1].project, None);
+    }
+
+    #[test]
+    fn usage_root_accepts_config_and_already_expanded_projects_paths() {
+        assert_eq!(
+            expand_usage_root("/tmp/claude"),
+            PathBuf::from("/tmp/claude/projects")
+        );
+        assert_eq!(
+            expand_usage_root("/tmp/claude/projects"),
+            PathBuf::from("/tmp/claude/projects")
+        );
+    }
+
+    #[test]
+    fn usage_converts_numeric_second_timestamps_to_milliseconds() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"assistant\",\"timestamp\":1776386452,",
+                "\"message\":{\"id\":\"seconds\",\"usage\":{\"input_tokens\":1}}}\n",
+                "{\"type\":\"assistant\",\"timestamp\":1776386452437,",
+                "\"message\":{\"id\":\"milliseconds\",\"usage\":{\"input_tokens\":1}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let events = parse_usage_file(&path).unwrap();
+        assert_eq!(events[0].timestamp_ms, 1_776_386_452_000);
+        assert_eq!(events[1].timestamp_ms, 1_776_386_452_437);
     }
 }
