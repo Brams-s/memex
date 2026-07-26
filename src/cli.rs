@@ -830,11 +830,10 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     vector.save()?;
     progress.finish();
     println!(
-        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {})",
+        "embedded {} vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {})",
         embedded_total,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
-        embedded_counts[crate::types::SourceKind::CodexSession.idx()],
-        embedded_counts[crate::types::SourceKind::CodexHistory.idx()],
+        embedded_counts[crate::types::SourceKind::Codex.idx()],
         embedded_counts[crate::types::SourceKind::Opencode.idx()],
         embedded_counts[crate::types::SourceKind::Cursor.idx()],
         embedded_counts[crate::types::SourceKind::Pi.idx()],
@@ -2043,7 +2042,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
     let record = &records[0];
     let tool = match record.source {
         crate::types::SourceKind::Claude => "claude",
-        crate::types::SourceKind::CodexSession | crate::types::SourceKind::CodexHistory => "codex",
+        crate::types::SourceKind::Codex => "codex",
         crate::types::SourceKind::Opencode => "opencode",
         crate::types::SourceKind::Cursor => "cursor",
         crate::types::SourceKind::Pi => "pi",

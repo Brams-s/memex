@@ -239,8 +239,7 @@ impl Progress {
 fn progress_label(source: SourceKind) -> &'static str {
     match source {
         SourceKind::Claude => "claude",
-        SourceKind::CodexSession => "codex",
-        SourceKind::CodexHistory => "codex-history",
+        SourceKind::Codex => "codex",
         SourceKind::Opencode => "opencode",
         SourceKind::Cursor => "cursor",
         SourceKind::Pi => "pi",

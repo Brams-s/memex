@@ -391,7 +391,7 @@ pub fn ingest_all(
             let key = path.to_string_lossy().to_string();
             let (task, skip) = prepare_file_task(
                 path,
-                SourceKind::CodexSession,
+                SourceKind::Codex,
                 options.include_reasoning,
                 &meta,
                 state.files.get(&key),
@@ -412,7 +412,7 @@ pub fn ingest_all(
             let key = history_path.to_string_lossy().to_string();
             let (task, skip) = prepare_file_task(
                 history_path,
-                SourceKind::CodexHistory,
+                SourceKind::Codex,
                 options.include_reasoning,
                 &meta,
                 state.files.get(&key),
@@ -612,22 +612,27 @@ pub fn ingest_all(
                 &next_doc_id,
                 &progress,
             )?,
-            SourceKind::CodexSession => parse_codex_session(
-                task,
-                options.include_reasoning,
-                &tx_record,
-                &tx_update,
-                &next_doc_id,
-                &progress,
-            )?,
-            SourceKind::CodexHistory => parse_codex_history(
-                task,
-                &tx_record,
-                &tx_update,
-                &next_doc_id,
-                &session_ids,
-                &progress,
-            )?,
+            SourceKind::Codex => {
+                if crate::sources::codex::is_history_path(&task.path) {
+                    parse_codex_history(
+                        task,
+                        &tx_record,
+                        &tx_update,
+                        &next_doc_id,
+                        &session_ids,
+                        &progress,
+                    )?
+                } else {
+                    parse_codex_session(
+                        task,
+                        options.include_reasoning,
+                        &tx_record,
+                        &tx_update,
+                        &next_doc_id,
+                        &progress,
+                    )?
+                }
+            }
             SourceKind::Opencode => parse_opencode_file(
                 task,
                 &tx_record,
@@ -987,7 +992,7 @@ fn parse_codex_session(
         include_reasoning,
         next_doc_id,
         |record| {
-            progress.add_produced(SourceKind::CodexSession, 1);
+            progress.add_produced(SourceKind::Codex, 1);
             tx_record.send(record)
         },
     )?;
@@ -995,7 +1000,7 @@ fn parse_codex_session(
         task,
         tx_update,
         progress,
-        SourceKind::CodexSession,
+        SourceKind::Codex,
         source_path,
         parsed,
     )
@@ -1020,7 +1025,7 @@ fn parse_codex_history(
         session_ids,
         next_doc_id,
         |record| {
-            progress.add_produced(SourceKind::CodexHistory, 1);
+            progress.add_produced(SourceKind::Codex, 1);
             tx_record.send(record)
         },
     )?;
@@ -1028,7 +1033,7 @@ fn parse_codex_history(
         task,
         tx_update,
         progress,
-        SourceKind::CodexHistory,
+        SourceKind::Codex,
         source_path,
         parsed,
     )
@@ -1906,7 +1911,7 @@ mod tests {
         let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
         let next_doc_id = AtomicU64::new(10);
         let (tx_record, rx_record, tx_update, rx_update) = parser_channels();
-        let first = incremental_task(&path, SourceKind::CodexSession, 0, 0, HashMap::new());
+        let first = incremental_task(&path, SourceKind::Codex, 0, 0, HashMap::new());
         parse_codex_session(
             &first,
             false,
@@ -1936,7 +1941,7 @@ mod tests {
             .expect("append result");
         let second = incremental_task(
             &path,
-            SourceKind::CodexSession,
+            SourceKind::Codex,
             first_state.offset,
             first_state.turn_id,
             first_state.pending_tool_calls,
@@ -1967,7 +1972,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111"
         );
         assert_eq!(result_record.project, "memex");
-        assert_eq!(result_record.source, SourceKind::CodexSession);
+        assert_eq!(result_record.source, SourceKind::Codex);
         assert_eq!(result_record.source_path, path.to_string_lossy());
         assert!(second_state.pending_tool_calls.is_empty());
     }

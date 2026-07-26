@@ -815,7 +815,7 @@ fn resolve_session_cwd_from_parts(
             return cwd;
         }
 
-        if source == SourceKind::CodexSession
+        if source == SourceKind::Codex
             && value.get("type").and_then(|v| v.as_str()) == Some("session_meta")
         {
             let payload_cwd = value
@@ -927,7 +927,7 @@ mod tests {
 
     fn record(project: &str, session_id: &str, source_path: &Path, ts: u64) -> Record {
         Record {
-            source: SourceKind::CodexSession,
+            source: SourceKind::Codex,
             doc_id: ts,
             ts,
             project: project.to_string(),

@@ -1528,13 +1528,12 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
     let first = records.first()?;
     match first.source {
         SourceKind::Claude => cwd_from_jsonl(Path::new(&first.source_path)),
-        SourceKind::CodexSession => cwd_from_codex_session(Path::new(&first.source_path)),
+        SourceKind::Codex => cwd_from_codex_session(Path::new(&first.source_path)),
         SourceKind::Copilot => cwd_from_copilot_session(Path::new(&first.source_path)),
         SourceKind::Cursor => cwd_from_cursor_session(Path::new(&first.source_path)),
         SourceKind::Opencode => cwd_from_opencode_session(Path::new(&first.source_path)),
         SourceKind::Pi => cwd_from_pi_session(Path::new(&first.source_path)),
         SourceKind::OpenClaw => cwd_from_pi_session(Path::new(&first.source_path)),
-        SourceKind::CodexHistory => None,
     }
     .filter(|path| path.is_dir())
 }

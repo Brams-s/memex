@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 3,
+    index: 4,
     usage: 4,
 };
 
@@ -29,12 +29,16 @@ pub fn classify_path(path: &str) -> Option<SourceKind> {
         || path.contains(".codex/archived_sessions")
         || path.contains(".codex\\archived_sessions")
     {
-        Some(SourceKind::CodexSession)
+        Some(SourceKind::Codex)
     } else if path.contains(".codex/history.jsonl") || path.contains(".codex\\history.jsonl") {
-        Some(SourceKind::CodexHistory)
+        Some(SourceKind::Codex)
     } else {
         None
     }
+}
+
+pub fn is_history_path(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("history.jsonl")
 }
 
 pub fn homes() -> Vec<PathBuf> {
@@ -68,7 +72,7 @@ pub fn discover_rollouts() -> Vec<SourceFile> {
     super::common::jsonl_files(rollout_roots())
         .into_iter()
         .map(|path| SourceFile {
-            source: SourceKind::CodexSession,
+            source: SourceKind::Codex,
             path,
         })
         .collect()
@@ -122,7 +126,7 @@ struct SessionMeta {
 fn fallback_meta(path: &Path) -> SessionMeta {
     SessionMeta {
         session_id: session_id_from_path(path).unwrap_or_else(|| "unknown".to_string()),
-        project: SourceKind::CodexSession.label().to_string(),
+        project: SourceKind::Codex.label().to_string(),
         cwd: None,
         links: SessionLinks {
             conversation_kind: Some(ConversationKind::Main.as_str().to_string()),
@@ -214,7 +218,7 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
     };
     Ok(SourceMetadata {
         session: SessionIdentity {
-            source: SourceKind::CodexSession,
+            source: SourceKind::Codex,
             session_id: metadata.session_id,
             parent_session_id: metadata.links.parent_session_id,
             conversation_kind: kind,
@@ -297,7 +301,7 @@ pub(crate) fn parse_index_records(
                 let mut links = metadata.links.record_links();
                 links.event_id = super::common::borrowed_string(payload, "id");
                 emit(Record {
-                    source: SourceKind::CodexSession,
+                    source: SourceKind::Codex,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -357,7 +361,7 @@ pub(crate) fn parse_index_records(
                     continue;
                 }
                 emit(Record {
-                    source: SourceKind::CodexSession,
+                    source: SourceKind::Codex,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -408,7 +412,7 @@ pub(crate) fn parse_index_records(
                     }
                 }
                 emit(Record {
-                    source: SourceKind::CodexSession,
+                    source: SourceKind::Codex,
                     doc_id,
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -446,7 +450,7 @@ pub(crate) fn parse_index_records(
                     links.parent_tool_use_id = Some(call_id.to_string());
                 }
                 emit(Record {
-                    source: SourceKind::CodexSession,
+                    source: SourceKind::Codex,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -494,7 +498,7 @@ pub(crate) fn parse_index_records(
                     }
                 }
                 emit(Record {
-                    source: SourceKind::CodexSession,
+                    source: SourceKind::Codex,
                     doc_id,
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -550,7 +554,7 @@ pub(crate) fn parse_index_records(
                     }
                 }
                 emit(Record {
-                    source: SourceKind::CodexSession,
+                    source: SourceKind::Codex,
                     doc_id,
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -594,7 +598,7 @@ pub(crate) fn parse_index_records(
                     links.parent_tool_use_id = Some(call_id.to_string());
                 }
                 emit(Record {
-                    source: SourceKind::CodexSession,
+                    source: SourceKind::Codex,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -700,10 +704,10 @@ pub(crate) fn parse_history_records(
             .max(0) as u64
             * 1000;
         emit(Record {
-            source: SourceKind::CodexHistory,
+            source: SourceKind::Codex,
             doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
             ts: timestamp,
-            project: SourceKind::CodexSession.label().to_string(),
+            project: SourceKind::Codex.label().to_string(),
             session_id: session_id.to_string(),
             turn_id,
             role: "user".to_string(),
@@ -1369,6 +1373,34 @@ mod tests {
         fs::write(archived.join("archived.jsonl"), "{}\n").unwrap();
         let files = super::super::common::jsonl_files([active, archived]);
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn history_records_use_the_canonical_codex_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.jsonl");
+        fs::write(
+            &path,
+            "{\"session_id\":\"missing-session\",\"ts\":42,\"text\":\"fallback prompt\"}\n",
+        )
+        .unwrap();
+        let mut records = Vec::new();
+
+        parse_history_records(
+            &path,
+            IndexParseState::default(),
+            &HashSet::new(),
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, SourceKind::Codex);
+        assert_eq!(records[0].project, "codex");
     }
 
     #[test]
