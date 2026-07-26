@@ -1,7 +1,8 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SourceKind {
     #[default]
     Claude,
@@ -92,8 +93,9 @@ impl SourceKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[value(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub enum SourceFilter {
     Claude,
     Codex,
@@ -167,7 +169,7 @@ pub struct RecordLinks {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
-    #[serde(skip)]
+    #[serde(default)]
     pub source: SourceKind,
     pub doc_id: u64,
     pub ts: u64,

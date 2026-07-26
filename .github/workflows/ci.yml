@@ -32,7 +32,7 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
-      - name: Run tests
+      - name: Run unit and integration tests
         run: cargo test --verbose -- --test-threads=1
 
   clippy:

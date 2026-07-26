@@ -33,7 +33,7 @@ pub struct UsageQuery {
     pub memo_ttl_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[value(rename_all = "kebab-case")]
 pub enum CostMode {
@@ -120,7 +120,7 @@ pub struct UsageEvent {
     pub(crate) source_order: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct UsageSummary {
     pub source: String,
     pub events: u64,
@@ -139,7 +139,7 @@ pub struct UsageSummary {
 /// Estimated prompt-cache waste: prompt tokens that were in the previous request's prompt
 /// (so a warm cache would have served them as cache reads) but were re-billed at
 /// input/cache-write rates instead.
-#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CacheWaste {
     pub missed_tokens: u64,
     /// Extra USD paid vs. a full cache hit, at catalog rates; misses on unpriced models

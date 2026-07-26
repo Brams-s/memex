@@ -1,6 +1,7 @@
 use crate::types::{Record, SourceFilter, SourceKind};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,7 +9,8 @@ use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 2;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProjectGrouping {
     #[default]
     Flat,
