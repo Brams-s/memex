@@ -707,26 +707,39 @@ impl StdIoRedirect {
     }
 }
 
+fn open_tui_index(paths: &Paths, auto_index: bool) -> Result<SearchIndex> {
+    let index = if paths.index.join("meta.json").exists() {
+        match SearchIndex::open_or_create(&paths.index) {
+            Ok(index) => return Ok(index),
+            Err(error) if !auto_index => return Err(error),
+            Err(_) => {
+                let _lease =
+                    IngestLease::acquire(paths, "TUI index initialization", INGEST_LEASE_TIMEOUT)?;
+                SearchIndex::open_or_create_for_ingest(&paths.index)?
+            }
+        }
+    } else {
+        let _lease = IngestLease::acquire(paths, "TUI index initialization", INGEST_LEASE_TIMEOUT)?;
+        if auto_index {
+            SearchIndex::open_or_create_for_ingest(&paths.index)?
+        } else {
+            SearchIndex::open_or_create(&paths.index)?
+        }
+    };
+    Ok(index)
+}
+
 pub fn run(
     root: Option<PathBuf>,
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    if config.auto_index_on_search_default() {
+    let auto_index = config.auto_index_on_search_default();
+    if auto_index {
         paths.ensure_dirs()?;
     }
-    let index = if paths.index.join("meta.json").exists() {
-        SearchIndex::open_or_create(&paths.index)?
-    } else {
-        let _lease =
-            IngestLease::acquire(&paths, "TUI index initialization", INGEST_LEASE_TIMEOUT)?;
-        if config.auto_index_on_search_default() {
-            SearchIndex::open_or_create_for_ingest(&paths.index)?
-        } else {
-            SearchIndex::open_or_create(&paths.index)?
-        }
-    };
+    let index = open_tui_index(&paths, auto_index)?;
     let (index_tx, index_rx) = std::sync::mpsc::channel();
     let (search_tx, search_rx) = std::sync::mpsc::channel();
     let (search_request_tx, search_request_rx) = std::sync::mpsc::channel();
@@ -6057,6 +6070,16 @@ mod tests {
     use super::*;
     use crate::types::{RecordLinks, SourceKind};
 
+    fn create_stale_schema_index(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).expect("create index dir");
+        let mut builder = tantivy::schema::SchemaBuilder::default();
+        builder.add_u64_field("doc_id", tantivy::schema::INDEXED | tantivy::schema::STORED);
+        let index =
+            tantivy::Index::create_in_dir(dir, builder.build()).expect("create stale schema index");
+        drop(index);
+        std::fs::write(dir.join("sentinel"), "stale").expect("write sentinel");
+    }
+
     fn test_app() -> (tempfile::TempDir, App) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
@@ -6086,6 +6109,18 @@ mod tests {
             },
         );
         (tmp, app)
+    }
+
+    #[test]
+    fn auto_index_tui_startup_rebuilds_stale_schema() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        create_stale_schema_index(&paths.index);
+
+        let index = open_tui_index(&paths, true).expect("rebuild stale index");
+
+        assert_eq!(index.doc_count().expect("doc count"), 0);
+        assert!(!paths.index.join("sentinel").exists());
     }
 
     fn record(role: &str, text: &str) -> Record {

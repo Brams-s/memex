@@ -2338,6 +2338,21 @@ mod tests {
     }
 
     #[test]
+    fn updating_scan_cache_replaces_malformed_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        paths.ensure_dirs().expect("dirs");
+        let cache_path = paths.state.join("scan_cache.json");
+        fs::write(&cache_path, "{\"last_scan_ts\":").expect("seed malformed cache");
+
+        update_scan_cache(&paths, 7, 42).expect("update scan cache");
+
+        let cache = ScanCache::load(&cache_path).expect("load replaced cache");
+        assert_eq!(cache.file_count, 7);
+        assert_eq!(cache.total_bytes, 42);
+    }
+
+    #[test]
     fn can_skip_noop_index_with_compatible_vectors() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");

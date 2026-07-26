@@ -81,7 +81,7 @@ impl ScanCache {
             return Ok(Self::default());
         }
         let data = fs::read_to_string(path)?;
-        let cache = serde_json::from_str(&data)?;
+        let cache = serde_json::from_str(&data).unwrap_or_default();
         Ok(cache)
     }
 
@@ -194,5 +194,18 @@ mod tests {
         cache.save(&path).expect("save cache");
 
         assert_eq!(ScanCache::load(&path).expect("load cache").file_count, 3);
+    }
+
+    #[test]
+    fn malformed_scan_cache_loads_as_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("scan_cache.json");
+        fs::write(&path, "{\"last_scan_ts\":").expect("seed malformed cache");
+
+        let cache = ScanCache::load(&path).expect("load malformed cache");
+
+        assert_eq!(cache.last_scan_ts, 0);
+        assert_eq!(cache.file_count, 0);
+        assert_eq!(cache.total_bytes, 0);
     }
 }
