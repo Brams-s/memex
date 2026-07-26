@@ -18,6 +18,10 @@ pub struct FileIdentity {
     /// prevents a short file's fingerprint from changing merely because its prefix grew.
     #[serde(default)]
     pub prefix_bytes: u64,
+    /// File creation time when the platform exposes it. This provides a stable replacement
+    /// signal on platforms where device and inode metadata are unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_ns: Option<i64>,
     /// Nanosecond-resolution modification marker for detecting same-size rewrites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ns: Option<i64>,
@@ -56,6 +60,10 @@ pub struct FileState {
     pub turn_id: u32,
     #[serde(default)]
     pub parser_version: u32,
+    /// Source-specific invalidation generation. Append-only sources leave this at zero;
+    /// SQLite-backed sources can advance it when prior rows may have changed.
+    #[serde(default)]
+    pub source_generation: u64,
     #[serde(default)]
     pub pending_tool_calls: HashMap<String, PendingToolCall>,
     #[serde(default)]

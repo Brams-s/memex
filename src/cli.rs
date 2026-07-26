@@ -82,6 +82,12 @@ struct IndexArgs {
     /// Skip indexing OpenClaw sessions
     #[arg(long = "no-openclaw", default_value_t = false)]
     no_openclaw: bool,
+    /// Index Hermes sessions from ~/.hermes/state.db [default: true]
+    #[arg(long, default_value_t = true)]
+    hermes: bool,
+    /// Skip indexing Hermes sessions
+    #[arg(long = "no-hermes", default_value_t = false)]
+    no_hermes: bool,
     /// Index GitHub Copilot CLI sessions from ~/.copilot [default: true]
     #[arg(long, default_value_t = true)]
     copilot: bool,
@@ -174,7 +180,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, hermes, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -269,7 +275,7 @@ EXAMPLES:
     memex usage --source codex --since 2026-07-01
     memex usage --json")]
     Usage {
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, hermes, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include events on or after this date/timestamp
@@ -648,6 +654,7 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
         index.cursor,
         index.pi && !index.no_pi,
         index.openclaw && !index.no_openclaw,
+        index.hermes && !index.no_hermes,
         index.copilot && !index.no_copilot,
         index.embeddings,
         index.no_embeddings,
@@ -668,6 +675,7 @@ fn run_index(
     cursor: bool,
     pi: bool,
     openclaw: bool,
+    hermes: bool,
     copilot: bool,
     embeddings_flag: bool,
     no_embeddings: bool,
@@ -705,6 +713,7 @@ fn run_index(
         include_cursor: cursor,
         include_pi: pi,
         include_openclaw: openclaw,
+        include_hermes: hermes,
         include_copilot: copilot,
         embeddings,
         backfill_embeddings: false,
@@ -826,7 +835,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     vector.save()?;
     progress.finish();
     println!(
-        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {})",
+        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {}, pi {}, openclaw {}, hermes {}, copilot {})",
         embedded_total,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
         embedded_counts[crate::types::SourceKind::CodexSession.idx()],
@@ -835,6 +844,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
         embedded_counts[crate::types::SourceKind::Cursor.idx()],
         embedded_counts[crate::types::SourceKind::Pi.idx()],
         embedded_counts[crate::types::SourceKind::OpenClaw.idx()],
+        embedded_counts[crate::types::SourceKind::Hermes.idx()],
         embedded_counts[crate::types::SourceKind::Copilot.idx()],
     );
 
@@ -886,6 +896,7 @@ fn run_search(
             include_cursor: true,
             include_pi: true,
             include_openclaw: true,
+            include_hermes: true,
             include_copilot: true,
             embeddings: embeddings_default,
             backfill_embeddings: false,
@@ -1995,6 +2006,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Cursor => "cursor",
         crate::types::SourceKind::Pi => "pi",
         crate::types::SourceKind::OpenClaw => "openclaw",
+        crate::types::SourceKind::Hermes => "hermes",
         crate::types::SourceKind::Copilot => "copilot",
     };
     let source_path = &record.source_path;
@@ -2623,6 +2635,9 @@ fn build_index_command_args(
     }
     if !index.openclaw || index.no_openclaw {
         args.push("--no-openclaw".to_string());
+    }
+    if !index.hermes || index.no_hermes {
+        args.push("--no-hermes".to_string());
     }
     if !index.copilot || index.no_copilot {
         args.push("--no-copilot".to_string());
@@ -3329,11 +3344,13 @@ mod tests {
             cursor: false,
             pi: false,
             openclaw: false,
+            hermes: false,
             copilot: false,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
             no_openclaw: false,
+            no_hermes: false,
             no_copilot: false,
             embeddings: false,
             no_embeddings: false,
@@ -3349,6 +3366,7 @@ mod tests {
         assert!(args.contains(&"--no-cursor".to_string()));
         assert!(args.contains(&"--no-pi".to_string()));
         assert!(args.contains(&"--no-openclaw".to_string()));
+        assert!(args.contains(&"--no-hermes".to_string()));
         assert!(args.contains(&"--no-copilot".to_string()));
     }
 

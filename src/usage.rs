@@ -503,12 +503,13 @@ fn assemble_usage_events(
     };
     type SourceScanner =
         fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
-    const SCANNERS: [(SourceFilter, SourceScanner); 7] = [
+    const SCANNERS: [(SourceFilter, SourceScanner); 8] = [
         (SourceFilter::Claude, scan_claude),
         (SourceFilter::Codex, scan_codex),
         (SourceFilter::Opencode, scan_opencode),
         (SourceFilter::Pi, scan_pi),
         (SourceFilter::OpenClaw, scan_openclaw),
+        (SourceFilter::Hermes, scan_hermes),
         (SourceFilter::Cursor, scan_cursor),
         (SourceFilter::Copilot, scan_copilot),
     ];
@@ -1210,6 +1211,19 @@ fn scan_openclaw(
         out,
         |path| crate::sources::openclaw::parse_usage_file(path).map(FileParse::cacheable),
     );
+    Ok(())
+}
+
+fn scan_hermes(
+    out: &mut Vec<UsageEvent>,
+    _warnings: &mut Vec<String>,
+    _cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    // Hermes uses WAL mode. A fresh read is cheap (one aggregate row per session) and
+    // avoids reusing a cache entry keyed only to state.db while new frames live in -wal.
+    for source_file in crate::sources::hermes::discover() {
+        out.extend(crate::sources::hermes::parse_usage_file(&source_file.path)?);
+    }
     Ok(())
 }
 

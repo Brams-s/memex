@@ -788,6 +788,9 @@ fn resolve_session_cwd_from_parts(
     {
         return Some(cwd);
     }
+    if source == SourceKind::Hermes {
+        return crate::sources::hermes::session_cwd(Path::new(source_path), session_id);
+    }
     let file = std::fs::File::open(source_path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut fallback: Option<String> = None;

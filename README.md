@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, OpenClaw, and GitHub Copilot CLI logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, OpenClaw, Hermes, and GitHub Copilot CLI logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
@@ -159,7 +159,7 @@ Token tracking is disabled by default because it scans and caches local agent lo
 token_usage = true
 ```
 
-Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, OpenClaw, and Copilot logs:
+Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, OpenClaw, Hermes, and Copilot logs:
 
 ```
 memex usage
@@ -215,7 +215,7 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents a
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|openclaw|copilot`
+- `--source claude|codex|cursor|opencode|pi|openclaw|hermes|copilot`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
@@ -338,6 +338,11 @@ Service logs and the plist live under `~/.memex` by default (macOS). On Linux, s
 `include_reasoning` defaults to false. Set it to true (or pass `memex index
 --include-reasoning`) to add plaintext reasoning as BM25-only records. Encrypted
 and redacted reasoning payloads are always excluded.
+Hermes sessions are discovered at `$HERMES_HOME/state.db` or
+`~/.hermes/state.db`. New active messages are indexed incrementally by their
+SQLite message ID; Memex rebuilds the Hermes projection only after a rewind,
+schema-generation change, database replacement, parser change, or reasoning-mode
+change.
 `max_indexed_tool_*_bytes` limits oversized tool payloads while leaving user and assistant text
 unchanged. memex keeps roughly the first three quarters and final quarter, with a marker reporting
 the omitted middle. Each value must be at least 1024 bytes. Run `memex index --reindex` to apply
