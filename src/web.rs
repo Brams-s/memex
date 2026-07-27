@@ -507,35 +507,31 @@ struct SessionSummary {
 }
 
 fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload> {
+    if params.query.is_empty() {
+        return recent_search_payload(paths, params);
+    }
+
     let index = open_index(paths)?;
     let target = params.offset.saturating_add(params.limit).saturating_add(1);
     let document_count = index.doc_count()?.max(1);
     let mut candidate_limit = target.saturating_mul(4).max(100).min(document_count);
 
     let summaries = loop {
-        let records: Vec<(Option<f32>, crate::types::Record)> = if params.query.is_empty() {
-            index
-                .recent_records_filtered(candidate_limit, params.source, params.project.as_deref())?
-                .into_iter()
-                .map(|record| (None, record))
-                .collect()
-        } else {
-            index
-                .search(&QueryOptions {
-                    query: params.query.clone(),
-                    project: params.project.clone(),
-                    role: None,
-                    tool: None,
-                    session_id: None,
-                    source: params.source,
-                    since: None,
-                    until: None,
-                    limit: candidate_limit,
-                })?
-                .into_iter()
-                .map(|(score, record)| (Some(score), record))
-                .collect()
-        };
+        let records: Vec<(Option<f32>, crate::types::Record)> = index
+            .search(&QueryOptions {
+                query: params.query.clone(),
+                project: params.project.clone(),
+                role: None,
+                tool: None,
+                session_id: None,
+                source: params.source,
+                since: None,
+                until: None,
+                limit: candidate_limit,
+            })?
+            .into_iter()
+            .map(|(score, record)| (Some(score), record))
+            .collect();
 
         let raw_count = records.len();
         let mut seen = HashSet::new();
@@ -571,6 +567,46 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         .skip(params.offset)
         .take(params.limit)
         .collect();
+
+    Ok(SearchPayload {
+        query: params.query.clone(),
+        offset: params.offset,
+        has_more,
+        results,
+    })
+}
+
+fn recent_search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload> {
+    let target = params.offset.saturating_add(params.limit).saturating_add(1);
+    let analytics = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+    let sessions = analytics.query_sessions(
+        params.source,
+        None,
+        params.project.as_deref(),
+        ProjectGrouping::Flat,
+        Some(target),
+    )?;
+    let has_more = sessions.len() > params.offset.saturating_add(params.limit);
+    let catalog = crate::catalog::CatalogStore::open_read_only(analytics_path(&paths.state))?;
+    let mut results = Vec::with_capacity(params.limit.min(sessions.len()));
+
+    for session in sessions.into_iter().skip(params.offset).take(params.limit) {
+        let stable_session_key =
+            crate::catalog::session_key(session.source, &session.session_id, &session.source_path);
+        let latest = catalog.latest_record_for_session(&stable_session_key)?;
+        let (role, snippet) = latest
+            .map(|record| (record.role, summarize(&record.text, 360)))
+            .unwrap_or_else(|| (String::new(), String::new()));
+        results.push(SessionSummary {
+            session_id: session.session_id,
+            project: session.project,
+            source: session.source.label().to_string(),
+            role,
+            ts: session.last_at,
+            score: None,
+            snippet,
+        });
+    }
 
     Ok(SearchPayload {
         query: params.query.clone(),
@@ -923,6 +959,38 @@ mod tests {
             .unwrap();
         assert!(records.is_empty());
         assert_eq!(total, 2);
+
+        let recent_first_page = search_payload(
+            &paths,
+            &SearchRequest {
+                query: String::new(),
+                source: None,
+                project: Some("memex".to_string()),
+                offset: 0,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(recent_first_page.results.len(), 1);
+        assert_eq!(recent_first_page.results[0].session_id, "session-b");
+        assert_eq!(recent_first_page.results[0].snippet, "alpha three");
+        assert!(recent_first_page.has_more);
+
+        let recent_second_page = search_payload(
+            &paths,
+            &SearchRequest {
+                query: String::new(),
+                source: None,
+                project: Some("memex".to_string()),
+                offset: 1,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(recent_second_page.results.len(), 1);
+        assert_eq!(recent_second_page.results[0].session_id, "session-a");
+        assert_eq!(recent_second_page.results[0].snippet, "alpha two");
+        assert!(!recent_second_page.has_more);
 
         let filtered = search_payload(
             &paths,

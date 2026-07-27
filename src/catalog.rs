@@ -62,6 +62,26 @@ impl CatalogStore {
             .map(Option::flatten)
     }
 
+    pub fn latest_record_for_session(&self, session_key: &str) -> Result<Option<Record>> {
+        let record_key: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT record_key
+                 FROM records
+                 WHERE session_key = ?1
+                 ORDER BY occurred_at DESC, turn_id DESC, record_id DESC
+                 LIMIT 1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        record_key
+            .as_deref()
+            .map(|key| self.record_by_key(key))
+            .transpose()
+            .map(Option::flatten)
+    }
+
     pub fn record_count(&self) -> Result<u64> {
         let count: i64 = self
             .conn
