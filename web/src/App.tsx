@@ -65,12 +65,10 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Toggle } from "@/components/ui/toggle"
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
+  ToggleGroup,
+  ToggleGroupItem,
+} from "@/components/ui/toggle-group"
 import { cn } from "@/lib/utils"
 
 type SearchResult = {
@@ -330,7 +328,10 @@ function UsageChart({
           onValueChange={(value) => setMetric(value as ActivityMetric)}
           value={metric}
         >
-          <SelectTrigger aria-label="Usage metric" className="usage-metric">
+          <SelectTrigger
+            aria-label="Usage metric"
+            className="usage-metric shadow-none"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -713,7 +714,7 @@ function App() {
               ))}
               {preview.remaining > 0 && (
                 <Button
-                  className="load-more"
+                  className="load-more shadow-none"
                   onClick={() => setHistoryLimit((limit) => limit + 150)}
                   variant="outline"
                 >
@@ -803,125 +804,121 @@ function App() {
         </SidebarContent>
       </Sidebar>
 
-      <SidebarInset className="content-inset">
+      <SidebarInset className="min-h-0 min-w-0 gap-2 overflow-hidden bg-transparent shadow-none">
         <Tabs
           className="transcript-tabs"
           onValueChange={(value) => setMode(value as PreviewMode)}
           value={mode}
         >
           <header className="command-bar">
-          <SidebarTrigger />
-          <InputGroup className="search-group">
-            <InputGroupAddon>
-              <Search />
-            </InputGroupAddon>
-            <InputGroupInput
-              aria-label="Search conversations"
-              autoFocus
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search conversations…"
-              value={query}
-            />
-          </InputGroup>
+            <SidebarTrigger />
+            <InputGroup className="search-group shadow-none">
+              <InputGroupAddon>
+                <Search />
+              </InputGroupAddon>
+              <InputGroupInput
+                aria-label="Search conversations"
+                autoFocus
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search conversations…"
+                value={query}
+              />
+            </InputGroup>
 
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button
-                aria-label="Filters"
-                className="filter-trigger"
-                size="icon"
-                variant="outline"
-              >
-                <Filter />
-                {filterCount > 0 && (
-                  <Badge className="filter-count">{filterCount}</Badge>
-                )}
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent align="end" className="filter-popover">
-              <div className="filter-field">
-                <label>Source</label>
-                <Select onValueChange={setSource} value={source}>
-                  <SelectTrigger aria-label="Source" className="w-full">
-                    <SelectValue placeholder="All sources" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All sources</SelectItem>
-                    <SelectItem value="claude">Claude</SelectItem>
-                    <SelectItem value="codex">Codex</SelectItem>
-                    <SelectItem value="opencode">OpenCode</SelectItem>
-                    <SelectItem value="cursor">Cursor</SelectItem>
-                    <SelectItem value="pi">Pi</SelectItem>
-                    <SelectItem value="openclaw">OpenClaw</SelectItem>
-                    <SelectItem value="copilot">Copilot</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="filter-field">
-                <label htmlFor="project-filter">Project</label>
-                <Input
-                  id="project-filter"
-                  onChange={(event) => setProject(event.target.value)}
-                  placeholder="Any project"
-                  value={project}
-                />
-              </div>
-            </PopoverContent>
-          </Popover>
+            <Popover>
+              <PopoverTrigger asChild>
+                <Button
+                  aria-label="Filters"
+                  className="filter-trigger shadow-none"
+                  size="icon"
+                  variant="outline"
+                >
+                  <Filter />
+                  {filterCount > 0 && (
+                    <Badge className="filter-count">{filterCount}</Badge>
+                  )}
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="filter-popover">
+                <div className="filter-field">
+                  <label>Source</label>
+                  <Select onValueChange={setSource} value={source}>
+                    <SelectTrigger
+                      aria-label="Source"
+                      className="w-full shadow-none"
+                    >
+                      <SelectValue placeholder="All sources" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All sources</SelectItem>
+                      <SelectItem value="claude">Claude</SelectItem>
+                      <SelectItem value="codex">Codex</SelectItem>
+                      <SelectItem value="opencode">OpenCode</SelectItem>
+                      <SelectItem value="cursor">Cursor</SelectItem>
+                      <SelectItem value="pi">Pi</SelectItem>
+                      <SelectItem value="openclaw">OpenClaw</SelectItem>
+                      <SelectItem value="copilot">Copilot</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="filter-field">
+                  <label htmlFor="project-filter">Project</label>
+                  <Input
+                    className="shadow-none"
+                    id="project-filter"
+                    onChange={(event) => setProject(event.target.value)}
+                    placeholder="Any project"
+                    value={project}
+                  />
+                </div>
+              </PopoverContent>
+            </Popover>
 
             <TabsList>
-              <TabsTrigger value="matches">
-                Matches
-              </TabsTrigger>
-              <TabsTrigger value="history">
-                History
-              </TabsTrigger>
-              <TabsTrigger value="usage">
-                Usage
-              </TabsTrigger>
+              <TabsTrigger value="matches">Matches</TabsTrigger>
+              <TabsTrigger value="history">History</TabsTrigger>
+              <TabsTrigger value="usage">Usage</TabsTrigger>
             </TabsList>
 
-          <div className="view-toggles">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="inline-flex">
-                  <Toggle
-                    aria-label="Show reasoning"
-                    onPressedChange={setShowThinking}
-                    pressed={showThinking}
-                    variant="outline"
-                  >
-                    <Brain />
-                  </Toggle>
-                </span>
-              </TooltipTrigger>
-              <TooltipContent>Reasoning</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="inline-flex">
-                  <Toggle
-                    aria-label="Show tool calls"
-                    onPressedChange={setShowDetails}
-                    pressed={showDetails}
-                    variant="outline"
-                  >
-                    <TerminalSquare />
-                  </Toggle>
-                </span>
-              </TooltipTrigger>
-              <TooltipContent>Tool calls</TooltipContent>
-            </Tooltip>
-          </div>
+            <ToggleGroup
+              aria-label="Transcript visibility"
+              className="view-toggles"
+              onValueChange={(values) => {
+                setShowThinking(values.includes("reasoning"))
+                setShowDetails(values.includes("tools"))
+              }}
+              spacing={0}
+              type="multiple"
+              value={[
+                ...(showThinking ? ["reasoning"] : []),
+                ...(showDetails ? ["tools"] : []),
+              ]}
+              variant="outline"
+            >
+              <ToggleGroupItem
+                aria-label="Show reasoning"
+                title="Reasoning"
+                value="reasoning"
+              >
+                <Brain />
+              </ToggleGroupItem>
+              <ToggleGroupItem
+                aria-label="Show tool calls"
+                title="Tool calls"
+                value="tools"
+              >
+                <TerminalSquare />
+              </ToggleGroupItem>
+            </ToggleGroup>
 
-          <Button
-            aria-label={`Use ${theme === "dark" ? "light" : "dark"} theme`}
-            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-            size="icon-sm"
-            variant="ghost"
-          >
-            {theme === "dark" ? <Sun /> : <Moon />}
-          </Button>
+            <Button
+              aria-label={`Use ${theme === "dark" ? "light" : "dark"} theme`}
+              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+              size="icon-sm"
+              variant="ghost"
+            >
+              {theme === "dark" ? <Sun /> : <Moon />}
+            </Button>
           </header>
 
           <TabsContent className="transcript-tab" value="matches">
