@@ -737,7 +737,6 @@ function App() {
         <SidebarHeader className="memex-sidebar-header">
           <div className="brand-row">
             <span className="brand-name">memex</span>
-            <Badge variant="secondary">local</Badge>
           </div>
           <div className="sidebar-summary">
             <span className={cn(error && "text-destructive")}>{status}</span>
