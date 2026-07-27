@@ -1,12 +1,14 @@
 import {
   startTransition,
   type CSSProperties,
+  type KeyboardEvent,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react"
+import { flushSync } from "react-dom"
 import {
   Brain,
   Filter,
@@ -16,23 +18,10 @@ import {
   TerminalSquare,
 } from "lucide-react"
 import ReactMarkdown from "react-markdown"
-import {
-  Bar,
-  BarChart,
-  CartesianGrid,
-  XAxis,
-  YAxis,
-} from "recharts"
 import remarkGfm from "remark-gfm"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import {
-  type ChartConfig,
-  ChartContainer,
-  ChartTooltip,
-  ChartTooltipContent,
-} from "@/components/ui/chart"
 import { Input } from "@/components/ui/input"
 import {
   InputGroup,
@@ -107,15 +96,21 @@ type SessionPayload = {
   messages: Message[]
 }
 
-type PreviewMode = "matches" | "history" | "usage"
+type PreviewMode = "matches" | "history"
+type ShellView = "home" | "transcript"
 type PreviewRow = { message: Message; index: number; context: boolean }
 
 const paramsAtLoad = new URLSearchParams(window.location.search)
 const requestedMode = paramsAtLoad.get("mode")
 const initialMode: PreviewMode =
-  requestedMode === "history" || requestedMode === "usage"
+  requestedMode === "history" || requestedMode === "matches"
     ? requestedMode
-    : "matches"
+    : localStorage.getItem("memex-preview-mode") === "history"
+      ? "history"
+      : "matches"
+const initialShellView: ShellView = paramsAtLoad.has("session")
+  ? "transcript"
+  : "home"
 
 const formatDate = (timestamp: number) =>
   timestamp
@@ -338,12 +333,124 @@ const activityColors = [
   "oklch(0.5 0.02 260)",
 ]
 
+const sourceActivityColors: Record<string, string> = {
+  claude: "rgb(214 138 88)",
+  codex: "rgb(160 180 200)",
+  opencode: "rgb(150 180 150)",
+  cursor: "rgb(170 150 200)",
+  pi: "rgb(120 190 190)",
+  openclaw: "rgb(235 160 110)",
+  copilot: "rgb(140 160 220)",
+}
+
 const compactNumber = new Intl.NumberFormat(undefined, {
   notation: "compact",
   maximumFractionDigits: 1,
 })
 
-function UsageChart({
+const brailleLevels = [" ", "⣀", "⣤", "⣶", "⣿"] as const
+const homeChartHeight = 6
+
+type ActivityGroup = {
+  color: string
+  label: string
+  total: number
+}
+
+type BrailleChartData = {
+  grid: Array<Array<{ color: string; glyph: string }>>
+  groups: ActivityGroup[]
+  total: number
+}
+
+function activityDateKeys(days: number, points: ActivityPayload["points"]) {
+  const latestPoint = points
+    .map((point) => point.date)
+    .sort()
+    .at(-1)
+  const end = latestPoint
+    ? new Date(`${latestPoint}T00:00:00Z`)
+    : new Date()
+  return Array.from({ length: days }, (_, index) => {
+    const date = new Date(end)
+    date.setUTCDate(end.getUTCDate() - (days - index - 1))
+    return date.toISOString().slice(0, 10)
+  })
+}
+
+function buildBrailleChart(payload: ActivityPayload | null): BrailleChartData {
+  const points = payload?.points || []
+  const dates = activityDateKeys(payload?.days || 30, points)
+  const totalsBySource = new Map<string, number>()
+  const valuesByDate = new Map<string, Map<string, number>>()
+  let total = 0
+
+  points.forEach((point) => {
+    total += point.value
+    totalsBySource.set(
+      point.source,
+      (totalsBySource.get(point.source) || 0) + point.value,
+    )
+    const row = valuesByDate.get(point.date) || new Map<string, number>()
+    row.set(point.source, (row.get(point.source) || 0) + point.value)
+    valuesByDate.set(point.date, row)
+  })
+
+  const groups = Array.from(totalsBySource.entries())
+    .sort(
+      ([leftName, leftTotal], [rightName, rightTotal]) =>
+        rightTotal - leftTotal || leftName.localeCompare(rightName),
+    )
+    .map(([label, groupTotal], index) => ({
+      color:
+        sourceActivityColors[label.toLocaleLowerCase()] ||
+        activityColors[index % activityColors.length],
+      label,
+      total: groupTotal,
+    }))
+  const columnTotals = dates.map((date) =>
+    Array.from(valuesByDate.get(date)?.values() || []).reduce(
+      (sum, value) => sum + value,
+      0,
+    ),
+  )
+  const maximum = Math.max(0, ...columnTotals)
+  const emptyColor = "var(--muted-foreground)"
+  const grid = Array.from({ length: homeChartHeight }, () =>
+    dates.map(() => ({ color: emptyColor, glyph: " " })),
+  )
+
+  dates.forEach((date, column) => {
+    const columnTotal = columnTotals[column]
+    if (!columnTotal || !maximum) return
+    const level = Math.ceil(
+      (columnTotal * homeChartHeight * 4) / maximum,
+    )
+    const values = valuesByDate.get(date)
+    const dotColors: string[] = []
+    let cumulative = 0
+
+    groups.forEach((group) => {
+      cumulative += values?.get(group.label) || 0
+      const boundary = Math.floor((cumulative * level) / columnTotal)
+      while (dotColors.length < boundary) dotColors.push(group.color)
+    })
+
+    for (let row = 0; row < homeChartHeight; row += 1) {
+      const base = (homeChartHeight - row - 1) * 4
+      const fill = Math.min(4, Math.max(0, level - base))
+      if (!fill) continue
+      grid[row][column] = {
+        color: dotColors[base + Math.floor((fill - 1) / 2)] || groups[0].color,
+        glyph: brailleLevels[fill],
+      }
+    }
+  })
+
+  return { grid, groups, total }
+}
+
+function HomeActivityChart({
   active,
   project,
   source,
@@ -375,7 +482,7 @@ function UsageChart({
         setError(
           requestError instanceof Error
             ? requestError.message
-            : "Could not load usage",
+            : "Could not load activity",
         )
       })
       .finally(() => {
@@ -383,46 +490,62 @@ function UsageChart({
       })
   }, [active, metric, project, source])
 
-  const { chartConfig, chartData, sources, total } = useMemo(() => {
-    const points = payload?.points || []
-    const sourceNames = Array.from(new Set(points.map((point) => point.source)))
-    const rows = new Map<string, Record<string, string | number>>()
-    let sum = 0
-    points.forEach((point) => {
-      const row = rows.get(point.date) || { date: point.date }
-      row[point.source] = Number(row[point.source] || 0) + point.value
-      rows.set(point.date, row)
-      sum += point.value
-    })
-    const config = Object.fromEntries(
-      sourceNames.map((name) => [name, { label: name }]),
-    ) satisfies ChartConfig
-    return {
-      chartConfig: config,
-      chartData: Array.from(rows.values()),
-      sources: sourceNames,
-      total: sum,
-    }
-  }, [payload])
+  const chart = useMemo(() => buildBrailleChart(payload), [payload])
+  const chartLabel = `${compactNumber.format(chart.total)} ${metric} over the last 30 days`
 
   return (
-    <div className="usage-surface">
-      <div className="usage-heading">
-        <div>
-          <h2>30-day activity</h2>
-          <p>
-            {loading
-              ? "Loading local activity…"
-              : `${compactNumber.format(total)} ${metric}${payload?.partial ? " · partial" : ""}`}
-          </p>
+    <section
+      aria-busy={loading}
+      aria-label="Recent activity"
+      className="home-activity"
+    >
+      <div
+        aria-label={chartLabel}
+        className={cn("braille-chart", loading && "is-loading")}
+        role="img"
+      >
+        {chart.grid.map((row, rowIndex) => (
+          <div className="braille-row" key={rowIndex}>
+            {row.map((cell, columnIndex) => (
+              <span
+                aria-hidden="true"
+                key={`${rowIndex}-${columnIndex}`}
+                style={{ color: cell.color }}
+              >
+                {cell.glyph}
+              </span>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      <div className="home-activity-caption">
+        <div className="activity-summary">
+          <span>
+            {error
+              ? "Activity unavailable"
+              : loading && !payload
+                ? "Loading activity…"
+                : `${compactNumber.format(chart.total)} ${metric}${payload?.partial ? " · partial" : ""}`}
+          </span>
+          {chart.groups.length > 0 && (
+            <span className="activity-legend" aria-hidden="true">
+              {chart.groups.map((group) => (
+                <span key={group.label}>
+                  <i style={{ background: group.color }} />
+                  {group.label}
+                </span>
+              ))}
+            </span>
+          )}
         </div>
         <Select
           onValueChange={(value) => setMetric(value as ActivityMetric)}
           value={metric}
         >
           <SelectTrigger
-            aria-label="Usage metric"
-            className="usage-metric shadow-none"
+            aria-label="Activity metric"
+            className="home-chart-select shadow-none"
           >
             <SelectValue />
           </SelectTrigger>
@@ -433,67 +556,13 @@ function UsageChart({
         </Select>
       </div>
 
-      {error ? (
-        <div className="empty text-destructive">{error}</div>
-      ) : metric === "tokens" &&
-        payload &&
-        !payload.token_usage_enabled ? (
-        <div className="empty">
+      {metric === "tokens" && payload && !payload.token_usage_enabled && (
+        <p className="home-activity-note">
           Token usage is disabled. Set <code>token_usage = true</code> in the
           memex config to enable it.
-        </div>
-      ) : !loading && chartData.length === 0 ? (
-        <div className="empty">No activity in this window.</div>
-      ) : (
-        <ChartContainer className="usage-chart" config={chartConfig}>
-          <BarChart accessibilityLayer data={chartData}>
-            <CartesianGrid vertical={false} />
-            <XAxis
-              axisLine={false}
-              dataKey="date"
-              minTickGap={22}
-              tickFormatter={(value) =>
-                new Intl.DateTimeFormat(undefined, {
-                  month: "short",
-                  day: "numeric",
-                  timeZone: "UTC",
-                }).format(new Date(`${value}T00:00:00Z`))
-              }
-              tickLine={false}
-            />
-            <YAxis
-              axisLine={false}
-              tickFormatter={(value) => compactNumber.format(value)}
-              tickLine={false}
-              width={48}
-            />
-            <ChartTooltip
-              content={
-                <ChartTooltipContent
-                  formatter={(value, name) => (
-                    <>
-                      <span className="text-muted-foreground">{name}</span>
-                      <span className="ml-auto font-mono font-medium">
-                        {compactNumber.format(Number(value))}
-                      </span>
-                    </>
-                  )}
-                />
-              }
-            />
-            {sources.map((name, index) => (
-              <Bar
-                dataKey={name}
-                fill={activityColors[index % activityColors.length]}
-                key={name}
-                radius={index === sources.length - 1 ? [3, 3, 0, 0] : 0}
-                stackId="activity"
-              />
-            ))}
-          </BarChart>
-        </ChartContainer>
+        </p>
       )}
-    </div>
+    </section>
   )
 }
 
@@ -501,10 +570,14 @@ function App() {
   const [query, setQuery] = useState(paramsAtLoad.get("q") || "")
   const [source, setSource] = useState(paramsAtLoad.get("source") || "all")
   const [project, setProject] = useState(paramsAtLoad.get("project") || "")
+  const [shellView, setShellView] = useState<ShellView>(initialShellView)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
   const [mode, setMode] = useState<PreviewMode>(initialMode)
   const [showThinking, setShowThinking] = useState(false)
   const [showDetails, setShowDetails] = useState(false)
   const [results, setResults] = useState<SearchResult[]>([])
+  const [knownProjects, setKnownProjects] = useState<string[]>([])
+  const [homeSelectedIndex, setHomeSelectedIndex] = useState(0)
   const [hasMoreResults, setHasMoreResults] = useState(false)
   const [loadingMoreResults, setLoadingMoreResults] = useState(false)
   const [selectedId, setSelectedId] = useState(paramsAtLoad.get("session"))
@@ -523,6 +596,10 @@ function App() {
     localStorage.setItem("memex-theme", theme)
   }, [theme])
 
+  useEffect(() => {
+    localStorage.setItem("memex-preview-mode", mode)
+  }, [mode])
+
   const updateLocation = useCallback(
     (nextSelectedId: string | null) => {
       const next = new URLSearchParams()
@@ -530,7 +607,7 @@ function App() {
       if (source !== "all") next.set("source", source)
       if (project.trim()) next.set("project", project.trim())
       if (nextSelectedId) next.set("session", nextSelectedId)
-      if (mode !== "matches") next.set("mode", mode)
+      if (nextSelectedId && mode !== "matches") next.set("mode", mode)
       history.replaceState({}, "", next.size ? `?${next}` : location.pathname)
     },
     [mode, project, query, source],
@@ -649,16 +726,17 @@ function App() {
         setHasMoreResults(data.has_more)
         setStatus(searchStatus(data.results.length, data.has_more))
 
-        const currentId = selectedId
-        const next =
-          data.results.find((item) => item.session_id === currentId) ||
-          data.results[0]
-        if (next) void selectSession(next.session_id, next, false)
-        else {
-          setSelectedId(null)
-          setSession(null)
+        if (shellView === "transcript") {
+          const currentId = selectedId
+          const next =
+            data.results.find((item) => item.session_id === currentId) ||
+            data.results[0]
+          if (next) void selectSession(next.session_id, next, false)
+          else {
+            setSelectedId(null)
+            setSession(null)
+          }
         }
-
       } catch (requestError) {
         if (generation !== searchGeneration.current) return
         const message =
@@ -668,7 +746,13 @@ function App() {
       }
     }, 180)
     return () => window.clearTimeout(timer)
-  }, [fetchFirstPage, query, searchParamsFor, searchStatus])
+  }, [
+    query,
+    searchParamsFor,
+    searchStatus,
+    selectSession,
+    shellView,
+  ])
 
   const loadMoreResults = useCallback(async () => {
     if (!hasMoreResults || loadingMoreResults) return
@@ -774,7 +858,230 @@ function App() {
     }
   }, [historyLimit, mode, query, session, showDetails, showThinking])
 
+  const homeResults = useMemo(() => {
+    const unique = new Map<string, SearchResult>()
+    results.forEach((result) => {
+      if (!unique.has(result.session_id)) unique.set(result.session_id, result)
+    })
+    return Array.from(unique.values()).slice(0, 12)
+  }, [results])
+
+  useEffect(() => {
+    setHomeSelectedIndex(0)
+  }, [query, source, project])
+
+  useEffect(() => {
+    const discovered = results
+      .map((result) => result.project.trim())
+      .filter(Boolean)
+    if (!discovered.length) return
+    setKnownProjects((current) => {
+      const next = Array.from(new Set([...current, ...discovered])).sort((a, b) =>
+        a.localeCompare(b),
+      )
+      return next.length === current.length &&
+        next.every((value, index) => value === current[index])
+        ? current
+        : next
+    })
+  }, [results])
+
+  const openTranscript = useCallback(
+    (result: SearchResult) => {
+      const update = () => {
+        setShellView("transcript")
+        void selectSession(result.session_id, result)
+      }
+      const startViewTransition = (
+        document as Document & {
+          startViewTransition?: (callback: () => void) => unknown
+        }
+      ).startViewTransition
+
+      if (startViewTransition) {
+        startViewTransition.call(document, () => flushSync(update))
+      } else {
+        update()
+      }
+    },
+    [selectSession],
+  )
+
+  const returnHome = useCallback(() => {
+    const update = () => {
+      setShellView("home")
+      setSidebarOpen(false)
+      setSelectedId(null)
+      setSession(null)
+    }
+    const startViewTransition = (
+      document as Document & {
+        startViewTransition?: (callback: () => void) => unknown
+      }
+    ).startViewTransition
+
+    if (startViewTransition) {
+      startViewTransition.call(document, () => flushSync(update))
+    } else {
+      update()
+    }
+  }, [])
+
+  const handleHomeSearchKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLInputElement>) => {
+      if (event.key === "ArrowDown") {
+        event.preventDefault()
+        setHomeSelectedIndex((index) =>
+          Math.min(index + 1, Math.max(0, homeResults.length - 1)),
+        )
+        return
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault()
+        setHomeSelectedIndex((index) => Math.max(0, index - 1))
+        return
+      }
+      if (event.key === "Enter") {
+        const result = homeResults[homeSelectedIndex] || homeResults[0]
+        if (!result) return
+        event.preventDefault()
+        openTranscript(result)
+      }
+    },
+    [homeResults, homeSelectedIndex, openTranscript],
+  )
+
   const filterCount = Number(source !== "all") + Number(Boolean(project.trim()))
+  const homeSurface = (
+    <main className="home-surface">
+      <div className="home-column">
+        <HomeActivityChart
+          active={shellView === "home"}
+          project={project}
+          source={source}
+        />
+
+        <InputGroup className="home-search search-morph shadow-none">
+          <InputGroupAddon>
+            <Search />
+          </InputGroupAddon>
+          <InputGroupInput
+            aria-activedescendant={
+              homeResults[homeSelectedIndex]
+                ? `home-result-${homeSelectedIndex}`
+                : undefined
+            }
+            aria-controls="home-results"
+            aria-autocomplete="list"
+            aria-expanded={homeResults.length > 0}
+            aria-label="Search conversations"
+            autoFocus
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={handleHomeSearchKeyDown}
+            placeholder="Search your sessions…"
+            role="combobox"
+            value={query}
+          />
+        </InputGroup>
+
+        <div className="home-results-heading">
+          <div>
+            <strong>{query.trim() ? "matches" : "recent"}</strong>
+            <span>
+              {results.length}
+              {hasMoreResults ? "+" : ""}
+            </span>
+          </div>
+          <div className="home-result-filters">
+            <Select onValueChange={setSource} value={source}>
+              <SelectTrigger
+                aria-label="Source"
+                className="home-filter-select shadow-none"
+              >
+                <SelectValue placeholder="all sources" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">all sources</SelectItem>
+                <SelectItem value="claude">Claude</SelectItem>
+                <SelectItem value="codex">Codex</SelectItem>
+                <SelectItem value="opencode">OpenCode</SelectItem>
+                <SelectItem value="cursor">Cursor</SelectItem>
+                <SelectItem value="pi">Pi</SelectItem>
+                <SelectItem value="openclaw">OpenClaw</SelectItem>
+                <SelectItem value="copilot">Copilot</SelectItem>
+              </SelectContent>
+            </Select>
+            <Select
+              onValueChange={(value) => setProject(value === "all" ? "" : value)}
+              value={project || "all"}
+            >
+              <SelectTrigger
+                aria-label="Project"
+                className="home-filter-select home-project-select shadow-none"
+              >
+                <SelectValue placeholder="All projects" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All projects</SelectItem>
+                {knownProjects.map((option) => (
+                  <SelectItem key={option} value={option}>
+                    {option}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        <div
+          aria-label={query.trim() ? "Matching sessions" : "Recent sessions"}
+          className="home-results"
+          id="home-results"
+          role="listbox"
+        >
+          {error ? (
+            <div className="home-results-empty text-destructive">{error}</div>
+          ) : homeResults.length === 0 ? (
+            <div className="home-results-empty">
+              {status === "Searching…" || status === "Loading recent sessions…"
+                ? status
+                : query.trim()
+                  ? "No matching sessions"
+                  : "No recent sessions"}
+            </div>
+          ) : (
+            homeResults.map((result, index) => (
+              <button
+                aria-selected={homeSelectedIndex === index}
+                className={cn(
+                  "home-result",
+                  homeSelectedIndex === index && "is-selected",
+                )}
+                id={`home-result-${index}`}
+                key={result.session_id}
+                onClick={() => openTranscript(result)}
+                onMouseEnter={() => setHomeSelectedIndex(index)}
+                role="option"
+                type="button"
+              >
+                <span className="home-result-title">
+                  {result.project || "Untitled session"}
+                </span>
+                <span className="home-result-meta">
+                  {result.source} · {result.role}
+                </span>
+                <time>{formatDate(result.ts)}</time>
+                <span className="home-result-snippet">
+                  {result.snippet || "No text preview"}
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+    </main>
+  )
+
   const transcriptSurface = (
     <div className="transcript-surface">
       <div className="transcript-scroll">
@@ -823,12 +1130,17 @@ function App() {
   return (
     <SidebarProvider
       className="memex-shell"
+      defaultOpen={false}
+      onOpenChange={setSidebarOpen}
+      open={sidebarOpen}
       style={{ "--sidebar-width": "19rem" } as CSSProperties}
     >
       <Sidebar collapsible="offcanvas">
         <SidebarHeader className="memex-sidebar-header">
           <div className="brand-row">
-            <span className="brand-name">memex</span>
+            <button className="brand-name" onClick={returnHome} type="button">
+              memex
+            </button>
           </div>
           <div className="sidebar-summary">
             <span className={cn(error && "text-destructive")}>{status}</span>
@@ -848,9 +1160,7 @@ function App() {
                     <SidebarMenuButton
                       className="session-button"
                       isActive={selectedId === result.session_id}
-                      onClick={() =>
-                        void selectSession(result.session_id, result)
-                      }
+                      onClick={() => openTranscript(result)}
                       onPointerEnter={() =>
                         void fetchFirstPage(result.session_id).catch(() => {})
                       }
@@ -896,135 +1206,140 @@ function App() {
       </Sidebar>
 
       <SidebarInset className="min-h-0 min-w-0 gap-2 overflow-hidden bg-transparent p-2 shadow-none">
-        <Tabs
-          className="transcript-tabs"
-          onValueChange={(value) => setMode(value as PreviewMode)}
-          value={mode}
-        >
-          <header className="command-bar">
-            <SidebarTrigger />
-            <InputGroup className="search-group shadow-none">
-              <InputGroupAddon>
-                <Search />
-              </InputGroupAddon>
-              <InputGroupInput
-                aria-label="Search conversations"
-                autoFocus
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search conversations…"
-                value={query}
-              />
-            </InputGroup>
+        {shellView === "home" ? (
+          homeSurface
+        ) : (
+          <Tabs
+            className="transcript-tabs"
+            onValueChange={(value) => setMode(value as PreviewMode)}
+            value={mode}
+          >
+            <header className="command-bar">
+              <SidebarTrigger />
+              <InputGroup className="search-group search-morph shadow-none">
+                <InputGroupAddon>
+                  <Search />
+                </InputGroupAddon>
+                <InputGroupInput
+                  aria-label="Search conversations"
+                  autoFocus
+                  onChange={(event) => setQuery(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (
+                      event.key !== "Escape" &&
+                      !(event.key === "Backspace" && query.length === 0)
+                    )
+                      return
+                    event.preventDefault()
+                    returnHome()
+                  }}
+                  placeholder="Search conversations…"
+                  value={query}
+                />
+              </InputGroup>
 
-            <Popover>
-              <PopoverTrigger asChild>
-                <Button
-                  aria-label="Filters"
-                  className="filter-trigger shadow-none"
-                  size="icon"
-                  variant="outline"
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button
+                    aria-label="Filters"
+                    className="filter-trigger shadow-none"
+                    size="icon"
+                    variant="outline"
+                  >
+                    <Filter />
+                    {filterCount > 0 && (
+                      <Badge className="filter-count">{filterCount}</Badge>
+                    )}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="end" className="filter-popover">
+                  <div className="filter-field">
+                    <label>Source</label>
+                    <Select onValueChange={setSource} value={source}>
+                      <SelectTrigger
+                        aria-label="Source"
+                        className="w-full shadow-none"
+                      >
+                        <SelectValue placeholder="All sources" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">All sources</SelectItem>
+                        <SelectItem value="claude">Claude</SelectItem>
+                        <SelectItem value="codex">Codex</SelectItem>
+                        <SelectItem value="opencode">OpenCode</SelectItem>
+                        <SelectItem value="cursor">Cursor</SelectItem>
+                        <SelectItem value="pi">Pi</SelectItem>
+                        <SelectItem value="openclaw">OpenClaw</SelectItem>
+                        <SelectItem value="copilot">Copilot</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="filter-field">
+                    <label htmlFor="project-filter">Project</label>
+                    <Input
+                      className="shadow-none"
+                      id="project-filter"
+                      onChange={(event) => setProject(event.target.value)}
+                      placeholder="Any project"
+                      value={project}
+                    />
+                  </div>
+                </PopoverContent>
+              </Popover>
+
+              <TabsList>
+                <TabsTrigger value="matches">Matches</TabsTrigger>
+                <TabsTrigger value="history">History</TabsTrigger>
+              </TabsList>
+
+              <ToggleGroup
+                aria-label="Transcript visibility"
+                className="view-toggles"
+                multiple
+                onValueChange={(values) => {
+                  setShowThinking(values.includes("reasoning"))
+                  setShowDetails(values.includes("tools"))
+                }}
+                value={[
+                  ...(showThinking ? ["reasoning"] : []),
+                  ...(showDetails ? ["tools"] : []),
+                ]}
+                variant="outline"
+              >
+                <ToggleGroupItem
+                  aria-label="Show reasoning"
+                  title="Reasoning"
+                  value="reasoning"
                 >
-                  <Filter />
-                  {filterCount > 0 && (
-                    <Badge className="filter-count">{filterCount}</Badge>
-                  )}
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent align="end" className="filter-popover">
-                <div className="filter-field">
-                  <label>Source</label>
-                  <Select onValueChange={setSource} value={source}>
-                    <SelectTrigger
-                      aria-label="Source"
-                      className="w-full shadow-none"
-                    >
-                      <SelectValue placeholder="All sources" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">All sources</SelectItem>
-                      <SelectItem value="claude">Claude</SelectItem>
-                      <SelectItem value="codex">Codex</SelectItem>
-                      <SelectItem value="opencode">OpenCode</SelectItem>
-                      <SelectItem value="cursor">Cursor</SelectItem>
-                      <SelectItem value="pi">Pi</SelectItem>
-                      <SelectItem value="openclaw">OpenClaw</SelectItem>
-                      <SelectItem value="copilot">Copilot</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="filter-field">
-                  <label htmlFor="project-filter">Project</label>
-                  <Input
-                    className="shadow-none"
-                    id="project-filter"
-                    onChange={(event) => setProject(event.target.value)}
-                    placeholder="Any project"
-                    value={project}
-                  />
-                </div>
-              </PopoverContent>
-            </Popover>
+                  <Brain />
+                </ToggleGroupItem>
+                <ToggleGroupItem
+                  aria-label="Show tool calls"
+                  title="Tool calls"
+                  value="tools"
+                >
+                  <TerminalSquare />
+                </ToggleGroupItem>
+              </ToggleGroup>
 
-            <TabsList>
-              <TabsTrigger value="matches">Matches</TabsTrigger>
-              <TabsTrigger value="history">History</TabsTrigger>
-              <TabsTrigger value="usage">Usage</TabsTrigger>
-            </TabsList>
-
-            <ToggleGroup
-              aria-label="Transcript visibility"
-              className="view-toggles"
-              multiple
-              onValueChange={(values) => {
-                setShowThinking(values.includes("reasoning"))
-                setShowDetails(values.includes("tools"))
-              }}
-              value={[
-                ...(showThinking ? ["reasoning"] : []),
-                ...(showDetails ? ["tools"] : []),
-              ]}
-              variant="outline"
-            >
-              <ToggleGroupItem
-                aria-label="Show reasoning"
-                title="Reasoning"
-                value="reasoning"
+              <Button
+                aria-label={`Use ${theme === "dark" ? "light" : "dark"} theme`}
+                onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+                size="icon-sm"
+                variant="ghost"
               >
-                <Brain />
-              </ToggleGroupItem>
-              <ToggleGroupItem
-                aria-label="Show tool calls"
-                title="Tool calls"
-                value="tools"
-              >
-                <TerminalSquare />
-              </ToggleGroupItem>
-            </ToggleGroup>
+                {theme === "dark" ? <Sun /> : <Moon />}
+              </Button>
+            </header>
 
-            <Button
-              aria-label={`Use ${theme === "dark" ? "light" : "dark"} theme`}
-              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-              size="icon-sm"
-              variant="ghost"
-            >
-              {theme === "dark" ? <Sun /> : <Moon />}
-            </Button>
-          </header>
-
-          <TabsContent className="transcript-tab" value="matches">
-            {mode === "matches" && transcriptSurface}
-          </TabsContent>
-          <TabsContent className="transcript-tab" value="history">
-            {mode === "history" && transcriptSurface}
-          </TabsContent>
-          <TabsContent className="transcript-tab" value="usage">
-            <UsageChart
-              active={mode === "usage"}
-              project={project}
-              source={source}
-            />
-          </TabsContent>
-        </Tabs>
+            <TabsContent className="transcript-tab" value="matches">
+              {mode === "matches" && transcriptSurface}
+            </TabsContent>
+            <TabsContent className="transcript-tab" value="history">
+              {mode === "history" && transcriptSurface}
+            </TabsContent>
+          </Tabs>
+        )}
       </SidebarInset>
     </SidebarProvider>
   )
