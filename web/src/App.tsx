@@ -107,6 +107,9 @@ type PreviewMode = "matches" | "history"
 type ShellView = "home" | "transcript"
 type PreviewRow = { message: Message; index: number; context: boolean }
 
+const SESSION_HISTORY_PAGE_SIZE = 200
+const SESSION_HISTORY_CONCURRENCY = 6
+
 const paramsAtLoad = new URLSearchParams(window.location.search)
 const requestedMode = paramsAtLoad.get("mode")
 const initialMode: PreviewMode =
@@ -702,13 +705,36 @@ function App() {
         if (generation !== sessionGeneration.current) return
         setSession(firstPage)
         const messages = [...firstPage.messages]
-        while (messages.length < firstPage.total) {
-          const page = await api<SessionPayload>(
-            `/api/session?id=${encodeURIComponent(id)}&offset=${messages.length}&limit=100`,
+        const remainingOffsets: number[] = []
+        for (
+          let offset = messages.length;
+          offset < firstPage.total;
+          offset += SESSION_HISTORY_PAGE_SIZE
+        ) {
+          remainingOffsets.push(offset)
+        }
+        for (
+          let start = 0;
+          start < remainingOffsets.length;
+          start += SESSION_HISTORY_CONCURRENCY
+        ) {
+          const offsets = remainingOffsets.slice(
+            start,
+            start + SESSION_HISTORY_CONCURRENCY,
+          )
+          const pages = await Promise.all(
+            offsets.map((offset) =>
+              api<SessionPayload>(
+                `/api/session?id=${encodeURIComponent(id)}&offset=${offset}&limit=${SESSION_HISTORY_PAGE_SIZE}`,
+              ),
+            ),
           )
           if (generation !== sessionGeneration.current) return
-          messages.push(...page.messages)
-          startTransition(() => setSession({ ...firstPage, messages }))
+          for (const page of pages) messages.push(...page.messages)
+          const loadedMessages = [...messages]
+          startTransition(() =>
+            setSession({ ...firstPage, messages: loadedMessages }),
+          )
         }
       } catch (requestError) {
         if (generation !== sessionGeneration.current) return
