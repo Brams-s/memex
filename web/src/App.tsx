@@ -890,6 +890,7 @@ function App() {
     (result: SearchResult) => {
       const update = () => {
         setShellView("transcript")
+        setSidebarOpen(true)
         void selectSession(result.session_id, result)
       }
       const startViewTransition = (
@@ -898,13 +899,13 @@ function App() {
         }
       ).startViewTransition
 
-      if (startViewTransition) {
+      if (shellView === "home" && startViewTransition) {
         startViewTransition.call(document, () => flushSync(update))
       } else {
         update()
       }
     },
-    [selectSession],
+    [selectSession, shellView],
   )
 
   const returnHome = useCallback(() => {
@@ -949,6 +950,67 @@ function App() {
       }
     },
     [homeResults, homeSelectedIndex, openTranscript],
+  )
+
+  const handleSidebarKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLElement>) => {
+      if (event.key === "Enter" || event.key === " ") {
+        const button = (event.target as Element).closest<HTMLButtonElement>(
+          ".session-button",
+        )
+        const result = results.find(
+          (item) => item.session_id === button?.dataset.sessionId,
+        )
+        if (!result) return
+        event.preventDefault()
+        openTranscript(result)
+        return
+      }
+
+      const direction =
+        event.key === "ArrowDown" || event.key === "j"
+          ? 1
+          : event.key === "ArrowUp" || event.key === "k"
+            ? -1
+            : 0
+      const edge =
+        event.key === "Home" ? 0 : event.key === "End" ? results.length - 1 : -1
+      if (
+        (!direction && edge < 0) ||
+        event.altKey ||
+        event.ctrlKey ||
+        event.metaKey
+      )
+        return
+
+      const buttons = Array.from(
+        event.currentTarget.querySelectorAll<HTMLButtonElement>(
+          ".session-button:not(:disabled)",
+        ),
+      )
+      if (!buttons.length) return
+
+      event.preventDefault()
+      const target = event.target as Element
+      const focusedIndex = buttons.findIndex(
+        (button) => button === target || button.contains(target),
+      )
+      const selectedIndex = buttons.findIndex(
+        (button) => button.dataset.sessionId === selectedId,
+      )
+      const currentIndex =
+        focusedIndex >= 0 ? focusedIndex : Math.max(0, selectedIndex)
+      const nextIndex =
+        edge >= 0
+          ? Math.min(edge, buttons.length - 1)
+          : Math.min(
+              buttons.length - 1,
+              Math.max(0, currentIndex + direction),
+            )
+      buttons[nextIndex].focus({ preventScroll: true })
+      buttons[nextIndex].scrollIntoView({ block: "nearest" })
+    },
+    [openTranscript, results, selectedId],
   )
 
   const filterCount = Number(source !== "all") + Number(Boolean(project.trim()))
@@ -1152,13 +1214,14 @@ function App() {
           </div>
         </SidebarHeader>
         <SidebarContent>
-          <SidebarGroup className="pt-0">
+          <SidebarGroup className="pt-0 pr-0">
             <SidebarGroupContent>
-              <SidebarMenu>
+              <SidebarMenu onKeyDown={handleSidebarKeyDown}>
                 {results.map((result) => (
                   <SidebarMenuItem key={result.session_id}>
                     <SidebarMenuButton
                       className="session-button"
+                      data-session-id={result.session_id}
                       isActive={selectedId === result.session_id}
                       onClick={() => openTranscript(result)}
                       onPointerEnter={() =>

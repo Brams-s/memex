@@ -531,7 +531,6 @@ body {
   height: 100%;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-gutter: stable;
 }
 
 .filter-popover {
