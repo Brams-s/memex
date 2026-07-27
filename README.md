@@ -290,6 +290,7 @@ Enable:
 ```
 memex index-service enable
 memex index-service enable --continuous
+memex index-service enable --web-ui
 ```
 
 Disable:
@@ -301,6 +302,27 @@ memex index-service disable
 
 On Linux, creates systemd user units in `~/.config/systemd/user/`. On macOS, creates a launchd plist in `~/.memex/`.
 On successful enable, memex writes `auto_index_on_search = false` to config when that setting is absent, so searches do not duplicate daemon work. Explicit user config is preserved.
+
+`--web-ui` implies continuous mode and serves a local search and transcript browser at
+`http://127.0.0.1:6363`. It mirrors the TUI's core workflow with search-as-you-type,
+source and project filters, a persistent session list, and Matches/History transcript
+previews. The server binds to loopback by default because the index
+contains private conversation history. Override the address explicitly when needed:
+
+```
+memex index-service enable --web-listen 127.0.0.1:8080
+```
+
+To run the same UI in the foreground without changing the background service:
+
+```
+memex web
+```
+
+The browser frontend lives in `web/`, uses React and shadcn components, and is
+built with `cd web && bun install && bun run build`. The generated static assets
+are embedded in the memex binary, so serving the UI does not add a JavaScript
+runtime to the daemon.
 
 ## Embeddings
 
@@ -373,6 +395,8 @@ max_indexed_tool_output_bytes = 262144  # 256 KiB default
 index_service_mode = "interval"  # interval or continuous
 index_service_interval = 3600  # seconds (ignored when mode = "continuous")
 index_service_poll_interval = 30  # seconds
+index_service_web_ui = false  # serve local browser; forces continuous mode when true
+index_service_web_listen = "127.0.0.1:6363"
 index_service_label = "memex-index"  # service name (default: com.memex.index on macOS)
 index_service_systemd_dir = "~/.config/systemd/user"  # Linux only
 claude_resume_cmd = "claude --resume {session_id}"

@@ -36,6 +36,8 @@ in {
         - index_service_mode (string): "interval" or "continuous"
         - index_service_interval (int): seconds
         - index_service_poll_interval (int): seconds
+        - index_service_web_ui (bool): serve the local Web UI in continuous mode
+        - index_service_web_listen (string): Web UI address and port
         - index_service_label (string): service name for systemd/launchd
         - index_service_systemd_dir (string): systemd user directory (Linux)
         - index_service_plist (string): launchd plist path (macOS)

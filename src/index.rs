@@ -1,8 +1,8 @@
-use crate::types::{Record, RecordLinks};
+use crate::types::{Record, RecordLinks, SourceFilter};
 use anyhow::{Result, anyhow};
 use std::ops::Bound;
 use std::path::Path;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::Value;
 use tantivy::schema::{
@@ -208,13 +208,96 @@ impl SearchIndex {
         Ok(records)
     }
 
-    pub fn recent_records(&self, limit: usize) -> Result<Vec<Record>> {
+    pub fn records_by_session_id_page(
+        &self,
+        session_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<Record>, usize)> {
         let reader = self.reader()?;
         let searcher = reader.searcher();
-        let query = AllQuery;
+        let term = Term::from_field_text(self.fields.session_id, session_id);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let total = searcher.search(&query, &Count)?;
+        if offset >= total {
+            return Ok((Vec::new(), total));
+        }
+        let page_limit = limit.max(1).min(total - offset);
+        let collector = TopDocs::with_limit(page_limit)
+            .and_offset(offset)
+            .order_by_fast_field::<u64>("turn_id", Order::Asc);
+        let top_docs: Vec<(u64, tantivy::DocAddress)> = searcher.search(&query, &collector)?;
+        let mut records = Vec::with_capacity(top_docs.len());
+        for (_turn_id, addr) in top_docs {
+            let doc = searcher.doc::<TantivyDocument>(addr)?;
+            records.push(record_from_doc(&self.fields, &doc));
+        }
+        records.sort_by(|a, b| {
+            a.turn_id
+                .cmp(&b.turn_id)
+                .then_with(|| a.ts.cmp(&b.ts))
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        });
+        Ok((records, total))
+    }
+
+    pub fn recent_records(&self, limit: usize) -> Result<Vec<Record>> {
+        self.recent_records_filtered(limit, None, None)
+    }
+
+    pub fn recent_records_for_source(
+        &self,
+        limit: usize,
+        source: Option<SourceFilter>,
+    ) -> Result<Vec<Record>> {
+        self.recent_records_filtered(limit, source, None)
+    }
+
+    pub fn recent_records_filtered(
+        &self,
+        limit: usize,
+        source: Option<SourceFilter>,
+        project: Option<&str>,
+    ) -> Result<Vec<Record>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        if let Some(source) = source
+            && let Some(field) = self.fields.source
+        {
+            let terms = source
+                .storage_labels()
+                .iter()
+                .map(|label| {
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(field, label),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    )
+                })
+                .collect();
+            clauses.push((Occur::Must, Box::new(BooleanQuery::new(terms))));
+        }
+        if let Some(project) = project {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.project, project),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        let query: Box<dyn Query> = if clauses.is_empty() {
+            Box::new(AllQuery)
+        } else {
+            Box::new(BooleanQuery::new(clauses))
+        };
         let collector =
             TopDocs::with_limit(limit.max(1)).order_by_fast_field::<u64>("ts", Order::Desc);
-        let top_docs: Vec<(u64, tantivy::DocAddress)> = searcher.search(&query, &collector)?;
+        let top_docs: Vec<(u64, tantivy::DocAddress)> =
+            searcher.search(query.as_ref(), &collector)?;
         let mut records = Vec::with_capacity(top_docs.len());
         for (_ts, addr) in top_docs {
             let doc = searcher.doc::<TantivyDocument>(addr)?;

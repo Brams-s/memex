@@ -131,6 +131,10 @@ EXAMPLES:
             hide = true
         )]
         watch_interval: u64,
+        #[arg(long, hide = true)]
+        web_ui: bool,
+        #[arg(long, hide = true, value_name = "ADDRESS")]
+        web_listen: Option<String>,
     },
     /// Delete existing index and rebuild from scratch
     Reindex {
@@ -232,6 +236,19 @@ OUTPUT FIELDS (--fields):
     },
     /// Interactive terminal UI for browsing sessions
     Tui {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Serve the local conversation browser
+    #[command(after_help = "\
+EXAMPLES:
+    memex web
+    memex web --listen 127.0.0.1:8080")]
+    Web {
+        /// Address and port to bind
+        #[arg(long, default_value = crate::web::DEFAULT_LISTEN)]
+        listen: String,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -443,6 +460,12 @@ enum IndexServiceCommand {
         /// Seconds between invocations in interval mode [default: 3600]
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         interval: Option<u64>,
+        /// Serve the local Web UI (implies continuous mode)
+        #[arg(long)]
+        web_ui: bool,
+        /// Web UI address and port [default: 127.0.0.1:6363] (implies --web-ui)
+        #[arg(long, value_name = "ADDRESS")]
+        web_listen: Option<String>,
         /// Path for stdout log file [default: ~/.memex/index-service.log] (macOS only)
         #[arg(long)]
         stdout: Option<PathBuf>,
@@ -489,9 +512,15 @@ pub fn run() -> Result<()> {
             index,
             watch,
             watch_interval,
+            web_ui,
+            web_listen,
         } => {
             if watch {
-                run_index_loop(&index, watch_interval)?;
+                let listen = (web_ui || web_listen.is_some())
+                    .then(|| web_listen.unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string()));
+                run_index_loop(&index, watch_interval, listen)?;
+            } else if web_ui || web_listen.is_some() {
+                return Err(anyhow!("--web-ui requires --watch"));
             } else {
                 run_index_args(&index, false)?;
             }
@@ -556,6 +585,9 @@ pub fn run() -> Result<()> {
             check_for_update_async(Some(update_tx));
             tui::run(root, Some(update_rx))?;
         }
+        Commands::Web { listen, root } => {
+            crate::web::serve(root, &listen)?;
+        }
         Commands::IndexService { action } => match action {
             IndexServiceCommand::Enable {
                 index,
@@ -563,6 +595,8 @@ pub fn run() -> Result<()> {
                 continuous,
                 poll_interval,
                 interval,
+                web_ui,
+                web_listen,
                 stdout,
                 stderr,
                 plist,
@@ -574,6 +608,8 @@ pub fn run() -> Result<()> {
                     continuous,
                     poll_interval,
                     interval,
+                    web_ui,
+                    web_listen,
                     stdout,
                     stderr,
                     plist,
@@ -665,11 +701,16 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn run_index_loop(index: &IndexArgs, interval_secs: u64) -> Result<()> {
+fn run_index_loop(index: &IndexArgs, interval_secs: u64, web_listen: Option<String>) -> Result<()> {
+    run_index_args(index, false)?;
+    let _web_thread = web_listen
+        .as_deref()
+        .map(|listen| crate::web::spawn(index.root.clone(), listen))
+        .transpose()?;
     loop {
+        std::thread::sleep(Duration::from_secs(interval_secs));
         run_index_args(index, false)?;
         std::io::stdout().flush().ok();
-        std::thread::sleep(Duration::from_secs(interval_secs));
     }
 }
 
@@ -2330,6 +2371,8 @@ fn run_index_service_enable(
     continuous: bool,
     poll_interval: Option<u64>,
     interval: Option<u64>,
+    web_ui: bool,
+    web_listen: Option<String>,
     stdout: Option<PathBuf>,
     stderr: Option<PathBuf>,
     plist: Option<PathBuf>,
@@ -2348,7 +2391,12 @@ fn run_index_service_enable(
 
     let paths = Paths::new(index.root.clone())?;
     let config = UserConfig::load(&paths)?;
-    let cli_continuous = continuous || poll_interval.is_some();
+    let cli_web_ui = web_ui || web_listen.is_some();
+    let web_ui = cli_web_ui || config.index_service_web_ui_default();
+    let web_listen = web_listen
+        .or_else(|| config.index_service_web_listen.clone())
+        .unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string());
+    let cli_continuous = continuous || poll_interval.is_some() || cli_web_ui;
     let config_continuous = match config.index_service_mode() {
         Some("interval") => false,
         Some("continuous") => true,
@@ -2359,7 +2407,7 @@ fn run_index_service_enable(
         }
         None => config.index_service_continuous_default(),
     };
-    let continuous = if cli_continuous {
+    let continuous = if cli_continuous || web_ui {
         true
     } else if interval.is_some() {
         false
@@ -2370,7 +2418,8 @@ fn run_index_service_enable(
     let interval = interval.unwrap_or(config.index_service_interval());
 
     let exe = std::env::current_exe()?;
-    let program_args = build_index_command_args(index, continuous, poll_interval);
+    let program_args =
+        build_index_command_args(index, continuous, poll_interval, web_ui, &web_listen);
 
     std::fs::create_dir_all(&paths.root)?;
 
@@ -2406,6 +2455,9 @@ fn run_index_service_enable(
 
     result?;
     disable_auto_index_on_search_by_default(&paths, &config)?;
+    if web_ui {
+        println!("web UI: http://{web_listen}");
+    }
     Ok(())
 }
 
@@ -2822,6 +2874,8 @@ fn build_index_command_args(
     index: &IndexArgs,
     continuous: bool,
     poll_interval: u64,
+    web_ui: bool,
+    web_listen: &str,
 ) -> Vec<String> {
     let mut args = Vec::new();
     args.push("index".to_string());
@@ -2867,6 +2921,11 @@ fn build_index_command_args(
         args.push("--watch".to_string());
         args.push("--watch-interval".to_string());
         args.push(format!("{poll_interval}"));
+    }
+    if web_ui {
+        args.push("--web-ui".to_string());
+        args.push("--web-listen".to_string());
+        args.push(web_listen.to_string());
     }
     if let Some(model) = &index.model {
         args.push("--model".to_string());
@@ -3613,7 +3672,7 @@ mod tests {
             diagnostics: false,
         };
 
-        let args = build_index_command_args(&index, false, 30);
+        let args = build_index_command_args(&index, false, 30, false, crate::web::DEFAULT_LISTEN);
 
         assert!(args.contains(&"--no-codex".to_string()));
         assert!(args.contains(&"--no-opencode".to_string()));
@@ -3621,6 +3680,64 @@ mod tests {
         assert!(args.contains(&"--no-pi".to_string()));
         assert!(args.contains(&"--no-openclaw".to_string()));
         assert!(args.contains(&"--no-copilot".to_string()));
+    }
+
+    #[test]
+    fn build_index_command_args_includes_web_ui_options() {
+        let index = IndexArgs {
+            source: None,
+            include_agents: false,
+            include_reasoning: false,
+            codex: true,
+            opencode: true,
+            cursor: true,
+            pi: true,
+            openclaw: true,
+            copilot: true,
+            no_codex: false,
+            no_opencode: false,
+            no_pi: false,
+            no_openclaw: false,
+            no_copilot: false,
+            embeddings: false,
+            no_embeddings: false,
+            model: None,
+            root: None,
+            diagnostics: false,
+        };
+
+        let args = build_index_command_args(&index, true, 30, true, "127.0.0.1:6363");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--web-listen", "127.0.0.1:6363"])
+        );
+        assert!(args.contains(&"--web-ui".to_string()));
+        assert!(args.contains(&"--watch".to_string()));
+    }
+
+    #[test]
+    fn service_web_listen_flag_is_accepted() {
+        let cli = Cli::try_parse_from([
+            "memex",
+            "index-service",
+            "enable",
+            "--web-listen",
+            "127.0.0.1:6363",
+        ])
+        .unwrap();
+
+        let Some(Commands::IndexService {
+            action:
+                IndexServiceCommand::Enable {
+                    web_ui, web_listen, ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected index service enable command");
+        };
+        assert!(!web_ui);
+        assert_eq!(web_listen.as_deref(), Some("127.0.0.1:6363"));
     }
 
     #[test]

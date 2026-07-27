@@ -32,6 +32,18 @@ in {
       default = 30;
       description = "Polling interval in seconds (if continuous).";
     };
+
+    webUI = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Serve the local Web UI and run in continuous mode.";
+    };
+
+    webListen = lib.mkOption {
+      type = lib.types.str;
+      default = "127.0.0.1:6363";
+      description = "Address and port for the local Web UI.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -41,19 +53,19 @@ in {
       path = [cfg.package];
       serviceConfig = {
         ExecStart =
-          if cfg.continuous
-          then "${cfg.package}/bin/memex index --watch --watch-interval ${toString cfg.watchInterval}"
+          if cfg.continuous || cfg.webUI
+          then "${cfg.package}/bin/memex index --watch --watch-interval ${toString cfg.watchInterval}${lib.optionalString cfg.webUI " --web-ui --web-listen ${lib.escapeShellArg cfg.webListen}"}"
           else "${cfg.package}/bin/memex index";
 
         Restart =
-          if cfg.continuous
+          if cfg.continuous || cfg.webUI
           then "always"
           else "no";
         RestartSec = 10;
       };
     };
 
-    systemd.user.timers.memex-index = lib.mkIf (!cfg.continuous) {
+    systemd.user.timers.memex-index = lib.mkIf (!cfg.continuous && !cfg.webUI) {
       description = "Memex Index Timer";
       wantedBy = ["timers.target"];
       timerConfig = {
