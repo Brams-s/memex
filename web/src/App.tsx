@@ -145,6 +145,96 @@ function getPreferredTheme() {
 }
 
 type XmlField = { label: string; value: string; path: string }
+type ToolPayload = Record<string, unknown>
+
+const rustDebugString = /\bString\(("(?:\\.|[^"\\])*")\)/g
+const rustDebugStaticBoolean = /\bStatic\(Bool\((true|false)\)\)/g
+const rustDebugStaticNull = /\bStatic\(Null\)/g
+const rustDebugStaticNumber =
+  /\bStatic\((?:I64|U64|F64)\((-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)\)\)/g
+const rustDebugBoolean = /\bBool\((true|false)\)/g
+const rustDebugNumber =
+  /\bNumber\((-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)\)/g
+
+function parseToolPayload(content: string): ToolPayload | null {
+  const source = content.trim()
+  if (!source.startsWith("{") || !source.endsWith("}")) return null
+
+  for (const candidate of [
+    source,
+    source
+      .replace(rustDebugString, "$1")
+      .replace(rustDebugStaticBoolean, "$1")
+      .replace(rustDebugStaticNull, "null")
+      .replace(rustDebugStaticNumber, "$1")
+      .replace(rustDebugBoolean, "$1")
+      .replace(rustDebugNumber, "$1"),
+  ]) {
+    try {
+      const value = JSON.parse(candidate) as unknown
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        return value as ToolPayload
+      }
+    } catch {
+      // Try the normalized representation before falling back to raw text.
+    }
+  }
+
+  return null
+}
+
+function formatToolLabel(value: string) {
+  return value.replace(/[-_]+/g, " ")
+}
+
+function ToolValue({ name, value }: { name: string; value: unknown }) {
+  const serialized = JSON.stringify(value, null, 2)
+  const text =
+    typeof value === "string"
+      ? value
+      : typeof value === "undefined"
+        ? "undefined"
+        : serialized ?? String(value)
+  const blockValue =
+    typeof value === "object" ||
+    text.includes("\n") ||
+    /^(command|code|content|patch|prompt|query|script|sql)$/i.test(name)
+
+  return blockValue ? (
+    <pre className="tool-value">{text}</pre>
+  ) : (
+    <code className="tool-value-inline">{text}</code>
+  )
+}
+
+function ToolCallContent({ content }: { content: string }) {
+  const payload = useMemo(() => parseToolPayload(content), [content])
+  if (!payload) return <pre className="tool-content">{content}</pre>
+
+  const description =
+    typeof payload.description === "string" ? payload.description : null
+  const fields = Object.entries(payload).filter(
+    ([name]) => name !== "description",
+  )
+
+  return (
+    <div className="tool-call">
+      {description && <p className="tool-call-description">{description}</p>}
+      {fields.length > 0 && (
+        <dl className="tool-fields">
+          {fields.map(([name, value]) => (
+            <div className="tool-field" key={name}>
+              <dt>{formatToolLabel(name)}</dt>
+              <dd>
+                <ToolValue name={name} value={value} />
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
+  )
+}
 
 function parseXml(content: string): { title: string; fields: XmlField[] } | null {
   const source = content.trim()
@@ -209,9 +299,11 @@ function XmlMessage({ content }: { content: string }) {
 }
 
 function MessageContent({ message }: { message: Message }) {
-  if (["tool_use", "tool_result"].includes(message.role)) {
+  if (message.role === "tool_use")
+    return <ToolCallContent content={message.content} />
+
+  if (message.role === "tool_result")
     return <pre className="tool-content">{message.content}</pre>
-  }
 
   if (parseXml(message.content)) return <XmlMessage content={message.content} />
 
