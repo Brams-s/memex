@@ -1,5 +1,6 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -148,6 +149,8 @@ impl SourceFilter {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RecordLinks {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_event_id: Option<String>,
@@ -171,6 +174,9 @@ pub struct RecordLinks {
 pub struct Record {
     #[serde(default)]
     pub source: SourceKind,
+    /// Stable source-derived identity. Unlike `doc_id`, this survives a full index rebuild.
+    #[serde(default)]
+    pub record_key: String,
     pub doc_id: u64,
     pub ts: u64,
     pub project: String,
@@ -189,9 +195,85 @@ pub struct Record {
     pub source_path: String,
 }
 
+impl Record {
+    pub fn ensure_record_key(&mut self) {
+        if self.record_key.is_empty() {
+            self.record_key = self.computed_record_key();
+        }
+    }
+
+    pub fn computed_record_key(&self) -> String {
+        let mut hasher = Sha256::new();
+        hash_identity_part(&mut hasher, "version", "1");
+        hash_identity_part(&mut hasher, "source", self.source.storage_label());
+        hash_identity_part(
+            &mut hasher,
+            "session",
+            if self.session_id.is_empty() {
+                &self.source_path
+            } else {
+                &self.session_id
+            },
+        );
+
+        let native_id = self
+            .links
+            .event_id
+            .as_deref()
+            .or(self.links.source_tool_use_id.as_deref())
+            .or(self.links.source_tool_assistant_uuid.as_deref())
+            .or(self.links.parent_tool_use_id.as_deref());
+        if let Some(native_id) = native_id {
+            hash_identity_part(&mut hasher, "native", native_id);
+        } else {
+            hash_identity_part(&mut hasher, "path", &self.source_path);
+            hash_identity_part(&mut hasher, "turn", &self.turn_id.to_string());
+        }
+
+        hash_identity_part(&mut hasher, "role", &self.role);
+        hash_identity_part(
+            &mut hasher,
+            "subtype",
+            self.tool_name.as_deref().unwrap_or(""),
+        );
+        hash_identity_part(
+            &mut hasher,
+            "source_tool_use_id",
+            self.links.source_tool_use_id.as_deref().unwrap_or(""),
+        );
+        hash_identity_part(
+            &mut hasher,
+            "parent_tool_use_id",
+            self.links.parent_tool_use_id.as_deref().unwrap_or(""),
+        );
+
+        // This final deterministic suffix distinguishes repeated blocks emitted from one
+        // source-native event and deliberately collapses exact duplicate projections.
+        hash_identity_part(&mut hasher, "text", &self.text);
+        hash_identity_part(
+            &mut hasher,
+            "tool_input",
+            self.tool_input.as_deref().unwrap_or(""),
+        );
+        hash_identity_part(
+            &mut hasher,
+            "tool_output",
+            self.tool_output.as_deref().unwrap_or(""),
+        );
+        format!("rk1_{:x}", hasher.finalize())
+    }
+}
+
+fn hash_identity_part(hasher: &mut Sha256, label: &str, value: &str) {
+    hasher.update((label.len() as u64).to_le_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SourceFilter, SourceKind};
+    use super::{Record, RecordLinks, SourceFilter, SourceKind};
     use clap::ValueEnum;
     use std::collections::HashSet;
 
@@ -213,6 +295,46 @@ mod tests {
             assert_eq!(SourceKind::from_label(label), Some(SourceKind::Codex));
         }
         assert_eq!(SourceKind::Codex.storage_label(), "codex");
+    }
+
+    fn record(doc_id: u64, source_path: &str) -> Record {
+        Record {
+            source: SourceKind::Codex,
+            record_key: String::new(),
+            doc_id,
+            ts: 1,
+            project: "memex".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: 2,
+            role: "assistant".to_string(),
+            text: "same projected content".to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            links: RecordLinks {
+                event_id: Some("event-1".to_string()),
+                ..RecordLinks::default()
+            },
+            source_path: source_path.to_string(),
+        }
+    }
+
+    #[test]
+    fn record_key_survives_doc_id_and_source_path_changes_with_native_identity() {
+        let first = record(1, "/old/session.jsonl");
+        let rebuilt = record(999, "/moved/session.jsonl");
+
+        assert_eq!(first.computed_record_key(), rebuilt.computed_record_key());
+        assert!(first.computed_record_key().starts_with("rk1_"));
+    }
+
+    #[test]
+    fn record_key_distinguishes_changed_projection_content() {
+        let first = record(1, "/session.jsonl");
+        let mut changed = first.clone();
+        changed.text = "different projected content".to_string();
+
+        assert_ne!(first.computed_record_key(), changed.computed_record_key());
     }
 
     #[test]

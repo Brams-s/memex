@@ -208,6 +208,46 @@ fn read_meta_until(path: &Path, limit: u64) -> Result<SessionMeta> {
     Ok(metadata)
 }
 
+fn read_interaction_until(path: &Path, limit: u64) -> Result<Option<String>> {
+    if limit == 0 {
+        return Ok(None);
+    }
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let limit = (limit as usize).min(mmap.len());
+    let mut start = 0usize;
+    let mut buffer = Vec::new();
+    let mut interaction_id = None;
+    while start < limit {
+        let slice = &mmap[start..limit];
+        let relative = memchr(b'\n', slice).unwrap_or(slice.len());
+        let line = &slice[..relative];
+        start += relative + 1;
+        if line.is_empty() {
+            continue;
+        }
+        buffer.clear();
+        buffer.extend_from_slice(line);
+        let Ok(value) = simd_json::to_borrowed_value(&mut buffer) else {
+            continue;
+        };
+        if value.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        match payload.get("type").and_then(|value| value.as_str()) {
+            Some("task_started") => {
+                interaction_id = borrowed_string(payload, &["turn_id", "turnId"]);
+            }
+            Some("task_complete") => interaction_id = None,
+            _ => {}
+        }
+    }
+    Ok(interaction_id)
+}
+
 pub fn probe(path: &Path) -> Result<SourceMetadata> {
     let limit = path.metadata()?.len();
     let metadata = read_meta_until(path, limit)?;
@@ -244,6 +284,7 @@ pub(crate) fn parse_index_records(
     let mut pending_tool_calls = state.pending_tool_calls;
     let source_path = path.to_string_lossy().to_string();
     let mut metadata = read_meta_until(path, state.offset)?;
+    let mut interaction_id = read_interaction_until(path, state.offset)?;
     let mut buffer = Vec::new();
     let mut diagnostics = ParseDiagnostics::default();
 
@@ -290,7 +331,19 @@ pub(crate) fn parse_index_records(
             let Some(payload) = object.get("payload").and_then(|value| value.as_object()) else {
                 continue;
             };
-            if payload.get("type").and_then(|value| value.as_str()) == Some("agent_reasoning")
+            let event_type = payload.get("type").and_then(|value| value.as_str());
+            if event_type == Some("task_started") {
+                interaction_id = borrowed_string(
+                    object.get("payload").expect("payload exists"),
+                    &["turn_id", "turnId"],
+                );
+                continue;
+            }
+            if event_type == Some("task_complete") {
+                interaction_id = None;
+                continue;
+            }
+            if event_type == Some("agent_reasoning")
                 && include_reasoning
                 && let Some(text) = payload
                     .get("text")
@@ -299,9 +352,11 @@ pub(crate) fn parse_index_records(
                     .filter(|text| !text.is_empty())
             {
                 let mut links = metadata.links.record_links();
+                links.interaction_id = interaction_id.clone();
                 links.event_id = super::common::borrowed_string(payload, "id");
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -333,6 +388,7 @@ pub(crate) fn parse_index_records(
             .and_then(|value| value.as_str())
             .unwrap_or("");
         let mut links = metadata.links.record_links();
+        links.interaction_id = interaction_id.clone();
         links.event_id = super::common::borrowed_string(payload, "id");
         match payload_type {
             "message" => {
@@ -362,6 +418,7 @@ pub(crate) fn parse_index_records(
                 }
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -413,6 +470,7 @@ pub(crate) fn parse_index_records(
                 }
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id,
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -451,6 +509,7 @@ pub(crate) fn parse_index_records(
                 }
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -499,6 +558,7 @@ pub(crate) fn parse_index_records(
                 }
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id,
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -555,6 +615,7 @@ pub(crate) fn parse_index_records(
                 }
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id,
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -599,6 +660,7 @@ pub(crate) fn parse_index_records(
                 }
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -705,6 +767,7 @@ pub(crate) fn parse_history_records(
             * 1000;
         emit(Record {
             source: SourceKind::Codex,
+            record_key: String::new(),
             doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
             ts: timestamp,
             project: SourceKind::Codex.label().to_string(),
@@ -1499,5 +1562,40 @@ mod tests {
                 .iter()
                 .any(|record| { record.text.contains("ciphertext-must-never-be-indexed") })
         );
+    }
+
+    #[test]
+    fn source_turn_id_groups_sibling_messages_and_tool_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codex.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\",\"cwd\":\"/repo\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"progress\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"Read\",\"call_id\":\"call-1\",\"arguments\":\"{}\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"next\"}}\n",
+            ),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].links.interaction_id.as_deref(), Some("turn-1"));
+        assert_eq!(records[1].links.interaction_id.as_deref(), Some("turn-1"));
+        assert_eq!(records[2].links.interaction_id, None);
     }
 }

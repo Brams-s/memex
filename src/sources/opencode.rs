@@ -240,6 +240,7 @@ pub(crate) fn parse_index_records(
         record_links.event_id = Some(message_id);
         emit(Record {
             source: SourceKind::Opencode,
+            record_key: String::new(),
             doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
             ts: timestamp,
             project: project.clone(),

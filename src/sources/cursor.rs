@@ -194,6 +194,7 @@ pub(crate) fn parse_index_records(
                             }
                             emit(Record {
                                 source: SourceKind::Cursor,
+                                record_key: String::new(),
                                 doc_id,
                                 ts: timestamp,
                                 project: project.clone(),
@@ -237,6 +238,7 @@ pub(crate) fn parse_index_records(
                             }
                             emit(Record {
                                 source: SourceKind::Cursor,
+                                record_key: String::new(),
                                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                                 ts: timestamp,
                                 project: project.clone(),
@@ -261,6 +263,7 @@ pub(crate) fn parse_index_records(
         if !text.is_empty() {
             emit(Record {
                 source: SourceKind::Cursor,
+                record_key: String::new(),
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
                 project: project.clone(),

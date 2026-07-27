@@ -219,7 +219,7 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                 until_ms: None,
                 cost_mode: CostMode::Source,
                 include_events: false,
-                cache_path: Some(paths.state.join("usage-cache.sqlite3")),
+                cache_path: Some(analytics_path(&paths.state)),
                 memo_ttl_ms: 60_000,
             };
             let (points, partial) = scan_usage_activity(&query)?;
@@ -594,11 +594,22 @@ struct SessionPayload {
 
 #[derive(Serialize)]
 struct MessagePayload {
+    record_key: String,
     role: String,
     content: String,
     ts: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interaction_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tool_use_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_tool_use_id: Option<String>,
 }
 
 fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<SessionPayload>> {
@@ -620,10 +631,16 @@ fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<Sess
     let messages = records
         .into_iter()
         .map(|record| MessagePayload {
+            record_key: record.record_key,
             role: record.role,
             content: record.text,
             ts: record.ts,
             tool_name: record.tool_name,
+            interaction_id: record.links.interaction_id,
+            event_id: record.links.event_id,
+            parent_event_id: record.links.parent_event_id,
+            parent_tool_use_id: record.links.parent_tool_use_id,
+            source_tool_use_id: record.links.source_tool_use_id,
         })
         .collect();
 
@@ -789,32 +806,38 @@ mod tests {
         paths.ensure_dirs().unwrap();
         let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
         let mut writer = index.writer().unwrap();
+        let mut catalog =
+            crate::analytics::AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
         for (doc_id, session_id, text) in [
             (1, "session-a", "alpha one"),
             (2, "session-a", "alpha two"),
             (3, "session-b", "alpha three"),
         ] {
-            index
-                .add_record(
-                    &mut writer,
-                    &Record {
-                        source: SourceKind::Claude,
-                        doc_id,
-                        ts: doc_id * 1_000,
-                        project: "memex".to_string(),
-                        session_id: session_id.to_string(),
-                        turn_id: doc_id as u32,
-                        role: "assistant".to_string(),
-                        text: text.to_string(),
-                        tool_name: None,
-                        tool_input: None,
-                        tool_output: None,
-                        links: RecordLinks::default(),
-                        source_path: "/tmp/session.jsonl".to_string(),
-                    },
-                )
-                .unwrap();
+            let mut record = Record {
+                source: SourceKind::Claude,
+                record_key: String::new(),
+                doc_id,
+                ts: doc_id * 1_000,
+                project: "memex".to_string(),
+                session_id: session_id.to_string(),
+                turn_id: doc_id as u32,
+                role: "assistant".to_string(),
+                text: text.to_string(),
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                links: RecordLinks::default(),
+                source_path: format!("/tmp/{session_id}.jsonl"),
+            };
+            if doc_id == 1 {
+                record.links.interaction_id = Some("request-1".to_string());
+                record.links.event_id = Some("event-1".to_string());
+            }
+            record.ensure_record_key();
+            catalog.record(&record).unwrap();
+            index.add_record(&mut writer, &record).unwrap();
         }
+        catalog.flush().unwrap();
         writer.commit().unwrap();
 
         let payload = search_payload(
@@ -860,6 +883,26 @@ mod tests {
         assert_eq!(second_search_page.offset, 1);
         assert_eq!(second_search_page.results.len(), 1);
         assert!(!second_search_page.has_more);
+
+        let first_session_page = session_payload(
+            &paths,
+            &SessionRequest {
+                session_id: "session-a".to_string(),
+                offset: 0,
+                limit: 1,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!first_session_page.messages[0].record_key.is_empty());
+        assert_eq!(
+            first_session_page.messages[0].interaction_id.as_deref(),
+            Some("request-1")
+        );
+        assert_eq!(
+            first_session_page.messages[0].event_id.as_deref(),
+            Some("event-1")
+        );
 
         let page = session_payload(
             &paths,

@@ -79,10 +79,16 @@ type SearchPayload = {
 }
 
 type Message = {
+  record_key: string
   role: string
   content: string
   ts: number
   tool_name?: string | null
+  interaction_id?: string | null
+  event_id?: string | null
+  parent_event_id?: string | null
+  parent_tool_use_id?: string | null
+  source_tool_use_id?: string | null
   provisional?: boolean
 }
 
@@ -681,6 +687,7 @@ function App() {
           total: 1,
           messages: [
             {
+              record_key: `provisional:${id}`,
               role: summary.role,
               content: summary.snippet || "Loading transcript…",
               ts: summary.ts,
@@ -1174,18 +1181,35 @@ function App() {
             <div className="empty">No visible messages in this preview.</div>
           ) : (
             <>
-              {preview.rows.map(({ message, index, context }) => (
-                <article
-                  className={cn("message", context && "context")}
-                  key={`${message.ts}-${index}`}
-                >
-                  <div className="message-meta">
-                    <span>{message.tool_name || message.role || "event"}</span>
-                    <time>{formatDate(message.ts)}</time>
+              {preview.rows.map(({ message, index, context }, rowIndex) => {
+                const previous = preview.rows[rowIndex - 1]?.message
+                const startsInteraction =
+                  message.interaction_id &&
+                  message.interaction_id !== previous?.interaction_id
+
+                return (
+                  <div className="message-row" key={message.record_key || `${message.ts}-${index}`}>
+                    {startsInteraction && (
+                      <div
+                        className="interaction-divider"
+                        title={message.interaction_id ?? undefined}
+                      >
+                        <span>Interaction</span>
+                      </div>
+                    )}
+                    <article
+                      className={cn("message", context && "context")}
+                      data-interaction-id={message.interaction_id || undefined}
+                    >
+                      <div className="message-meta">
+                        <span>{message.tool_name || message.role || "event"}</span>
+                        <time>{formatDate(message.ts)}</time>
+                      </div>
+                      <MessageContent message={message} />
+                    </article>
                   </div>
-                  <MessageContent message={message} />
-                </article>
-              ))}
+                )
+              })}
               {preview.remaining > 0 && (
                 <Button
                   className="load-more shadow-none"

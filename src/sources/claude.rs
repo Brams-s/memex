@@ -311,6 +311,8 @@ pub(crate) fn parse_index_records(
             _ => None,
         };
         let entry_links = RecordLinks {
+            interaction_id: super::common::borrowed_string(object, "requestId")
+                .or_else(|| super::common::borrowed_string(object, "request_id")),
             event_id: entry_uuid.clone(),
             parent_event_id: entry_parent_uuid,
             logical_parent_event_id: super::common::borrowed_string(object, "logicalParentUuid"),
@@ -394,6 +396,7 @@ pub(crate) fn parse_index_records(
                             }
                             emit(Record {
                                 source: SourceKind::Claude,
+                                record_key: String::new(),
                                 doc_id,
                                 ts: timestamp,
                                 project: project.clone(),
@@ -423,6 +426,7 @@ pub(crate) fn parse_index_records(
                                         .map(|uuid| format!("{uuid}:reasoning:{content_index}"));
                                     emit(Record {
                                         source: SourceKind::Claude,
+                                        record_key: String::new(),
                                         doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                                         ts: timestamp,
                                         project: project.clone(),
@@ -494,6 +498,7 @@ pub(crate) fn parse_index_records(
                 }
                 emit(Record {
                     source: SourceKind::Claude,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -515,6 +520,7 @@ pub(crate) fn parse_index_records(
         if !text.is_empty() {
             emit(Record {
                 source: SourceKind::Claude,
+                record_key: String::new(),
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
                 project: project.clone(),

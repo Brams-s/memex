@@ -317,6 +317,7 @@ pub(crate) fn parse_index_records_for(
             }
             let record = Record {
                 source,
+                record_key: String::new(),
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
                 project: project.clone(),
@@ -348,6 +349,7 @@ pub(crate) fn parse_index_records_for(
             };
             let record = Record {
                 source,
+                record_key: String::new(),
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
                 project: project.clone(),
@@ -428,6 +430,7 @@ pub(crate) fn parse_index_records_for(
                                         .map(|id| format!("{id}:reasoning"));
                                     emit(Record {
                                         source,
+                                        record_key: String::new(),
                                         doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                                         ts: timestamp,
                                         project: project.clone(),
@@ -495,6 +498,7 @@ pub(crate) fn parse_index_records_for(
                         }
                         let record = Record {
                             source,
+                            record_key: String::new(),
                             doc_id,
                             ts: timestamp,
                             project: project.clone(),
@@ -519,6 +523,7 @@ pub(crate) fn parse_index_records_for(
                 }
                 let record = Record {
                     source,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -573,6 +578,7 @@ pub(crate) fn parse_index_records_for(
                 }
                 let record = Record {
                     source,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -614,6 +620,7 @@ pub(crate) fn parse_index_records_for(
                 }
                 let record = Record {
                     source,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -645,6 +652,7 @@ pub(crate) fn parse_index_records_for(
                 }
                 let record = Record {
                     source,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),

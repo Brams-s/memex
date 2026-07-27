@@ -163,6 +163,7 @@ pub(crate) fn parse_index_records(
                 let links = copilot_record_links(obj, data, &session_id, turn_id);
                 let record = Record {
                     source: SourceKind::Copilot,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -190,6 +191,7 @@ pub(crate) fn parse_index_records(
                 let links = copilot_record_links(obj, data, &session_id, turn_id);
                 let record = Record {
                     source: SourceKind::Copilot,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -242,6 +244,7 @@ pub(crate) fn parse_index_records(
                 }
                 let record = Record {
                     source: SourceKind::Copilot,
+                    record_key: String::new(),
                     doc_id,
                     ts: timestamp,
                     project: project.clone(),
@@ -289,6 +292,7 @@ pub(crate) fn parse_index_records(
                 }
                 let record = Record {
                     source: SourceKind::Copilot,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -316,6 +320,7 @@ pub(crate) fn parse_index_records(
                 let links = copilot_record_links(obj, data, &session_id, turn_id);
                 let record = Record {
                     source: SourceKind::Copilot,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
