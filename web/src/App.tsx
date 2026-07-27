@@ -733,7 +733,7 @@ function App() {
       className="memex-shell"
       style={{ "--sidebar-width": "19rem" } as CSSProperties}
     >
-      <Sidebar collapsible="offcanvas" variant="inset">
+      <Sidebar collapsible="offcanvas">
         <SidebarHeader className="memex-sidebar-header">
           <div className="brand-row">
             <span className="brand-name">memex</span>
@@ -803,7 +803,7 @@ function App() {
         </SidebarContent>
       </Sidebar>
 
-      <SidebarInset className="min-h-0 min-w-0 gap-2 overflow-hidden bg-transparent shadow-none">
+      <SidebarInset className="min-h-0 min-w-0 gap-2 overflow-hidden bg-transparent p-2 shadow-none">
         <Tabs
           className="transcript-tabs"
           onValueChange={(value) => setMode(value as PreviewMode)}
@@ -882,12 +882,11 @@ function App() {
             <ToggleGroup
               aria-label="Transcript visibility"
               className="view-toggles"
+              multiple
               onValueChange={(values) => {
                 setShowThinking(values.includes("reasoning"))
                 setShowDetails(values.includes("tools"))
               }}
-              spacing={0}
-              type="multiple"
               value={[
                 ...(showThinking ? ["reasoning"] : []),
                 ...(showDetails ? ["tools"] : []),
