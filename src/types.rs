@@ -148,6 +148,16 @@ impl SourceFilter {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RecordLinks {
+    /// Stable order of the source message within its session. Every record emitted from the
+    /// same source message carries the same value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_ordinal: Option<u32>,
+    /// Zero-based order of this tool call within its owning message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_index: Option<u32>,
+    /// Zero-based order of this result update within its owning tool call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_index: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interaction_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,6 +178,30 @@ pub struct RecordLinks {
     pub source_tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_tool_assistant_uuid: Option<String>,
+    /// Normalized source-provided lifecycle status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Original status spelling when the source provides one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

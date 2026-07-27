@@ -661,6 +661,7 @@ fn record_from_doc(
             parent_tool_use_id: get_str(fields.parent_tool_use_id),
             source_tool_use_id: get_str(fields.source_tool_use_id),
             source_tool_assistant_uuid: get_str(fields.source_tool_assistant_uuid),
+            ..RecordLinks::default()
         },
         source_path,
     };

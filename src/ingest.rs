@@ -4,7 +4,9 @@ use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
 use crate::lease::IngestLease;
 use crate::progress::{Progress, SOURCE_COUNT};
-use crate::state::{FileIdentity, FileState, IngestState, PendingToolCall, ScanCache};
+use crate::state::{
+    FileIdentity, FileState, IngestState, ParserStreamState, PendingToolCall, ScanCache,
+};
 #[cfg(test)]
 use crate::types::RecordLinks;
 use crate::types::{Record, SourceKind};
@@ -62,6 +64,7 @@ struct FileTask {
     delete_first: bool,
     parser_version_invalidated: bool,
     pending_tool_calls: HashMap<String, PendingToolCall>,
+    parser_stream: ParserStreamState,
     identity: FileIdentity,
     parser_version: u32,
     projection_epoch: u64,
@@ -155,9 +158,23 @@ fn prepare_file_task(
     let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
     let parser_version_invalidated =
         previous.is_some_and(|previous| previous.parser_version != parser_version);
-    let (offset, turn_id, delete_first, pending_tool_calls, skip) = match previous {
-        None => (0, 0, false, HashMap::new(), false),
-        Some(_) if force_replay => (0, 0, true, HashMap::new(), false),
+    let (offset, turn_id, delete_first, pending_tool_calls, parser_stream, skip) = match previous {
+        None => (
+            0,
+            0,
+            false,
+            HashMap::new(),
+            ParserStreamState::default(),
+            false,
+        ),
+        Some(_) if force_replay => (
+            0,
+            0,
+            true,
+            HashMap::new(),
+            ParserStreamState::default(),
+            false,
+        ),
         Some(previous)
             if size < previous.size
                 || mtime < previous.mtime
@@ -171,13 +188,21 @@ fn prepare_file_task(
                         .is_some_and(|(old, new)| old != new))
                 || (size == previous.size && mtime != previous.mtime) =>
         {
-            (0, 0, true, HashMap::new(), false)
+            (
+                0,
+                0,
+                true,
+                HashMap::new(),
+                ParserStreamState::default(),
+                false,
+            )
         }
         Some(previous) if size == previous.size && mtime == previous.mtime => (
             previous.offset,
             previous.turn_id,
             false,
             previous.pending_tool_calls.clone(),
+            previous.parser_stream.clone(),
             true,
         ),
         Some(previous) => (
@@ -185,6 +210,7 @@ fn prepare_file_task(
             previous.turn_id,
             false,
             previous.pending_tool_calls.clone(),
+            previous.parser_stream.clone(),
             false,
         ),
     };
@@ -200,6 +226,7 @@ fn prepare_file_task(
             delete_first,
             parser_version_invalidated,
             pending_tool_calls,
+            parser_stream,
             identity,
             parser_version,
             projection_epoch: 0,
@@ -254,6 +281,7 @@ fn completed_file_state(
     offset: u64,
     turn_id: u32,
     pending_tool_calls: HashMap<String, PendingToolCall>,
+    parser_stream: ParserStreamState,
 ) -> FileState {
     FileState {
         size: task.size,
@@ -262,6 +290,7 @@ fn completed_file_state(
         turn_id,
         parser_version: task.parser_version,
         pending_tool_calls,
+        parser_stream,
         identity: task.identity.clone(),
     }
 }
@@ -1102,6 +1131,7 @@ fn parse_claude_file(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         include_reasoning,
         next_doc_id,
@@ -1135,6 +1165,7 @@ fn parse_codex_session(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         include_reasoning,
         next_doc_id,
@@ -1168,6 +1199,7 @@ fn parse_codex_history(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         session_ids,
         next_doc_id,
@@ -1201,6 +1233,7 @@ fn finish_source_parse(
         parsed.offset,
         parsed.turn_id,
         parsed.pending_tool_calls,
+        parsed.parser_stream,
     );
     tx_update.send(FileUpdate {
         path: source_path,
@@ -1225,6 +1258,7 @@ fn parse_opencode_file(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         opencode_session_links,
         next_doc_id,
@@ -1258,6 +1292,7 @@ fn parse_cursor_file(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         next_doc_id,
         |record| {
@@ -1289,6 +1324,7 @@ fn parse_pi_file(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         include_reasoning,
         next_doc_id,
@@ -1321,6 +1357,7 @@ fn parse_openclaw_file(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         include_reasoning,
         next_doc_id,
@@ -1352,6 +1389,7 @@ fn parse_copilot_session(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         next_doc_id,
         |record| {
@@ -1584,6 +1622,7 @@ mod tests {
             delete_first: false,
             parser_version_invalidated: false,
             pending_tool_calls,
+            parser_stream: ParserStreamState::default(),
             identity: file_identity(
                 path,
                 &metadata,
@@ -2008,7 +2047,12 @@ mod tests {
         .expect("parse calls");
         let first_records: Vec<_> = rx_record.try_iter().collect();
         let first_state = rx_update.try_recv().expect("first state").state;
-        assert_eq!(first_records.len(), 2);
+        assert_eq!(first_records.len(), 3);
+        assert_eq!(first_records[2].role, "assistant");
+        assert!(first_records[2].text.is_empty());
+        assert!(first_records[..2].iter().all(|record| {
+            record.links.message_ordinal == first_records[2].links.message_ordinal
+        }));
         assert_eq!(first_state.pending_tool_calls.len(), 2);
         let pending_a = first_state
             .pending_tool_calls
@@ -2027,13 +2071,14 @@ mod tests {
             .expect("open append")
             .write_all(results.as_bytes())
             .expect("append results");
-        let second = incremental_task(
+        let mut second = incremental_task(
             &path,
             SourceKind::Claude,
             first_state.offset,
             first_state.turn_id,
             first_state.pending_tool_calls,
         );
+        second.parser_stream = first_state.parser_stream;
         parse_claude_file(
             &second,
             false,
@@ -2093,8 +2138,22 @@ mod tests {
             &progress,
         )
         .expect("parse call");
-        let call_record = rx_record.try_recv().expect("call record");
+        let first_records: Vec<_> = rx_record.try_iter().collect();
+        let call_record = first_records
+            .iter()
+            .find(|record| record.role == "tool_use")
+            .expect("call record");
         let first_state = rx_update.try_recv().expect("first state").state;
+        assert_eq!(first_records.len(), 2);
+        let owner = first_records
+            .iter()
+            .find(|record| record.role == "assistant")
+            .expect("assistant owner");
+        assert!(owner.text.is_empty());
+        assert_eq!(
+            call_record.links.message_ordinal,
+            owner.links.message_ordinal
+        );
         assert_eq!(call_record.tool_name.as_deref(), Some("shell"));
         assert_eq!(
             first_state
@@ -2111,13 +2170,14 @@ mod tests {
             .expect("open append")
             .write_all(result.as_bytes())
             .expect("append result");
-        let second = incremental_task(
+        let mut second = incremental_task(
             &path,
             SourceKind::Codex,
             first_state.offset,
             first_state.turn_id,
             first_state.pending_tool_calls,
         );
+        second.parser_stream = first_state.parser_stream;
         parse_codex_session(
             &second,
             false,
@@ -2175,6 +2235,7 @@ mod tests {
             metadata.len(),
             1,
             original.pending_tool_calls.clone(),
+            original.parser_stream.clone(),
         );
 
         fs::write(&path, "short\n").expect("truncate");
@@ -2237,8 +2298,13 @@ mod tests {
                 ..PendingToolCall::default()
             },
         );
-        let previous =
-            completed_file_state(&first, metadata.len(), 1, first.pending_tool_calls.clone());
+        let previous = completed_file_state(
+            &first,
+            metadata.len(),
+            1,
+            first.pending_tool_calls.clone(),
+            first.parser_stream.clone(),
+        );
 
         fs::OpenOptions::new()
             .append(true)
@@ -2298,6 +2364,7 @@ mod tests {
                     ..PendingToolCall::default()
                 },
             )]),
+            parser_stream: ParserStreamState::default(),
             identity,
         };
         let (task, skip) = prepare_file_task(
@@ -2371,6 +2438,7 @@ mod tests {
                     ..PendingToolCall::default()
                 },
             )]),
+            first.parser_stream.clone(),
         );
 
         let (replay, skip) = prepare_file_task(
@@ -2468,6 +2536,7 @@ mod tests {
                     turn_id: 1,
                     parser_version: crate::sources::index_state_version(SourceKind::Claude),
                     pending_tool_calls: HashMap::new(),
+                    parser_stream: ParserStreamState::default(),
                     identity: FileIdentity::default(),
                 },
             )]),
@@ -2534,8 +2603,8 @@ mod tests {
         fs::write(
             &session_file,
             r#"{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"sess-claude","isSidechain":false,"timestamp":"2026-03-11T01:23:43.844Z","message":{"content":"question"}}
-{"type":"assistant","uuid":"a1","parentUuid":"u1","logicalParentUuid":"u0","sessionId":"sess-claude","isSidechain":true,"sourceToolUseID":"source-tool","sourceToolAssistantUUID":"source-assistant","timestamp":"2026-03-11T01:23:44.844Z","message":{"content":[{"type":"text","text":"answer"},{"type":"tool_use","id":"tool-claude","name":"Read","input":{"file_path":"Cargo.toml"}}]}}
-{"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"sess-claude","isSidechain":true,"timestamp":"2026-03-11T01:23:45.844Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool-claude","content":"ok"}]}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","logicalParentUuid":"u0","sessionId":"sess-claude","isSidechain":true,"sourceToolUseID":"source-tool","sourceToolAssistantUUID":"source-assistant","timestamp":"2026-03-11T01:23:44.844Z","message":{"model":"claude-test","usage":{"input_tokens":100,"cache_read_input_tokens":40,"cache_creation_input_tokens":10,"output_tokens":20},"content":[{"type":"text","text":"answer"},{"type":"tool_use","id":"tool-claude","name":"Read","input":{"file_path":"Cargo.toml"}}]}}
+{"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"sess-claude","isSidechain":true,"timestamp":"2026-03-11T01:23:45.844Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool-claude","content":"ok","is_error":false}]}}
 "#,
         )
         .expect("write claude fixture");
@@ -2577,6 +2646,11 @@ mod tests {
         assert_eq!(records[1].links.event_id.as_deref(), Some("tool-claude"));
         assert_eq!(records[1].links.parent_event_id.as_deref(), Some("a1"));
         assert_eq!(
+            records[1].links.message_ordinal,
+            records[2].links.message_ordinal
+        );
+        assert_eq!(records[1].links.call_index, Some(0));
+        assert_eq!(
             records[1].links.logical_parent_event_id.as_deref(),
             Some("u0")
         );
@@ -2596,6 +2670,11 @@ mod tests {
         assert_eq!(records[2].role, "assistant");
         assert_eq!(records[2].links.event_id.as_deref(), Some("a1"));
         assert_eq!(records[2].links.parent_event_id.as_deref(), Some("u1"));
+        assert_eq!(records[2].links.model.as_deref(), Some("claude-test"));
+        assert_eq!(records[2].links.input_tokens, Some(100));
+        assert_eq!(records[2].links.cache_read_tokens, Some(40));
+        assert_eq!(records[2].links.cache_write_tokens, Some(10));
+        assert_eq!(records[2].links.output_tokens, Some(20));
         assert_eq!(records[2].links.thread_source.as_deref(), Some("sidechain"));
         assert_eq!(
             records[2].links.conversation_kind.as_deref(),
@@ -2615,6 +2694,8 @@ mod tests {
             Some("tool-claude")
         );
         assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
+        assert_eq!(records[3].links.event_index, Some(0));
+        assert_eq!(records[3].links.status.as_deref(), Some("success"));
     }
 
     #[test]
@@ -2918,7 +2999,7 @@ mod tests {
             &session_file,
             r#"{"type":"session","version":3,"id":"11111111-1111-1111-1111-111111111111","timestamp":"2026-07-03T01:02:03Z","cwd":"/Users/nico/Code/memex"}
 {"type":"message","id":"u1","timestamp":"2026-07-03T01:02:04Z","message":{"role":"user","content":[{"type":"text","text":"hello pi"}]}}
-{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-07-03T01:02:05Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"considering options"},{"type":"text","text":"I will run a command"},{"type":"toolCall","id":"tc1","name":"Read","arguments":{"file_path":"README.md"}}]}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-07-03T01:02:05Z","message":{"role":"assistant","model":"pi-test","usage":{"input":90,"cacheRead":30,"cacheWrite":5,"output":15,"reasoning":4},"content":[{"type":"thinking","thinking":"considering options"},{"type":"text","text":"I will run a command"},{"type":"toolCall","id":"tc1","name":"Read","arguments":{"file_path":"README.md"}}]}}
 {"type":"message","id":"tr1","parentId":"a1","timestamp":"2026-07-03T01:02:06Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"Read","content":[{"type":"text","text":"README contents"}],"isError":false}}
 {"type":"message","id":"b1","parentId":"tr1","timestamp":"2026-07-03T01:02:07Z","message":{"role":"bashExecution","command":"cargo test","output":"ok","exitCode":0,"cancelled":false,"truncated":false}}
 {"type":"message","id":"bh1","parentId":"b1","timestamp":"2026-07-03T01:02:07Z","message":{"role":"bashExecution","command":"echo secret","output":"secret output","exitCode":0,"excludeFromContext":true}}
@@ -2979,20 +3060,34 @@ mod tests {
         assert!(records[1].text.contains("README.md"));
         assert_eq!(records[1].links.event_id.as_deref(), Some("tc1"));
         assert_eq!(records[1].links.parent_event_id.as_deref(), Some("a1"));
+        assert_eq!(
+            records[1].links.message_ordinal,
+            records[2].links.message_ordinal
+        );
+        assert_eq!(records[1].links.call_index, Some(0));
         assert_eq!(records[2].role, "assistant");
         assert!(records[2].text.contains("I will run a command"));
         assert!(!records[2].text.contains("considering options"));
         assert_eq!(records[2].links.event_id.as_deref(), Some("a1"));
         assert_eq!(records[2].links.parent_event_id.as_deref(), Some("u1"));
+        assert_eq!(records[2].links.model.as_deref(), Some("pi-test"));
+        assert_eq!(records[2].links.input_tokens, Some(90));
+        assert_eq!(records[2].links.cache_read_tokens, Some(30));
+        assert_eq!(records[2].links.cache_write_tokens, Some(5));
+        assert_eq!(records[2].links.output_tokens, Some(15));
+        assert_eq!(records[2].links.reasoning_tokens, Some(4));
         assert_eq!(records[3].role, "tool_result");
         assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
         assert_eq!(records[3].text, "README contents");
         assert_eq!(records[3].links.event_id.as_deref(), Some("tr1"));
         assert_eq!(records[3].links.parent_event_id.as_deref(), Some("a1"));
         assert_eq!(records[3].links.parent_tool_use_id.as_deref(), Some("tc1"));
+        assert_eq!(records[3].links.event_index, Some(0));
+        assert_eq!(records[3].links.status.as_deref(), Some("success"));
         assert_eq!(records[4].role, "tool_result");
         assert_eq!(records[4].tool_name.as_deref(), Some("Bash"));
         assert!(records[4].text.contains("$ cargo test"));
+        assert_eq!(records[4].links.status.as_deref(), Some("success"));
         assert!(records[4].text.contains("exit code: 0"));
         assert_eq!(records[5].role, "assistant");
         assert_eq!(records[5].links.event_id.as_deref(), Some("c1"));
@@ -3065,6 +3160,7 @@ mod tests {
             delete_first: false,
             parser_version_invalidated: false,
             pending_tool_calls: HashMap::new(),
+            parser_stream: ParserStreamState::default(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Pi),
             projection_epoch: 0,
@@ -3128,8 +3224,7 @@ mod tests {
             concat!(
                 "{\"type\":\"session.start\",\"timestamp\":\"2026-06-01T12:00:00Z\",\"data\":{\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"context\":{\"cwd\":\"/Users/nico/Code/memex\",\"repository\":\"nicosuave/memex\"}}}\n",
                 "{\"type\":\"user.message\",\"timestamp\":\"2026-06-01T12:00:01Z\",\"data\":{\"content\":\"Find the parser\"}}\n",
-                "{\"type\":\"assistant.message\",\"timestamp\":\"2026-06-01T12:00:02Z\",\"data\":{\"content\":\"I will inspect ingestion.\"}}\n",
-                "{\"type\":\"tool.execution_start\",\"timestamp\":\"2026-06-01T12:00:03Z\",\"data\":{\"toolCallId\":\"call-1\",\"toolName\":\"grep\",\"arguments\":{\"pattern\":\"parse_copilot\"}}}\n",
+                "{\"type\":\"tool.execution_start\",\"timestamp\":\"2026-06-01T12:00:03Z\",\"data\":{\"toolCallId\":\"call-1\",\"toolName\":\"grep\",\"model\":\"copilot-test\",\"usage\":{\"inputTokens\":18,\"outputTokens\":2},\"arguments\":{\"pattern\":\"parse_copilot\"}}}\n",
                 "{\"type\":\"tool.execution_complete\",\"timestamp\":\"2026-06-01T12:00:04Z\",\"data\":{\"toolCallId\":\"call-1\",\"success\":true,\"result\":{\"content\":\"src/ingest.rs\"}}}\n"
             ),
         )
@@ -3145,6 +3240,7 @@ mod tests {
             delete_first: false,
             parser_version_invalidated: false,
             pending_tool_calls: HashMap::new(),
+            parser_stream: ParserStreamState::default(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Copilot),
             projection_epoch: 0,
@@ -3180,10 +3276,19 @@ mod tests {
             records[1].links.event_id.as_deref(),
             Some("11111111-1111-4111-8111-111111111111:1")
         );
+        assert_eq!(records[1].links.model.as_deref(), Some("copilot-test"));
+        assert!(records[1].text.is_empty());
+        assert_eq!(records[1].links.input_tokens, Some(18));
+        assert_eq!(records[1].links.output_tokens, Some(2));
         assert_eq!(records[2].role, "tool_use");
         assert_eq!(records[2].tool_name.as_deref(), Some("grep"));
         assert!(records[2].text.contains("parse_copilot"));
         assert_eq!(records[2].links.event_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            records[2].links.message_ordinal,
+            records[1].links.message_ordinal
+        );
+        assert_eq!(records[2].links.call_index, Some(0));
         assert_eq!(records[3].role, "tool_result");
         assert_eq!(records[3].tool_name.as_deref(), Some("grep"));
         assert_eq!(records[3].tool_output.as_deref(), Some("src/ingest.rs"));
@@ -3192,6 +3297,8 @@ mod tests {
             records[3].links.parent_tool_use_id.as_deref(),
             Some("call-1")
         );
+        assert_eq!(records[3].links.event_index, Some(0));
+        assert_eq!(records[3].links.status.as_deref(), Some("success"));
 
         let update = rx_update.try_recv().expect("file update");
         assert_eq!(update.state.offset, meta.len());

@@ -6,7 +6,7 @@ use std::io::Cursor;
 use std::path::Path;
 use std::time::Duration;
 
-const CATALOG_SCHEMA_VERSION: i64 = 8;
+const CATALOG_SCHEMA_VERSION: i64 = 9;
 const INLINE_BODY_BYTES: usize = 4 * 1024;
 
 pub struct CatalogStore {
@@ -69,7 +69,7 @@ impl CatalogStore {
                 "SELECT record_key
                  FROM records
                  WHERE session_key = ?1
-                 ORDER BY occurred_at DESC, turn_id DESC, record_id DESC
+                 ORDER BY occurred_at DESC, source_order DESC, record_id DESC
                  LIMIT 1",
                 params![session_key],
                 |row| row.get(0),
@@ -203,7 +203,8 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
             session_key TEXT NOT NULL,
             session_id TEXT NOT NULL,
             occurred_at INTEGER NOT NULL,
-            turn_id INTEGER NOT NULL,
+            source_order INTEGER NOT NULL,
+            message_ordinal INTEGER,
             role TEXT NOT NULL,
             tool_name TEXT,
             event_id TEXT,
@@ -218,7 +219,7 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
             source_tool_assistant_uuid TEXT
         );
         CREATE INDEX IF NOT EXISTS records_session_time_idx
-            ON records(session_key, occurred_at, turn_id);
+            ON records(session_key, occurred_at, source_order);
         CREATE INDEX IF NOT EXISTS records_source_path_idx ON records(source_path);
         CREATE INDEX IF NOT EXISTS records_event_idx ON records(session_key, event_id);
         CREATE INDEX IF NOT EXISTS records_interaction_idx ON records(interaction_id);
@@ -226,8 +227,17 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS messages (
             record_id INTEGER PRIMARY KEY REFERENCES records(record_id) ON DELETE CASCADE,
             message_identity TEXT,
+            session_key TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            model TEXT,
+            input_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            output_tokens INTEGER,
+            reasoning_tokens INTEGER,
             content_inline TEXT,
-            content_blob_hash TEXT REFERENCES content_blobs(content_hash)
+            content_blob_hash TEXT REFERENCES content_blobs(content_hash),
+            UNIQUE(session_key, ordinal)
         );
         CREATE INDEX IF NOT EXISTS messages_identity_idx
             ON messages(message_identity) WHERE message_identity IS NOT NULL;
@@ -236,6 +246,7 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
             record_id INTEGER PRIMARY KEY REFERENCES records(record_id) ON DELETE CASCADE,
             message_identity TEXT,
             message_record_id INTEGER REFERENCES records(record_id) ON DELETE SET NULL,
+            owner_link_status TEXT NOT NULL,
             content_inline TEXT,
             content_blob_hash TEXT REFERENCES content_blobs(content_hash)
         );
@@ -248,8 +259,13 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
             record_id INTEGER PRIMARY KEY REFERENCES records(record_id) ON DELETE CASCADE,
             message_identity TEXT,
             message_record_id INTEGER REFERENCES records(record_id) ON DELETE SET NULL,
-            call_index INTEGER NOT NULL,
+            owner_link_status TEXT NOT NULL,
+            call_index INTEGER,
             source_tool_use_id TEXT,
+            category TEXT,
+            skill_name TEXT,
+            file_path TEXT,
+            subagent_session_id TEXT,
             input_inline TEXT,
             input_blob_hash TEXT REFERENCES content_blobs(content_hash),
             search_text_inline TEXT,
@@ -267,7 +283,11 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
             record_id INTEGER PRIMARY KEY REFERENCES records(record_id) ON DELETE CASCADE,
             tool_call_record_id INTEGER REFERENCES records(record_id) ON DELETE SET NULL,
             source_tool_use_id TEXT,
-            event_index INTEGER NOT NULL,
+            call_link_status TEXT NOT NULL,
+            event_index INTEGER,
+            status TEXT,
+            source_status TEXT,
+            subagent_session_id TEXT,
             output_inline TEXT,
             output_blob_hash TEXT REFERENCES content_blobs(content_hash),
             search_text_inline TEXT,
@@ -406,7 +426,7 @@ pub(crate) fn finish_bulk_load(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         CREATE INDEX IF NOT EXISTS records_session_time_idx
-            ON records(session_key, occurred_at, turn_id);
+            ON records(session_key, occurred_at, source_order);
         CREATE INDEX IF NOT EXISTS records_source_path_idx ON records(source_path);
         CREATE INDEX IF NOT EXISTS records_event_idx ON records(session_key, event_id);
         CREATE INDEX IF NOT EXISTS records_interaction_idx ON records(interaction_id);
@@ -509,14 +529,15 @@ fn upsert_record_with_relations(
             r#"
         INSERT INTO records(
             record_key, doc_id, entity_type, source, source_path, session_key, session_id,
-            occurred_at, turn_id, role, tool_name, event_id, parent_event_id,
+            occurred_at, source_order, message_ordinal, role, tool_name,
+            event_id, parent_event_id,
             logical_parent_event_id, parent_session_id, thread_source, conversation_kind,
             interaction_id, parent_tool_use_id, source_tool_use_id,
             source_tool_assistant_uuid
         )
         VALUES(
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19, ?20, ?21
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22
         )
         ON CONFLICT(record_key) DO UPDATE SET
             doc_id = excluded.doc_id,
@@ -526,7 +547,8 @@ fn upsert_record_with_relations(
             session_key = excluded.session_key,
             session_id = excluded.session_id,
             occurred_at = excluded.occurred_at,
-            turn_id = excluded.turn_id,
+            source_order = excluded.source_order,
+            message_ordinal = excluded.message_ordinal,
             role = excluded.role,
             tool_name = excluded.tool_name,
             event_id = excluded.event_id,
@@ -553,6 +575,7 @@ fn upsert_record_with_relations(
                 record.session_id,
                 to_sql_u64(record.ts),
                 record.turn_id as i64,
+                record.links.message_ordinal.map(i64::from),
                 record.role,
                 record.tool_name,
                 record.links.event_id,
@@ -668,18 +691,44 @@ fn upsert_message(
     session_key: &str,
 ) -> Result<()> {
     let identity = message_identity(record, session_key);
+    let ordinal = record.links.message_ordinal.unwrap_or(record.turn_id) as i64;
     let body = store_body(conn, &record.text)?;
     conn.prepare_cached(
         r#"
-        INSERT INTO messages(record_id, message_identity, content_inline, content_blob_hash)
-        VALUES(?1, ?2, ?3, ?4)
+        INSERT INTO messages(
+            record_id, message_identity, session_key, ordinal, model, input_tokens,
+            cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
+            content_inline, content_blob_hash
+        )
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(record_id) DO UPDATE SET
             message_identity = excluded.message_identity,
+            session_key = excluded.session_key,
+            ordinal = excluded.ordinal,
+            model = excluded.model,
+            input_tokens = excluded.input_tokens,
+            cache_read_tokens = excluded.cache_read_tokens,
+            cache_write_tokens = excluded.cache_write_tokens,
+            output_tokens = excluded.output_tokens,
+            reasoning_tokens = excluded.reasoning_tokens,
             content_inline = excluded.content_inline,
             content_blob_hash = excluded.content_blob_hash
         "#,
     )?
-    .execute(params![record_id, identity, body.inline, body.blob_hash])?;
+    .execute(params![
+        record_id,
+        identity,
+        session_key,
+        ordinal,
+        record.links.model,
+        record.links.input_tokens.map(to_sql_u64),
+        record.links.cache_read_tokens.map(to_sql_u64),
+        record.links.cache_write_tokens.map(to_sql_u64),
+        record.links.output_tokens.map(to_sql_u64),
+        record.links.reasoning_tokens.map(to_sql_u64),
+        body.inline,
+        body.blob_hash
+    ])?;
     Ok(())
 }
 
@@ -690,16 +739,19 @@ fn upsert_thinking(
     session_key: &str,
 ) -> Result<()> {
     let identity = owner_message_identity(record, session_key);
+    let owner_status = pending_owner_status(identity.as_deref(), record.links.message_ordinal);
     let body = store_body(conn, &record.text)?;
     conn.prepare_cached(
         r#"
         INSERT INTO thinking(
-            record_id, message_identity, message_record_id, content_inline, content_blob_hash
+            record_id, message_identity, message_record_id, owner_link_status,
+            content_inline, content_blob_hash
         )
-        VALUES(?1, ?2, ?3, ?4, ?5)
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6)
         ON CONFLICT(record_id) DO UPDATE SET
             message_identity = excluded.message_identity,
             message_record_id = excluded.message_record_id,
+            owner_link_status = excluded.owner_link_status,
             content_inline = excluded.content_inline,
             content_blob_hash = excluded.content_blob_hash
         "#,
@@ -708,6 +760,7 @@ fn upsert_thinking(
         record_id,
         identity,
         Option::<i64>::None,
+        owner_status,
         body.inline,
         body.blob_hash
     ])?;
@@ -722,26 +775,57 @@ fn upsert_tool_call(
     resolve_relations: bool,
 ) -> Result<()> {
     let identity = owner_message_identity(record, session_key);
+    let owner_status = pending_owner_status(identity.as_deref(), record.links.message_ordinal);
     let source_tool_use_id = record
         .links
         .source_tool_use_id
         .as_deref()
         .or(record.links.event_id.as_deref());
     let input = record.tool_input.as_deref().unwrap_or(&record.text);
+    let category = normalized_tool_category(record.tool_name.as_deref());
+    let skill_name = record
+        .links
+        .skill_name
+        .clone()
+        .or_else(|| tool_input_string(input, &["skill", "skill_name", "name"]));
+    let file_path = record.links.file_path.clone().or_else(|| {
+        tool_input_string(
+            input,
+            &["file_path", "path", "file", "notebook_path", "target_file"],
+        )
+    });
+    let subagent_session_id = record.links.subagent_session_id.clone().or_else(|| {
+        tool_input_string(
+            input,
+            &[
+                "subagent_session_id",
+                "subagentSessionId",
+                "agent_id",
+                "agentId",
+            ],
+        )
+    });
     let body = store_body(conn, input)?;
     let search_body = store_distinct_search_body(conn, &record.text, input)?;
     conn.prepare_cached(
         r#"
         INSERT INTO tool_calls(
-            record_id, message_identity, message_record_id, call_index, source_tool_use_id,
+            record_id, message_identity, message_record_id, owner_link_status,
+            call_index, source_tool_use_id, category, skill_name, file_path,
+            subagent_session_id,
             input_inline, input_blob_hash, search_text_inline, search_text_blob_hash
         )
-        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         ON CONFLICT(record_id) DO UPDATE SET
             message_identity = excluded.message_identity,
             message_record_id = excluded.message_record_id,
+            owner_link_status = excluded.owner_link_status,
             call_index = excluded.call_index,
             source_tool_use_id = excluded.source_tool_use_id,
+            category = excluded.category,
+            skill_name = excluded.skill_name,
+            file_path = excluded.file_path,
+            subagent_session_id = excluded.subagent_session_id,
             input_inline = excluded.input_inline,
             input_blob_hash = excluded.input_blob_hash,
             search_text_inline = excluded.search_text_inline,
@@ -752,8 +836,13 @@ fn upsert_tool_call(
         record_id,
         identity,
         Option::<i64>::None,
-        record.turn_id as i64,
+        owner_status,
+        record.links.call_index.map(i64::from),
         source_tool_use_id,
+        category,
+        skill_name,
+        file_path,
+        subagent_session_id,
         body.inline,
         body.blob_hash,
         search_body.inline,
@@ -798,19 +887,31 @@ fn upsert_tool_result(
         None
     };
     let output = record.tool_output.as_deref().unwrap_or(&record.text);
+    let call_link_status = if tool_call_record_id.is_some() {
+        "linked"
+    } else if source_tool_use_id.is_some() {
+        "source_identity_unmatched"
+    } else {
+        "source_identity_missing"
+    };
     let body = store_body(conn, output)?;
     let search_body = store_distinct_search_body(conn, &record.text, output)?;
     conn.prepare_cached(
         r#"
         INSERT INTO tool_results(
-            record_id, tool_call_record_id, source_tool_use_id, event_index,
+            record_id, tool_call_record_id, source_tool_use_id, call_link_status,
+            event_index, status, source_status, subagent_session_id,
             output_inline, output_blob_hash, search_text_inline, search_text_blob_hash
         )
-        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(record_id) DO UPDATE SET
             tool_call_record_id = excluded.tool_call_record_id,
             source_tool_use_id = excluded.source_tool_use_id,
+            call_link_status = excluded.call_link_status,
             event_index = excluded.event_index,
+            status = excluded.status,
+            source_status = excluded.source_status,
+            subagent_session_id = excluded.subagent_session_id,
             output_inline = excluded.output_inline,
             output_blob_hash = excluded.output_blob_hash,
             search_text_inline = excluded.search_text_inline,
@@ -821,7 +922,11 @@ fn upsert_tool_result(
         record_id,
         tool_call_record_id,
         source_tool_use_id,
-        record.turn_id as i64,
+        call_link_status,
+        record.links.event_index.map(i64::from),
+        record.links.status,
+        record.links.source_status,
+        record.links.subagent_session_id,
         body.inline,
         body.blob_hash,
         search_body.inline,
@@ -921,6 +1026,26 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         WHERE child.message_record_id IS NULL
           AND child.message_identity IS NOT NULL
         GROUP BY child.record_id;
+        INSERT OR IGNORE INTO message_entity_links(child_id, message_id)
+        SELECT child.record_id, MIN(parent.record_id)
+        FROM thinking AS child
+        JOIN records AS child_record ON child_record.record_id = child.record_id
+        JOIN messages AS parent
+          ON parent.session_key = child_record.session_key
+         AND parent.ordinal = child_record.message_ordinal
+        WHERE child.message_record_id IS NULL
+          AND child_record.message_ordinal IS NOT NULL
+        GROUP BY child.record_id;
+        INSERT OR IGNORE INTO message_entity_links(child_id, message_id)
+        SELECT child.record_id, MIN(parent.record_id)
+        FROM tool_calls AS child
+        JOIN records AS child_record ON child_record.record_id = child.record_id
+        JOIN messages AS parent
+          ON parent.session_key = child_record.session_key
+         AND parent.ordinal = child_record.message_ordinal
+        WHERE child.message_record_id IS NULL
+          AND child_record.message_ordinal IS NOT NULL
+        GROUP BY child.record_id;
         UPDATE thinking AS child
         SET message_record_id = links.message_id
         FROM message_entity_links AS links
@@ -931,6 +1056,52 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         FROM message_entity_links AS links
         WHERE child.message_record_id IS NULL
           AND child.record_id = links.child_id;
+        UPDATE thinking
+        SET owner_link_status = CASE
+            WHEN message_record_id IS NOT NULL THEN 'linked'
+            WHEN message_identity IS NOT NULL THEN 'source_identity_unmatched'
+            WHEN EXISTS (
+                SELECT 1
+                FROM records
+                WHERE records.record_id = thinking.record_id
+                  AND records.message_ordinal IS NOT NULL
+            ) THEN 'source_ordinal_unmatched'
+            ELSE 'source_identity_missing'
+        END
+        WHERE owner_link_status <> CASE
+            WHEN message_record_id IS NOT NULL THEN 'linked'
+            WHEN message_identity IS NOT NULL THEN 'source_identity_unmatched'
+            WHEN EXISTS (
+                SELECT 1
+                FROM records
+                WHERE records.record_id = thinking.record_id
+                  AND records.message_ordinal IS NOT NULL
+            ) THEN 'source_ordinal_unmatched'
+            ELSE 'source_identity_missing'
+        END;
+        UPDATE tool_calls
+        SET owner_link_status = CASE
+            WHEN message_record_id IS NOT NULL THEN 'linked'
+            WHEN message_identity IS NOT NULL THEN 'source_identity_unmatched'
+            WHEN EXISTS (
+                SELECT 1
+                FROM records
+                WHERE records.record_id = tool_calls.record_id
+                  AND records.message_ordinal IS NOT NULL
+            ) THEN 'source_ordinal_unmatched'
+            ELSE 'source_identity_missing'
+        END
+        WHERE owner_link_status <> CASE
+            WHEN message_record_id IS NOT NULL THEN 'linked'
+            WHEN message_identity IS NOT NULL THEN 'source_identity_unmatched'
+            WHEN EXISTS (
+                SELECT 1
+                FROM records
+                WHERE records.record_id = tool_calls.record_id
+                  AND records.message_ordinal IS NOT NULL
+            ) THEN 'source_ordinal_unmatched'
+            ELSE 'source_identity_missing'
+        END;
         DROP TABLE temp.message_entity_links;
 
         DROP TABLE IF EXISTS temp.tool_call_identity_links;
@@ -966,8 +1137,61 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         FROM tool_result_links AS links
         WHERE result.record_id = links.result_id
           AND result.tool_call_record_id IS NULL;
+        UPDATE tool_results
+        SET call_link_status = CASE
+            WHEN tool_call_record_id IS NOT NULL THEN 'linked'
+            WHEN source_tool_use_id IS NOT NULL THEN 'source_identity_unmatched'
+            ELSE 'source_identity_missing'
+        END
+        WHERE call_link_status <> CASE
+            WHEN tool_call_record_id IS NOT NULL THEN 'linked'
+            WHEN source_tool_use_id IS NOT NULL THEN 'source_identity_unmatched'
+            ELSE 'source_identity_missing'
+        END;
         DROP TABLE temp.tool_result_links;
         DROP TABLE temp.tool_call_identity_links;
+
+        DROP TABLE IF EXISTS temp.tool_call_ordinals;
+        CREATE TEMP TABLE tool_call_ordinals (
+            record_id INTEGER PRIMARY KEY,
+            call_index INTEGER NOT NULL
+        );
+        INSERT INTO tool_call_ordinals(record_id, call_index)
+        SELECT call.record_id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY call.message_record_id
+                   ORDER BY record.source_order, call.record_id
+               ) - 1
+        FROM tool_calls AS call
+        JOIN records AS record ON record.record_id = call.record_id
+        WHERE call.message_record_id IS NOT NULL;
+        UPDATE tool_calls AS call
+        SET call_index = ordinal.call_index
+        FROM tool_call_ordinals AS ordinal
+        WHERE call.record_id = ordinal.record_id
+          AND call.call_index IS NOT ordinal.call_index;
+        DROP TABLE temp.tool_call_ordinals;
+
+        DROP TABLE IF EXISTS temp.tool_result_ordinals;
+        CREATE TEMP TABLE tool_result_ordinals (
+            record_id INTEGER PRIMARY KEY,
+            event_index INTEGER NOT NULL
+        );
+        INSERT INTO tool_result_ordinals(record_id, event_index)
+        SELECT result.record_id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY result.tool_call_record_id
+                   ORDER BY record.source_order, result.record_id
+               ) - 1
+        FROM tool_results AS result
+        JOIN records AS record ON record.record_id = result.record_id
+        WHERE result.tool_call_record_id IS NOT NULL;
+        UPDATE tool_results AS result
+        SET event_index = ordinal.event_index
+        FROM tool_result_ordinals AS ordinal
+        WHERE result.record_id = ordinal.record_id
+          AND result.event_index IS NOT ordinal.event_index;
+        DROP TABLE temp.tool_result_ordinals;
 
         UPDATE records AS child_record
         SET interaction_id = owner_record.interaction_id
@@ -1006,14 +1230,24 @@ fn record_by_key(conn: &Connection, record_key: &str) -> Result<Option<Record>> 
             SELECT
                    record.record_id, record.doc_id, record.entity_type, record.source,
                    record.source_path, record.session_key, record.session_id,
-                   record.occurred_at, record.turn_id, record.role, record.tool_name,
+                   record.occurred_at, record.source_order, record.role, record.tool_name,
                    record.event_id, record.parent_event_id, record.logical_parent_event_id,
                    record.parent_session_id, record.thread_source, record.conversation_kind,
                    interaction.source_interaction_id, record.parent_tool_use_id,
-                   record.source_tool_use_id, record.source_tool_assistant_uuid
+                   record.source_tool_use_id, record.source_tool_assistant_uuid,
+                   COALESCE(record.message_ordinal, message.ordinal),
+                   call.call_index, result.event_index,
+                   result.status, result.source_status, message.model,
+                   message.input_tokens, message.cache_read_tokens, message.cache_write_tokens,
+                   message.output_tokens, message.reasoning_tokens,
+                   call.skill_name, call.file_path,
+                   COALESCE(call.subagent_session_id, result.subagent_session_id)
             FROM records AS record
             LEFT JOIN interactions AS interaction
               ON interaction.interaction_id = record.interaction_id
+            LEFT JOIN messages AS message ON message.record_id = record.record_id
+            LEFT JOIN tool_calls AS call ON call.record_id = record.record_id
+            LEFT JOIN tool_results AS result ON result.record_id = record.record_id
             WHERE record.record_key = ?1
             "#,
             params![record_key],
@@ -1031,6 +1265,9 @@ fn record_by_key(conn: &Connection, record_key: &str) -> Result<Option<Record>> 
                     row.get::<_, String>(9)?,
                     row.get::<_, Option<String>>(10)?,
                     RecordLinks {
+                        message_ordinal: row.get::<_, Option<i64>>(21)?.map(|value| value as u32),
+                        call_index: row.get::<_, Option<i64>>(22)?.map(|value| value as u32),
+                        event_index: row.get::<_, Option<i64>>(23)?.map(|value| value as u32),
                         interaction_id: row.get(17)?,
                         event_id: row.get(11)?,
                         parent_event_id: row.get(12)?,
@@ -1041,6 +1278,17 @@ fn record_by_key(conn: &Connection, record_key: &str) -> Result<Option<Record>> 
                         parent_tool_use_id: row.get(18)?,
                         source_tool_use_id: row.get(19)?,
                         source_tool_assistant_uuid: row.get(20)?,
+                        status: row.get(24)?,
+                        source_status: row.get(25)?,
+                        model: row.get(26)?,
+                        input_tokens: row.get::<_, Option<i64>>(27)?.map(from_sql_u64),
+                        cache_read_tokens: row.get::<_, Option<i64>>(28)?.map(from_sql_u64),
+                        cache_write_tokens: row.get::<_, Option<i64>>(29)?.map(from_sql_u64),
+                        output_tokens: row.get::<_, Option<i64>>(30)?.map(from_sql_u64),
+                        reasoning_tokens: row.get::<_, Option<i64>>(31)?.map(from_sql_u64),
+                        skill_name: row.get(32)?,
+                        file_path: row.get(33)?,
+                        subagent_session_id: row.get(34)?,
                     },
                 ))
             },
@@ -1254,6 +1502,57 @@ fn owner_message_identity(record: &Record, session_key: &str) -> Option<String> 
         .map(|event| stable_key("message", &[session_key, event]))
 }
 
+fn pending_owner_status(identity: Option<&str>, message_ordinal: Option<u32>) -> &'static str {
+    if identity.is_some() || message_ordinal.is_some() {
+        "pending"
+    } else {
+        "source_identity_missing"
+    }
+}
+
+fn normalized_tool_category(tool_name: Option<&str>) -> &'static str {
+    let Some(name) = tool_name else {
+        return "other";
+    };
+    let normalized = name.to_ascii_lowercase();
+    if normalized.contains("skill") {
+        "skill"
+    } else if [
+        "read", "write", "edit", "patch", "glob", "grep", "file", "notebook",
+    ]
+    .iter()
+    .any(|part| normalized.contains(part))
+    {
+        "filesystem"
+    } else if ["bash", "shell", "exec", "terminal", "command"]
+        .iter()
+        .any(|part| normalized.contains(part))
+    {
+        "shell"
+    } else if normalized.contains("search") || normalized.contains("fetch") {
+        "search"
+    } else if ["agent", "task", "delegate"]
+        .iter()
+        .any(|part| normalized.contains(part))
+    {
+        "agent"
+    } else {
+        "other"
+    }
+}
+
+fn tool_input_string(input: &str, keys: &[&str]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    let object = value.as_object()?;
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
 fn stable_key(kind: &str, parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(kind.as_bytes());
@@ -1416,6 +1715,51 @@ mod tests {
     }
 
     #[test]
+    fn transcript_navigation_uses_ordering_indexes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(tmp.path().join("catalog.sqlite")).expect("catalog");
+        for (sql, expected_index) in [
+            (
+                "SELECT record_key FROM records
+                 WHERE session_key = ?1
+                 ORDER BY occurred_at, source_order",
+                "records_session_time_idx",
+            ),
+            (
+                "SELECT record_id FROM messages
+                 WHERE session_key = ?1
+                 ORDER BY ordinal",
+                "sqlite_autoindex_messages_1",
+            ),
+            (
+                "SELECT record_id FROM tool_calls
+                 WHERE message_record_id = ?1
+                 ORDER BY call_index",
+                "tool_calls_message_idx",
+            ),
+            (
+                "SELECT record_id FROM tool_results
+                 WHERE tool_call_record_id = ?1
+                 ORDER BY event_index",
+                "tool_results_call_idx",
+            ),
+        ] {
+            let details = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare query plan")
+                .query_map(params!["owner"], |row| row.get::<_, String>(3))
+                .expect("query plan")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect query plan");
+            assert!(
+                details.iter().any(|detail| detail.contains(expected_index)),
+                "plan did not use {expected_index}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
     fn relation_linking_reconciles_out_of_order_entities() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = CatalogStore::open(tmp.path().join("catalog.sqlite")).expect("catalog");
@@ -1486,6 +1830,235 @@ mod tests {
     }
 
     #[test]
+    fn relationship_projection_assigns_true_child_ordinals_and_link_states() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(tmp.path().join("catalog.sqlite")).expect("catalog");
+        seed_session(&store.conn);
+
+        let mut message = record("assistant", "working".to_string());
+        message.record_key = "rk-message".to_string();
+        message.doc_id = 1;
+        message.turn_id = 10;
+        message.links = RecordLinks {
+            event_id: Some("message-1".to_string()),
+            message_ordinal: Some(4),
+            model: Some("gpt-test".to_string()),
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            ..RecordLinks::default()
+        };
+
+        let mut first_call = record("tool_use", r#"{"file_path":"a.rs"}"#.to_string());
+        first_call.record_key = "rk-call-a".to_string();
+        first_call.doc_id = 2;
+        first_call.turn_id = 11;
+        first_call.links = RecordLinks {
+            event_id: Some("call-a".to_string()),
+            message_ordinal: Some(4),
+            call_index: Some(99),
+            ..RecordLinks::default()
+        };
+
+        let mut second_call = record(
+            "tool_use",
+            r#"{"skill":"review","agent_id":"agent-7"}"#.to_string(),
+        );
+        second_call.record_key = "rk-call-b".to_string();
+        second_call.doc_id = 3;
+        second_call.turn_id = 12;
+        second_call.tool_name = Some("Skill".to_string());
+        second_call.links = RecordLinks {
+            event_id: Some("call-b".to_string()),
+            message_ordinal: Some(4),
+            call_index: Some(99),
+            ..RecordLinks::default()
+        };
+
+        let mut first_result = record("tool_result", "progress".to_string());
+        first_result.record_key = "rk-result-a0".to_string();
+        first_result.doc_id = 4;
+        first_result.turn_id = 13;
+        first_result.links = RecordLinks {
+            parent_tool_use_id: Some("call-a".to_string()),
+            event_index: Some(99),
+            status: Some("pending".to_string()),
+            source_status: Some("running".to_string()),
+            ..RecordLinks::default()
+        };
+
+        let mut final_result = record("tool_result", "done".to_string());
+        final_result.record_key = "rk-result-a1".to_string();
+        final_result.doc_id = 5;
+        final_result.turn_id = 14;
+        final_result.links = RecordLinks {
+            parent_tool_use_id: Some("call-a".to_string()),
+            event_index: Some(99),
+            status: Some("success".to_string()),
+            source_status: Some("completed".to_string()),
+            ..RecordLinks::default()
+        };
+
+        let mut orphan_call = record("tool_use", "{}".to_string());
+        orphan_call.record_key = "rk-call-orphan".to_string();
+        orphan_call.doc_id = 6;
+        orphan_call.turn_id = 15;
+        orphan_call.links = RecordLinks {
+            event_id: Some("call-orphan".to_string()),
+            ..RecordLinks::default()
+        };
+        let mut unmatched_ordinal_call = record("tool_use", "{}".to_string());
+        unmatched_ordinal_call.record_key = "rk-call-unmatched-ordinal".to_string();
+        unmatched_ordinal_call.doc_id = 7;
+        unmatched_ordinal_call.turn_id = 16;
+        unmatched_ordinal_call.links = RecordLinks {
+            event_id: Some("call-unmatched-ordinal".to_string()),
+            message_ordinal: Some(99),
+            ..RecordLinks::default()
+        };
+
+        for entity in [
+            &final_result,
+            &second_call,
+            &first_result,
+            &first_call,
+            &message,
+            &orphan_call,
+            &unmatched_ordinal_call,
+        ] {
+            upsert_record(&store.conn, entity).expect("insert entity");
+        }
+        link_relations(&store.conn).expect("link relations");
+
+        let calls = store
+            .conn
+            .prepare(
+                "SELECT record.record_key, call.call_index, call.owner_link_status,
+                        call.category, call.skill_name, call.file_path,
+                        call.subagent_session_id
+                 FROM tool_calls AS call
+                 JOIN records AS record ON record.record_id = call.record_id
+                 WHERE call.message_record_id IS NOT NULL
+                 ORDER BY call.call_index",
+            )
+            .expect("prepare calls")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .expect("query calls")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect calls");
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "rk-call-a".to_string(),
+                    0,
+                    "linked".to_string(),
+                    "filesystem".to_string(),
+                    None,
+                    Some("a.rs".to_string()),
+                    None,
+                ),
+                (
+                    "rk-call-b".to_string(),
+                    1,
+                    "linked".to_string(),
+                    "skill".to_string(),
+                    Some("review".to_string()),
+                    None,
+                    Some("agent-7".to_string()),
+                ),
+            ]
+        );
+
+        let results = store
+            .conn
+            .prepare(
+                "SELECT result.event_index, result.call_link_status, result.status,
+                        result.source_status
+                 FROM tool_results AS result
+                 JOIN records AS record ON record.record_id = result.record_id
+                 WHERE result.tool_call_record_id = (
+                     SELECT record_id FROM records WHERE record_key = 'rk-call-a'
+                 )
+                 ORDER BY result.event_index",
+            )
+            .expect("prepare results")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .expect("query results")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect results");
+        assert_eq!(
+            results,
+            vec![
+                (
+                    0,
+                    "linked".to_string(),
+                    Some("pending".to_string()),
+                    Some("running".to_string()),
+                ),
+                (
+                    1,
+                    "linked".to_string(),
+                    Some("success".to_string()),
+                    Some("completed".to_string()),
+                ),
+            ]
+        );
+
+        let message_facts: (i64, String, i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT ordinal, model, input_tokens, output_tokens FROM messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("message facts");
+        assert_eq!(message_facts, (4, "gpt-test".to_string(), 100, 20));
+
+        let orphan_status: String = store
+            .conn
+            .query_row(
+                "SELECT owner_link_status FROM tool_calls
+                 WHERE record_id = (
+                     SELECT record_id FROM records WHERE record_key = 'rk-call-orphan'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphan status");
+        assert_eq!(orphan_status, "source_identity_missing");
+        let unmatched_ordinal_status: String = store
+            .conn
+            .query_row(
+                "SELECT owner_link_status FROM tool_calls
+                 WHERE record_id = (
+                     SELECT record_id FROM records
+                     WHERE record_key = 'rk-call-unmatched-ordinal'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("unmatched ordinal status");
+        assert_eq!(unmatched_ordinal_status, "source_ordinal_unmatched");
+    }
+
+    #[test]
     fn bulk_load_links_sibling_entities_to_their_source_interaction() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = CatalogStore::open(tmp.path().join("catalog.sqlite")).expect("catalog");
@@ -1544,7 +2117,7 @@ mod tests {
                     );
                     INSERT INTO usage_events(interaction_id)
                     SELECT interaction_id FROM interactions;
-                    UPDATE catalog_meta SET value = '7' WHERE key = 'schema_version';
+                    UPDATE catalog_meta SET value = '8' WHERE key = 'schema_version';
                     "#,
                 )
                 .expect("seed stale schema");
