@@ -1220,10 +1220,14 @@ fn stable_session_key(record: &Record) -> String {
 }
 
 pub(crate) fn session_key(source: SourceKind, session_id: &str, source_path: &str) -> String {
+    session_key_from_label(source.storage_label(), session_id, source_path)
+}
+
+pub(crate) fn session_key_from_label(source: &str, session_id: &str, source_path: &str) -> String {
     stable_key(
         "session",
         &[
-            source.storage_label(),
+            source,
             if session_id.is_empty() {
                 source_path
             } else {

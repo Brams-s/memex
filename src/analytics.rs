@@ -61,6 +61,21 @@ struct SessionAccumulator {
     message_count: u64,
 }
 
+struct LegacySessionRow {
+    source: String,
+    session_id: String,
+    source_path: String,
+    project: String,
+    cwd: Option<String>,
+    git_root: Option<String>,
+    git_common_dir: Option<String>,
+    repo_project: Option<String>,
+    started_at: i64,
+    last_at: i64,
+    message_count: i64,
+    resolution_status: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SessionMetadata {
     pub cwd: Option<String>,
@@ -78,7 +93,7 @@ impl AnalyticsStore {
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(2))?;
-        let store = Self { conn };
+        let mut store = Self { conn };
         store.init()?;
         Ok(store)
     }
@@ -93,8 +108,9 @@ impl AnalyticsStore {
         Ok(Self { conn })
     }
 
-    fn init(&self) -> Result<()> {
+    fn init(&mut self) -> Result<()> {
         crate::catalog::init_connection(&self.conn)?;
+        self.migrate_legacy_sessions()?;
         self.conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -165,6 +181,144 @@ impl AnalyticsStore {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![SCHEMA_VERSION.to_string()],
         )?;
+        Ok(())
+    }
+
+    fn migrate_legacy_sessions(&mut self) -> Result<()> {
+        let sessions_exists = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'
+            )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !sessions_exists {
+            return Ok(());
+        }
+
+        let has_session_key = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'session_key'
+            )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_session_key {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        let legacy_rows = {
+            let mut stmt = tx.prepare(
+                "SELECT source, session_id, source_path, project, cwd, git_root,
+                        git_common_dir, repo_project, started_at, last_at, message_count,
+                        resolution_status
+                 FROM sessions",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(LegacySessionRow {
+                    source: row.get(0)?,
+                    session_id: row.get(1)?,
+                    source_path: row.get(2)?,
+                    project: row.get(3)?,
+                    cwd: row.get(4)?,
+                    git_root: row.get(5)?,
+                    git_common_dir: row.get(6)?,
+                    repo_project: row.get(7)?,
+                    started_at: row.get(8)?,
+                    last_at: row.get(9)?,
+                    message_count: row.get(10)?,
+                    resolution_status: row.get(11)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        tx.execute_batch(
+            r#"
+            CREATE TABLE sessions_v4 (
+                session_key TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                project TEXT NOT NULL,
+                cwd TEXT,
+                git_root TEXT,
+                git_common_dir TEXT,
+                repo_project TEXT,
+                started_at INTEGER NOT NULL,
+                last_at INTEGER NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                resolution_status TEXT NOT NULL DEFAULT ''
+            );
+            "#,
+        )?;
+        {
+            let mut insert = tx.prepare(
+                r#"
+                INSERT INTO sessions_v4(
+                    session_key, source, session_id, source_path, project, cwd, git_root,
+                    git_common_dir, repo_project, started_at, last_at, message_count,
+                    resolution_status
+                )
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    source_path = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.source_path ELSE sessions_v4.source_path END,
+                    project = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.project ELSE sessions_v4.project END,
+                    cwd = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.cwd ELSE sessions_v4.cwd END,
+                    git_root = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.git_root ELSE sessions_v4.git_root END,
+                    git_common_dir = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.git_common_dir ELSE sessions_v4.git_common_dir END,
+                    repo_project = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.repo_project ELSE sessions_v4.repo_project END,
+                    started_at = MIN(sessions_v4.started_at, excluded.started_at),
+                    last_at = MAX(sessions_v4.last_at, excluded.last_at),
+                    message_count = MAX(sessions_v4.message_count, excluded.message_count),
+                    resolution_status = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.resolution_status ELSE sessions_v4.resolution_status END
+                "#,
+            )?;
+            for row in legacy_rows {
+                let session_key = crate::catalog::session_key_from_label(
+                    &row.source,
+                    &row.session_id,
+                    &row.source_path,
+                );
+                insert.execute(params![
+                    session_key,
+                    row.source,
+                    row.session_id,
+                    row.source_path,
+                    row.project,
+                    row.cwd,
+                    row.git_root,
+                    row.git_common_dir,
+                    row.repo_project,
+                    row.started_at,
+                    row.last_at,
+                    row.message_count,
+                    row.resolution_status,
+                ])?;
+            }
+        }
+        tx.execute_batch(
+            r#"
+            DROP TABLE sessions;
+            ALTER TABLE sessions_v4 RENAME TO sessions;
+            "#,
+        )?;
+        tx.commit().context("migrate legacy sessions schema")?;
         Ok(())
     }
 
@@ -1357,6 +1511,63 @@ mod tests {
 
         let store = AnalyticsStore::open(&db).expect("open store");
 
+        assert!(!store.complete().expect("complete"));
+    }
+
+    #[test]
+    fn legacy_sessions_schema_is_migrated_before_writes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(&transcript, "").expect("write transcript");
+        let db = tmp.path().join("analytics.sqlite");
+        {
+            let conn = Connection::open(&db).expect("open sqlite");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES('schema_version', '2');
+                INSERT INTO meta(key, value) VALUES('analytics_complete', '1');
+                CREATE TABLE sessions (
+                    source TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    cwd TEXT,
+                    git_root TEXT,
+                    git_common_dir TEXT,
+                    repo_project TEXT,
+                    started_at INTEGER NOT NULL,
+                    last_at INTEGER NOT NULL,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    resolution_status TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (source, session_id, source_path)
+                );
+                "#,
+            )
+            .expect("seed legacy schema");
+            conn.execute(
+                "INSERT INTO sessions(
+                    source, session_id, source_path, project, started_at, last_at, message_count
+                 ) VALUES('codex', 's1', ?1, 'memex', 10, 10, 3)",
+                params![transcript.to_string_lossy().as_ref()],
+            )
+            .expect("seed legacy session");
+        }
+
+        let mut writer = AnalyticsWriter::open(&db).expect("open analytics");
+        writer
+            .record(&record("memex", "s1", &transcript, 20))
+            .expect("record");
+        writer.flush().expect("flush");
+
+        let store = AnalyticsStore::open(&db).expect("open store");
+        let rows = store
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "s1");
+        assert_eq!(rows[0].last_at, 20);
+        assert_eq!(rows[0].message_count, 4);
         assert!(!store.complete().expect("complete"));
     }
 
