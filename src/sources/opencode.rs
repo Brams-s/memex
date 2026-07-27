@@ -210,7 +210,10 @@ pub(crate) fn parse_index_records(
         if !part_dir.exists() {
             continue;
         }
-        let mut part_files = std::fs::read_dir(part_dir)?
+        let Ok(part_entries) = std::fs::read_dir(part_dir) else {
+            continue;
+        };
+        let mut part_files = part_entries
             .flatten()
             .map(|entry| entry.path())
             .collect::<Vec<_>>();

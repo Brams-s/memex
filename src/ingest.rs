@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const EMBED_BATCH_SIZE: usize = 64;
@@ -206,6 +206,47 @@ fn prepare_file_task(
     )
 }
 
+fn discovered_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match path.metadata() {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read metadata for {}", path.display())),
+    }
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn finish_file_task(
+    task: &FileTask,
+    progress: &Progress,
+    skipped: &AtomicUsize,
+    result: Result<()>,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_not_found(&error) => {
+            // Active agent clients may rotate or delete a transcript after discovery. Treat
+            // that filesystem race as a skipped file instead of discarding the whole ingest.
+            progress.add_files_done(task.source, 1);
+            skipped.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to parse {} transcript {}",
+                task.source.label(),
+                task.path.display()
+            )
+        }),
+    }
+}
+
 fn completed_file_state(
     task: &FileTask,
     offset: u64,
@@ -358,7 +399,10 @@ pub fn ingest_all(
             crate::sources::claude::discover(&options.claude_source, options.include_agents)?;
         for source_file in claude_files {
             let path = source_file.path;
-            let meta = path.metadata()?;
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
@@ -385,7 +429,10 @@ pub fn ingest_all(
             if let Some(id) = crate::sources::codex::session_id_from_path(&path) {
                 session_ids.insert(id);
             }
-            let meta = path.metadata()?;
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
@@ -406,7 +453,10 @@ pub fn ingest_all(
 
     if options.include_codex {
         for history_path in crate::sources::codex::history_paths() {
-            let meta = history_path.metadata()?;
+            let Some(meta) = discovered_metadata(&history_path)? else {
+                files_skipped += 1;
+                continue;
+            };
             files_scanned += 1;
             total_bytes += meta.len();
             let key = history_path.to_string_lossy().to_string();
@@ -429,7 +479,10 @@ pub fn ingest_all(
         let opencode_files = crate::sources::opencode::discover_sessions()?;
         for source_file in opencode_files {
             let path = source_file.path;
-            let meta = path.metadata()?;
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
@@ -452,7 +505,10 @@ pub fn ingest_all(
         let cursor_files = crate::sources::cursor::discover_transcripts();
         for source_file in cursor_files {
             let path = source_file.path;
-            let meta = path.metadata()?;
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
@@ -475,7 +531,10 @@ pub fn ingest_all(
         let pi_files = crate::sources::pi::discover();
         for source_file in pi_files {
             let path = source_file.path;
-            let meta = path.metadata()?;
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
@@ -497,7 +556,10 @@ pub fn ingest_all(
     if options.include_openclaw {
         for source_file in crate::sources::openclaw::discover() {
             let path = source_file.path;
-            let meta = path.metadata()?;
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
@@ -520,7 +582,10 @@ pub fn ingest_all(
         let copilot_files = crate::sources::copilot::discover_sessions();
         for source_file in copilot_files {
             let path = source_file.path;
-            let meta = path.metadata()?;
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
@@ -602,8 +667,9 @@ pub fn ingest_all(
     });
 
     let tasks_arc = Arc::new(tasks);
+    let parse_skipped = AtomicUsize::new(0);
     let parser_result = tasks_arc.par_iter().try_for_each(|task| -> Result<()> {
-        match task.source {
+        let result = match task.source {
             SourceKind::Claude => parse_claude_file(
                 task,
                 options.include_reasoning,
@@ -611,7 +677,7 @@ pub fn ingest_all(
                 &tx_update,
                 &next_doc_id,
                 &progress,
-            )?,
+            ),
             SourceKind::Codex => {
                 if crate::sources::codex::is_history_path(&task.path) {
                     parse_codex_history(
@@ -621,7 +687,7 @@ pub fn ingest_all(
                         &next_doc_id,
                         &session_ids,
                         &progress,
-                    )?
+                    )
                 } else {
                     parse_codex_session(
                         task,
@@ -630,7 +696,7 @@ pub fn ingest_all(
                         &tx_update,
                         &next_doc_id,
                         &progress,
-                    )?
+                    )
                 }
             }
             SourceKind::Opencode => parse_opencode_file(
@@ -640,9 +706,9 @@ pub fn ingest_all(
                 &next_doc_id,
                 &progress,
                 &opencode_session_links,
-            )?,
+            ),
             SourceKind::Cursor => {
-                parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?
+                parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)
             }
             SourceKind::Pi => parse_pi_file(
                 task,
@@ -651,7 +717,7 @@ pub fn ingest_all(
                 &tx_update,
                 &next_doc_id,
                 &progress,
-            )?,
+            ),
             SourceKind::OpenClaw => parse_openclaw_file(
                 task,
                 options.include_reasoning,
@@ -659,12 +725,12 @@ pub fn ingest_all(
                 &tx_update,
                 &next_doc_id,
                 &progress,
-            )?,
+            ),
             SourceKind::Copilot => {
-                parse_copilot_session(task, &tx_record, &tx_update, &next_doc_id, &progress)?
+                parse_copilot_session(task, &tx_record, &tx_update, &next_doc_id, &progress)
             }
-        }
-        Ok(())
+        };
+        finish_file_task(task, &progress, &parse_skipped, result)
     });
 
     drop(tx_record);
@@ -703,7 +769,7 @@ pub fn ingest_all(
         records_added,
         records_embedded,
         files_scanned,
-        files_skipped,
+        files_skipped: files_skipped + parse_skipped.load(Ordering::Relaxed),
         diagnostics,
     })
 }
@@ -1515,6 +1581,43 @@ mod tests {
             result,
             Err(crossbeam_channel::TrySendError::Full(_))
         ));
+    }
+
+    #[test]
+    fn transcript_removed_after_discovery_is_skipped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("removed.jsonl");
+        fs::write(&path, "{}\n").expect("seed transcript");
+        let metadata = path.metadata().expect("transcript metadata");
+        let (task, skip) =
+            prepare_file_task(path.clone(), SourceKind::Claude, false, &metadata, None);
+        assert!(!skip);
+        fs::remove_file(&path).expect("remove transcript after discovery");
+        assert!(
+            discovered_metadata(&path)
+                .expect("missing metadata should not fail")
+                .is_none()
+        );
+
+        let (raw_tx_record, _rx_record) = unbounded();
+        let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
+        let (tx_update, _rx_update) = unbounded();
+        let next_doc_id = AtomicU64::new(1);
+        let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
+        let skipped = AtomicUsize::new(0);
+
+        let parse_result = parse_claude_file(
+            &task,
+            false,
+            &tx_record,
+            &tx_update,
+            &next_doc_id,
+            &progress,
+        );
+        finish_file_task(&task, &progress, &skipped, parse_result)
+            .expect("removed transcript should be skipped");
+
+        assert_eq!(skipped.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2781,8 +2884,8 @@ mod tests {
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
         let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, 0, meta.len()],
-            [0, 0, 0, 0, 0, 0, 0, 1],
+            [0, 0, 0, 0, 0, 0, meta.len()],
+            [0, 0, 0, 0, 0, 0, 1],
             false,
         ));
 
