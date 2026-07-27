@@ -155,6 +155,29 @@ fn prepare_file_task(
         .unwrap_or_else(|| size.min(FILE_IDENTITY_PREFIX_BYTES as u64))
         .min(size) as usize;
     let identity = file_identity(&path, metadata, prefix_bytes);
+    prepare_file_task_from_snapshot(
+        path,
+        source,
+        include_reasoning,
+        size,
+        mtime,
+        identity,
+        previous,
+        force_replay,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_file_task_from_snapshot(
+    path: PathBuf,
+    source: SourceKind,
+    include_reasoning: bool,
+    size: u64,
+    mtime: i64,
+    identity: FileIdentity,
+    previous: Option<&FileState>,
+    force_replay: bool,
+) -> (FileTask, bool) {
     let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
     let parser_version_invalidated =
         previous.is_some_and(|previous| previous.parser_version != parser_version);
@@ -233,6 +256,35 @@ fn prepare_file_task(
         },
         skip,
     )
+}
+
+fn prepare_opencode_task(
+    path: PathBuf,
+    include_reasoning: bool,
+    previous: Option<&FileState>,
+    force_replay: bool,
+) -> Result<(FileTask, bool)> {
+    let (size, mtime, modified_ns, fingerprint) =
+        crate::sources::opencode::session_dependency_fingerprint(&path)?;
+    let identity = FileIdentity {
+        device: None,
+        inode: None,
+        prefix_sha256: Some(fingerprint),
+        // A sentinel keeps aggregate dependency fingerprints comparable even when total bytes
+        // change; this is not a literal file prefix length.
+        prefix_bytes: u64::MAX,
+        modified_ns: Some(modified_ns),
+    };
+    Ok(prepare_file_task_from_snapshot(
+        path,
+        SourceKind::Opencode,
+        include_reasoning,
+        size,
+        mtime,
+        identity,
+        previous,
+        force_replay,
+    ))
 }
 
 fn discovered_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
@@ -569,14 +621,12 @@ pub fn ingest_all(
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
             discovered_paths.insert(key.clone());
-            let (task, skip) = prepare_file_task(
+            let (task, skip) = prepare_opencode_task(
                 path,
-                SourceKind::Opencode,
                 options.include_reasoning,
-                &meta,
                 state.files.get(&key),
                 catalog_needs_rebuild || incomplete_paths.contains(&key),
-            );
+            )?;
             if skip {
                 files_skipped += 1;
                 continue;
@@ -976,16 +1026,17 @@ fn vector_index_covers_embedding_documents(
     index: &SearchIndex,
     vector_index: &crate::vector::VectorIndex,
 ) -> Result<bool> {
-    let mut records = Vec::new();
-    index.for_each_record(|record| {
-        records.push(record);
-        Ok(())
-    })?;
-    Ok(
-        crate::embedding_documents::build_embedding_documents(records)
-            .iter()
-            .all(|document| vector_index.contains(document.vector_id)),
-    )
+    if !index.catalog_path().exists() {
+        return Ok(false);
+    }
+    let catalog = crate::catalog::CatalogStore::open_read_only(index.catalog_path())?;
+    let vector_ids = catalog.embedding_vector_ids()?;
+    if vector_ids.is_empty() {
+        return Ok(!catalog.has_embeddable_records()?);
+    }
+    Ok(vector_ids
+        .into_iter()
+        .all(|vector_id| vector_index.contains(vector_id)))
 }
 
 fn remove_vectors_for_source_paths(
@@ -1098,12 +1149,13 @@ fn writer_loop(
         }
     }
 
+    let affected_session_keys = analytics.affected_session_keys();
     analytics.flush()?;
     writer.commit()?;
     if embeddings {
-        let report = crate::embedding_documents::synchronize(
-            &index,
+        let report = crate::embedding_documents::synchronize_sessions(
             &analytics_path,
+            &affected_session_keys,
             vector_index.as_mut().unwrap(),
             embedder.as_mut().unwrap(),
             Some(&progress),
@@ -1726,6 +1778,50 @@ mod tests {
             .expect("removed transcript should be skipped");
 
         assert_eq!(skipped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn opencode_part_only_update_forces_session_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = temp.path().join("storage");
+        let session_dir = storage.join("message/ses_test");
+        let part_dir = storage.join("part/msg_test");
+        fs::create_dir_all(&session_dir).expect("message directory");
+        fs::create_dir_all(&part_dir).expect("part directory");
+        fs::write(
+            session_dir.join("msg_test.json"),
+            r#"{"id":"msg_test","role":"assistant","time":{"created":10}}"#,
+        )
+        .expect("message");
+        let part_path = part_dir.join("01-tool.json");
+        fs::write(
+            &part_path,
+            r#"{"type":"tool","callID":"call-1","state":{"status":"running"}}"#,
+        )
+        .expect("running part");
+
+        let (first, skip) =
+            prepare_opencode_task(session_dir.clone(), false, None, false).expect("first task");
+        assert!(!skip);
+        let previous =
+            completed_file_state(&first, 0, 3, HashMap::new(), ParserStreamState::default());
+        let (_, unchanged) =
+            prepare_opencode_task(session_dir.clone(), false, Some(&previous), false)
+                .expect("unchanged task");
+        assert!(unchanged);
+
+        fs::write(
+            part_path,
+            r#"{"type":"tool","callID":"call-1","state":{"status":"completed","output":"done"}}"#,
+        )
+        .expect("completed part");
+        let (replay, skip) = prepare_opencode_task(session_dir, false, Some(&previous), false)
+            .expect("updated task");
+
+        assert!(!skip);
+        assert!(replay.delete_first);
+        assert_eq!(replay.offset, 0);
+        assert_eq!(replay.turn_id, 0);
     }
 
     #[test]
@@ -2832,6 +2928,17 @@ mod tests {
             ],
         );
         save_embedding_vectors(&paths, &index, "bge", 384, Some(1));
+        let options = ingest_options(true, ModelChoice::BGESmall);
+
+        assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
+    }
+
+    #[test]
+    fn cannot_skip_noop_index_without_embedding_projection_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        let index = save_search_records(&paths, &[record(1, "user", "needs projection")]);
+        save_vector_store(&paths, "bge", 384);
         let options = ingest_options(true, ModelChoice::BGESmall);
 
         assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());

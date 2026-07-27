@@ -98,6 +98,78 @@ pub fn synchronize(
     Ok(report)
 }
 
+pub fn synchronize_sessions(
+    catalog_path: &Path,
+    affected_session_keys: &[String],
+    vector_index: &mut crate::vector::VectorIndex,
+    embedder: &mut crate::embed::EmbedderHandle,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<EmbeddingSyncReport> {
+    if affected_session_keys.is_empty() {
+        return Ok(EmbeddingSyncReport::default());
+    }
+    let mut catalog = crate::catalog::CatalogStore::open(catalog_path)?;
+    let old_vector_ids: HashSet<u64> = catalog
+        .embedding_vector_ids_for_session_keys(affected_session_keys)?
+        .into_iter()
+        .collect();
+    let records = catalog.records_for_session_keys(affected_session_keys)?;
+    let documents = build_embedding_documents(records);
+    let new_vector_ids: HashSet<u64> = documents
+        .iter()
+        .map(|document| document.vector_id)
+        .collect();
+    let removed = vector_index.remove_many(old_vector_ids.difference(&new_vector_ids).copied())?;
+    if removed > 0 {
+        // Persist eviction before deleting its durable mirror identity.
+        vector_index.save()?;
+    }
+    catalog.replace_embedding_documents_for_sessions(affected_session_keys, &documents)?;
+    embed_pending_documents(documents, removed, vector_index, embedder, progress)
+}
+
+fn embed_pending_documents(
+    documents: Vec<EmbeddingDocument>,
+    removed: usize,
+    vector_index: &mut crate::vector::VectorIndex,
+    embedder: &mut crate::embed::EmbedderHandle,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<EmbeddingSyncReport> {
+    let pending: Vec<&EmbeddingDocument> = documents
+        .iter()
+        .filter(|document| !vector_index.contains(document.vector_id))
+        .collect();
+    if let Some(progress) = progress {
+        for document in &pending {
+            progress.add_embed_total(document.source, 1);
+            progress.add_embed_pending(document.source, 1);
+        }
+    }
+    let mut report = EmbeddingSyncReport {
+        documents: documents.len(),
+        removed,
+        ..EmbeddingSyncReport::default()
+    };
+    for batch in pending.chunks(64) {
+        let texts: Vec<&str> = batch
+            .iter()
+            .map(|document| document.content.as_str())
+            .collect();
+        let embeddings = embedder.embed_texts(&texts)?;
+        for (document, embedding) in batch.iter().zip(embeddings.iter()) {
+            vector_index.add(document.vector_id, embedding)?;
+            report.embedded += 1;
+            report.embedded_by_source[document.source.idx()] += 1;
+            if let Some(progress) = progress {
+                progress.sub_embed_pending(document.source, 1);
+                progress.add_embedded(document.source, 1);
+            }
+        }
+    }
+    vector_index.save()?;
+    Ok(report)
+}
+
 pub fn build_embedding_documents(mut records: Vec<Record>) -> Vec<EmbeddingDocument> {
     records.sort_by(|left, right| {
         (
@@ -364,5 +436,50 @@ mod tests {
 
         assert_eq!(first[0].embedding_key, second[0].embedding_key);
         assert_eq!(first[0].vector_id, second[0].vector_id);
+    }
+
+    #[test]
+    fn session_projection_replacement_preserves_unaffected_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("catalog.sqlite");
+        let mut writer = crate::analytics::AnalyticsWriter::open(&path).unwrap();
+        let mut records = Vec::new();
+        for (doc_id, session_id) in [(1, "session-a"), (2, "session-b")] {
+            let mut record = record(doc_id, "assistant", session_id);
+            record.session_id = session_id.to_string();
+            record.source_path = format!("/tmp/{session_id}.jsonl");
+            record.record_key = format!("rk-{session_id}");
+            writer.record(&record).unwrap();
+            records.push(record);
+        }
+        writer.flush().unwrap();
+        drop(writer);
+        let mut catalog = crate::catalog::CatalogStore::open(&path).unwrap();
+        let documents = build_embedding_documents(records);
+        catalog.replace_embedding_documents(&documents).unwrap();
+        let session_a =
+            crate::catalog::session_key(SourceKind::Codex, "session-a", "/tmp/session-a.jsonl");
+        let session_b =
+            crate::catalog::session_key(SourceKind::Codex, "session-b", "/tmp/session-b.jsonl");
+        let session_b_ids = catalog
+            .embedding_vector_ids_for_session_keys(std::slice::from_ref(&session_b))
+            .unwrap();
+
+        catalog
+            .replace_embedding_documents_for_sessions(std::slice::from_ref(&session_a), &[])
+            .unwrap();
+
+        assert!(
+            catalog
+                .embedding_vector_ids_for_session_keys(&[session_a])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            catalog
+                .embedding_vector_ids_for_session_keys(&[session_b])
+                .unwrap(),
+            session_b_ids
+        );
     }
 }

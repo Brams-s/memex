@@ -26,6 +26,7 @@ pub struct SessionRow {
     pub project: String,
     pub display_project: String,
     pub cwd: Option<String>,
+    pub started_at: u64,
     pub last_at: u64,
     pub message_count: u64,
 }
@@ -41,6 +42,7 @@ pub struct AnalyticsWriter {
     git_cache: HashMap<String, GitMetadata>,
     catalog_batch_open: bool,
     catalog_batch_records: usize,
+    affected_session_keys: HashSet<String>,
     bulk_load: bool,
 }
 
@@ -507,7 +509,7 @@ impl AnalyticsStore {
         let mut sql = String::from(
             "SELECT source, session_id, source_path, project,
                     COALESCE(NULLIF(repo_project, ''), project) AS display_project,
-                    cwd, last_at, message_count
+                    cwd, started_at, last_at, message_count
              FROM sessions",
         );
         let mut clauses = Vec::new();
@@ -565,8 +567,9 @@ impl AnalyticsStore {
                 project,
                 display_project,
                 cwd: row.get(5)?,
-                last_at: row.get::<_, i64>(6)?.max(0) as u64,
-                message_count: row.get::<_, i64>(7)?.max(0) as u64,
+                started_at: row.get::<_, i64>(6)?.max(0) as u64,
+                last_at: row.get::<_, i64>(7)?.max(0) as u64,
+                message_count: row.get::<_, i64>(8)?.max(0) as u64,
             })
         })?;
 
@@ -774,6 +777,43 @@ impl AnalyticsStore {
         }
         Ok(projects)
     }
+
+    pub fn session_by_key(&self, session_key: &str) -> Result<Option<SessionRow>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT source, session_id, source_path, project, cwd,
+                       started_at, last_at, message_count
+                FROM sessions
+                WHERE session_key = ?1
+                "#,
+                params![session_key],
+                |row| {
+                    let source_label: String = row.get(0)?;
+                    let source = SourceKind::from_label(&source_label).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            format!("unknown source label: {source_label}").into(),
+                        )
+                    })?;
+                    let project: String = row.get(3)?;
+                    Ok(SessionRow {
+                        source,
+                        session_id: row.get(1)?,
+                        source_path: row.get(2)?,
+                        display_project: display_project_name(&project),
+                        project,
+                        cwd: row.get(4)?,
+                        started_at: row.get::<_, i64>(5)?.max(0) as u64,
+                        last_at: row.get::<_, i64>(6)?.max(0) as u64,
+                        message_count: row.get::<_, i64>(7)?.max(0) as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
 }
 
 impl AnalyticsWriter {
@@ -799,6 +839,7 @@ impl AnalyticsWriter {
             git_cache: HashMap::new(),
             catalog_batch_open: false,
             catalog_batch_records: 0,
+            affected_session_keys: HashSet::new(),
             bulk_load,
         })
     }
@@ -808,8 +849,21 @@ impl AnalyticsWriter {
         crate::catalog::clear(&self.store.conn)
     }
 
+    pub fn affected_session_keys(&self) -> Vec<String> {
+        self.affected_session_keys.iter().cloned().collect()
+    }
+
     pub fn delete_source_path(&mut self, source_path: &str) -> Result<()> {
         self.begin_catalog_batch()?;
+        {
+            let mut statement = self.store.conn.prepare_cached(
+                "SELECT DISTINCT session_key FROM records WHERE source_path = ?1",
+            )?;
+            let rows = statement.query_map(params![source_path], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                self.affected_session_keys.insert(row?);
+            }
+        }
         self.store.delete_source_path(source_path)
     }
 
@@ -837,6 +891,7 @@ impl AnalyticsWriter {
             session_id: canonical_record.session_id.clone(),
             source_path: canonical_record.source_path.clone(),
         };
+        self.affected_session_keys.insert(key.stable_key.clone());
         let entry = self
             .sessions
             .entry(key.clone())
@@ -957,9 +1012,16 @@ impl AnalyticsWriter {
     }
 
     fn link_catalog_relations(&mut self) -> Result<()> {
+        if self.affected_session_keys.is_empty() {
+            return Ok(());
+        }
         let tx = self.store.conn.transaction()?;
-        crate::catalog::link_relations(&tx)?;
+        crate::catalog::link_relations_for_sessions(
+            &tx,
+            self.affected_session_keys.iter().map(String::as_str),
+        )?;
         tx.commit()?;
+        self.affected_session_keys.clear();
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use crate::types::{Record, RecordLinks, SourceFilter};
+use crate::types::{Record, RecordLinks, SourceFilter, SourceKind};
 use anyhow::{Result, anyhow};
 use std::ops::Bound;
 use std::path::Path;
@@ -300,6 +300,59 @@ impl SearchIndex {
         Ok((records, total))
     }
 
+    pub fn records_by_canonical_session_page(
+        &self,
+        source: SourceKind,
+        session_id: &str,
+        source_path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<Record>, usize)> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let identity_term = if session_id.is_empty() {
+            Term::from_field_text(self.fields.source_path, source_path)
+        } else {
+            Term::from_field_text(self.fields.session_id, session_id)
+        };
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(
+            Occur::Must,
+            Box::new(TermQuery::new(identity_term, IndexRecordOption::Basic)),
+        )];
+        if let Some(source_field) = self.fields.source {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(source_field, source.storage_label()),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        let query = BooleanQuery::new(clauses);
+        let total = searcher.search(&query, &Count)?;
+        if offset >= total {
+            return Ok((Vec::new(), total));
+        }
+        let page_limit = limit.max(1).min(total - offset);
+        let collector = TopDocs::with_limit(page_limit)
+            .and_offset(offset)
+            .order_by_fast_field::<u64>("turn_id", Order::Asc);
+        let top_docs: Vec<(u64, tantivy::DocAddress)> = searcher.search(&query, &collector)?;
+        let mut records = Vec::with_capacity(top_docs.len());
+        let catalog = self.catalog_reader();
+        for (_turn_id, addr) in top_docs {
+            let doc = searcher.doc::<TantivyDocument>(addr)?;
+            records.push(record_from_doc(&self.fields, &doc, catalog.as_ref())?);
+        }
+        records.sort_by(|a, b| {
+            a.turn_id
+                .cmp(&b.turn_id)
+                .then_with(|| a.ts.cmp(&b.ts))
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        });
+        Ok((records, total))
+    }
+
     pub fn recent_records(&self, limit: usize) -> Result<Vec<Record>> {
         self.recent_records_filtered(limit, None, None)
     }
@@ -369,6 +422,10 @@ impl SearchIndex {
     pub fn doc_count(&self) -> Result<usize> {
         let reader = self.reader()?;
         Ok(reader.searcher().num_docs() as usize)
+    }
+
+    pub fn catalog_path(&self) -> &Path {
+        &self.catalog_path
     }
 
     pub fn for_each_record<F>(&self, mut f: F) -> Result<()>

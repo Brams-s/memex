@@ -238,7 +238,7 @@ impl Record {
 
     pub fn computed_record_key(&self) -> String {
         let mut hasher = Sha256::new();
-        hash_identity_part(&mut hasher, "version", "1");
+        hash_identity_part(&mut hasher, "version", "2");
         hash_identity_part(&mut hasher, "source", self.source.storage_label());
         hash_identity_part(
             &mut hasher,
@@ -250,18 +250,55 @@ impl Record {
             },
         );
 
-        let native_id = self
-            .links
-            .event_id
-            .as_deref()
-            .or(self.links.source_tool_use_id.as_deref())
-            .or(self.links.source_tool_assistant_uuid.as_deref())
-            .or(self.links.parent_tool_use_id.as_deref());
+        // A parent tool ID identifies the relationship, not the result event itself. Falling
+        // back to it would collapse multiple lifecycle/result updates for one call.
+        let native_id = self.links.event_id.as_deref().or_else(|| {
+            (self.role == "tool_use")
+                .then_some(self.links.source_tool_use_id.as_deref())
+                .flatten()
+        });
         if let Some(native_id) = native_id {
             hash_identity_part(&mut hasher, "native", native_id);
         } else {
             hash_identity_part(&mut hasher, "path", &self.source_path);
             hash_identity_part(&mut hasher, "turn", &self.turn_id.to_string());
+            hash_identity_part(
+                &mut hasher,
+                "source_tool_use_id",
+                self.links.source_tool_use_id.as_deref().unwrap_or(""),
+            );
+            hash_identity_part(
+                &mut hasher,
+                "parent_tool_use_id",
+                self.links.parent_tool_use_id.as_deref().unwrap_or(""),
+            );
+            hash_identity_part(
+                &mut hasher,
+                "message_ordinal",
+                &self
+                    .links
+                    .message_ordinal
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            );
+            hash_identity_part(
+                &mut hasher,
+                "call_index",
+                &self
+                    .links
+                    .call_index
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            );
+            hash_identity_part(
+                &mut hasher,
+                "event_index",
+                &self
+                    .links
+                    .event_index
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            );
         }
 
         hash_identity_part(&mut hasher, "role", &self.role);
@@ -270,20 +307,19 @@ impl Record {
             "subtype",
             self.tool_name.as_deref().unwrap_or(""),
         );
-        hash_identity_part(
-            &mut hasher,
-            "source_tool_use_id",
-            self.links.source_tool_use_id.as_deref().unwrap_or(""),
-        );
-        hash_identity_part(
-            &mut hasher,
-            "parent_tool_use_id",
-            self.links.parent_tool_use_id.as_deref().unwrap_or(""),
-        );
+        format!("rk2_{:x}", hasher.finalize())
+    }
 
-        // This final deterministic suffix distinguishes repeated blocks emitted from one
-        // source-native event and deliberately collapses exact duplicate projections.
+    pub fn computed_content_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hash_identity_part(&mut hasher, "version", "1");
+        hash_identity_part(&mut hasher, "role", &self.role);
         hash_identity_part(&mut hasher, "text", &self.text);
+        hash_identity_part(
+            &mut hasher,
+            "tool_name",
+            self.tool_name.as_deref().unwrap_or(""),
+        );
         hash_identity_part(
             &mut hasher,
             "tool_input",
@@ -294,7 +330,17 @@ impl Record {
             "tool_output",
             self.tool_output.as_deref().unwrap_or(""),
         );
-        format!("rk1_{:x}", hasher.finalize())
+        hash_identity_part(
+            &mut hasher,
+            "status",
+            self.links.status.as_deref().unwrap_or(""),
+        );
+        hash_identity_part(
+            &mut hasher,
+            "source_status",
+            self.links.source_status.as_deref().unwrap_or(""),
+        );
+        format!("ch1_{:x}", hasher.finalize())
     }
 }
 
@@ -359,16 +405,35 @@ mod tests {
         let rebuilt = record(999, "/moved/session.jsonl");
 
         assert_eq!(first.computed_record_key(), rebuilt.computed_record_key());
-        assert!(first.computed_record_key().starts_with("rk1_"));
+        assert!(first.computed_record_key().starts_with("rk2_"));
     }
 
     #[test]
-    fn record_key_distinguishes_changed_projection_content() {
+    fn record_key_is_independent_of_projection_content() {
         let first = record(1, "/session.jsonl");
         let mut changed = first.clone();
         changed.text = "different projected content".to_string();
+        changed.tool_input = Some("corrected input".to_string());
+        changed.tool_output = Some("corrected output".to_string());
 
-        assert_ne!(first.computed_record_key(), changed.computed_record_key());
+        assert_eq!(first.computed_record_key(), changed.computed_record_key());
+        assert_ne!(
+            first.computed_content_hash(),
+            changed.computed_content_hash()
+        );
+    }
+
+    #[test]
+    fn result_updates_do_not_use_the_parent_call_as_their_identity() {
+        let mut first = record(1, "/session.jsonl");
+        first.role = "tool_result".to_string();
+        first.links.event_id = None;
+        first.links.parent_tool_use_id = Some("call-1".to_string());
+        first.turn_id = 4;
+        let mut second = first.clone();
+        second.turn_id = 5;
+
+        assert_ne!(first.computed_record_key(), second.computed_record_key());
     }
 
     #[test]

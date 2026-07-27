@@ -6,7 +6,7 @@ use std::io::Cursor;
 use std::path::Path;
 use std::time::Duration;
 
-const CATALOG_SCHEMA_VERSION: i64 = 9;
+const CATALOG_SCHEMA_VERSION: i64 = 10;
 const INLINE_BODY_BYTES: usize = 4 * 1024;
 
 pub struct CatalogStore {
@@ -132,6 +132,64 @@ impl CatalogStore {
             .collect()
     }
 
+    pub fn has_embeddable_records(&self) -> Result<bool> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM records AS record
+                    JOIN messages AS message ON message.record_id = record.record_id
+                    WHERE record.role IN ('user', 'assistant')
+                      AND (
+                          message.content_blob_hash IS NOT NULL
+                          OR length(trim(COALESCE(message.content_inline, ''))) > 0
+                      )
+                )
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn embedding_vector_ids_for_session_keys(
+        &self,
+        session_keys: &[String],
+    ) -> Result<Vec<u64>> {
+        let mut ids = Vec::new();
+        let mut statement = self
+            .conn
+            .prepare("SELECT vector_id FROM embedding_documents WHERE session_key = ?1")?;
+        for session_key in session_keys {
+            let rows = statement.query_map(params![session_key], |row| row.get::<_, i64>(0))?;
+            for row in rows {
+                ids.push(from_sql_u64(row?));
+            }
+        }
+        Ok(ids)
+    }
+
+    pub fn records_for_session_keys(&self, session_keys: &[String]) -> Result<Vec<Record>> {
+        let mut record_keys = Vec::new();
+        let mut statement = self.conn.prepare(
+            "SELECT record_key
+             FROM records
+             WHERE session_key = ?1
+             ORDER BY occurred_at, source_order, record_id",
+        )?;
+        for session_key in session_keys {
+            let rows = statement.query_map(params![session_key], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                record_keys.push(row?);
+            }
+        }
+        record_keys
+            .iter()
+            .filter_map(|key| self.record_by_key(key).transpose())
+            .collect()
+    }
+
     pub fn replace_embedding_documents(
         &mut self,
         documents: &[crate::embedding_documents::EmbeddingDocument],
@@ -168,6 +226,56 @@ impl CatalogStore {
         transaction.commit()?;
         Ok(())
     }
+
+    pub fn replace_embedding_documents_for_sessions(
+        &mut self,
+        session_keys: &[String],
+        documents: &[crate::embedding_documents::EmbeddingDocument],
+    ) -> Result<()> {
+        let transaction = self.conn.transaction()?;
+        {
+            let mut delete =
+                transaction.prepare("DELETE FROM embedding_documents WHERE session_key = ?1")?;
+            for session_key in session_keys {
+                delete.execute(params![session_key])?;
+            }
+        }
+        insert_embedding_documents(&transaction, documents)?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+fn insert_embedding_documents(
+    conn: &Connection,
+    documents: &[crate::embedding_documents::EmbeddingDocument],
+) -> Result<()> {
+    let mut insert = conn.prepare(
+        r#"
+        INSERT INTO embedding_documents(
+            embedding_key, vector_id, session_key, role, anchor_record_key,
+            start_record_key, end_record_key, chunk_index, start_offset,
+            end_offset, content_hash
+        )
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )?;
+    for document in documents {
+        insert.execute(params![
+            document.embedding_key,
+            to_sql_u64(document.vector_id),
+            document.session_key,
+            document.role,
+            document.anchor_record_key,
+            document.start_record_key,
+            document.end_record_key,
+            document.chunk_index as i64,
+            document.start_offset.min(i64::MAX as usize) as i64,
+            document.end_offset.min(i64::MAX as usize) as i64,
+            document.content_hash,
+        ])?;
+    }
+    Ok(())
 }
 
 pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
@@ -196,6 +304,7 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS records (
             record_id INTEGER PRIMARY KEY,
             record_key TEXT NOT NULL UNIQUE,
+            content_hash TEXT NOT NULL,
             doc_id INTEGER NOT NULL UNIQUE,
             entity_type TEXT NOT NULL,
             source TEXT NOT NULL,
@@ -263,6 +372,8 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
             call_index INTEGER,
             source_tool_use_id TEXT,
             category TEXT,
+            status TEXT,
+            source_status TEXT,
             skill_name TEXT,
             file_path TEXT,
             subagent_session_id TEXT,
@@ -528,7 +639,8 @@ fn upsert_record_with_relations(
         .prepare_cached(
             r#"
         INSERT INTO records(
-            record_key, doc_id, entity_type, source, source_path, session_key, session_id,
+            record_key, content_hash, doc_id, entity_type, source, source_path,
+            session_key, session_id,
             occurred_at, source_order, message_ordinal, role, tool_name,
             event_id, parent_event_id,
             logical_parent_event_id, parent_session_id, thread_source, conversation_kind,
@@ -537,9 +649,10 @@ fn upsert_record_with_relations(
         )
         VALUES(
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19, ?20, ?21, ?22
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
         )
         ON CONFLICT(record_key) DO UPDATE SET
+            content_hash = excluded.content_hash,
             doc_id = excluded.doc_id,
             entity_type = excluded.entity_type,
             source = excluded.source,
@@ -567,6 +680,7 @@ fn upsert_record_with_relations(
         .query_row(
             params![
                 record.record_key,
+                record.computed_content_hash(),
                 to_sql_u64(record.doc_id),
                 entity_type,
                 record.source.storage_label(),
@@ -811,11 +925,12 @@ fn upsert_tool_call(
         r#"
         INSERT INTO tool_calls(
             record_id, message_identity, message_record_id, owner_link_status,
-            call_index, source_tool_use_id, category, skill_name, file_path,
+            call_index, source_tool_use_id, category, status, source_status,
+            skill_name, file_path,
             subagent_session_id,
             input_inline, input_blob_hash, search_text_inline, search_text_blob_hash
         )
-        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(record_id) DO UPDATE SET
             message_identity = excluded.message_identity,
             message_record_id = excluded.message_record_id,
@@ -823,6 +938,8 @@ fn upsert_tool_call(
             call_index = excluded.call_index,
             source_tool_use_id = excluded.source_tool_use_id,
             category = excluded.category,
+            status = excluded.status,
+            source_status = excluded.source_status,
             skill_name = excluded.skill_name,
             file_path = excluded.file_path,
             subagent_session_id = excluded.subagent_session_id,
@@ -840,6 +957,8 @@ fn upsert_tool_call(
         record.links.call_index.map(i64::from),
         source_tool_use_id,
         category,
+        record.links.status,
+        record.links.source_status,
         skill_name,
         file_path,
         subagent_session_id,
@@ -1005,6 +1124,42 @@ fn link_interactions(conn: &Connection) -> Result<()> {
 pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+        DROP TABLE IF EXISTS temp.affected_sessions;
+        CREATE TEMP TABLE affected_sessions (
+            session_key TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
+        INSERT INTO affected_sessions(session_key)
+        SELECT DISTINCT session_key FROM records;
+        "#,
+    )?;
+    link_relations_in_affected_sessions(conn)
+}
+
+pub(crate) fn link_relations_for_sessions<'a>(
+    conn: &Connection,
+    session_keys: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS temp.affected_sessions;
+        CREATE TEMP TABLE affected_sessions (
+            session_key TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
+        "#,
+    )?;
+    {
+        let mut insert =
+            conn.prepare_cached("INSERT OR IGNORE INTO affected_sessions(session_key) VALUES(?1)")?;
+        for session_key in session_keys {
+            insert.execute(params![session_key])?;
+        }
+    }
+    link_relations_in_affected_sessions(conn)
+}
+
+fn link_relations_in_affected_sessions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
         DROP TABLE IF EXISTS temp.message_entity_links;
         CREATE TEMP TABLE message_entity_links (
             child_id INTEGER PRIMARY KEY,
@@ -1013,16 +1168,24 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         INSERT INTO message_entity_links(child_id, message_id)
         SELECT child.record_id, MIN(parent.record_id)
         FROM thinking AS child
+        JOIN records AS child_record ON child_record.record_id = child.record_id
+        JOIN affected_sessions AS affected
+          ON affected.session_key = child_record.session_key
         JOIN messages AS parent
-          ON parent.message_identity = child.message_identity
+          ON parent.session_key = child_record.session_key
+         AND parent.message_identity = child.message_identity
         WHERE child.message_record_id IS NULL
           AND child.message_identity IS NOT NULL
         GROUP BY child.record_id
         UNION ALL
         SELECT child.record_id, MIN(parent.record_id)
         FROM tool_calls AS child
+        JOIN records AS child_record ON child_record.record_id = child.record_id
+        JOIN affected_sessions AS affected
+          ON affected.session_key = child_record.session_key
         JOIN messages AS parent
-          ON parent.message_identity = child.message_identity
+          ON parent.session_key = child_record.session_key
+         AND parent.message_identity = child.message_identity
         WHERE child.message_record_id IS NULL
           AND child.message_identity IS NOT NULL
         GROUP BY child.record_id;
@@ -1030,6 +1193,8 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         SELECT child.record_id, MIN(parent.record_id)
         FROM thinking AS child
         JOIN records AS child_record ON child_record.record_id = child.record_id
+        JOIN affected_sessions AS affected
+          ON affected.session_key = child_record.session_key
         JOIN messages AS parent
           ON parent.session_key = child_record.session_key
          AND parent.ordinal = child_record.message_ordinal
@@ -1040,6 +1205,8 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         SELECT child.record_id, MIN(parent.record_id)
         FROM tool_calls AS child
         JOIN records AS child_record ON child_record.record_id = child.record_id
+        JOIN affected_sessions AS affected
+          ON affected.session_key = child_record.session_key
         JOIN messages AS parent
           ON parent.session_key = child_record.session_key
          AND parent.ordinal = child_record.message_ordinal
@@ -1068,7 +1235,12 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
             ) THEN 'source_ordinal_unmatched'
             ELSE 'source_identity_missing'
         END
-        WHERE owner_link_status <> CASE
+        WHERE record_id IN (
+            SELECT record.record_id
+            FROM records AS record
+            JOIN affected_sessions AS affected USING(session_key)
+        )
+          AND owner_link_status <> CASE
             WHEN message_record_id IS NOT NULL THEN 'linked'
             WHEN message_identity IS NOT NULL THEN 'source_identity_unmatched'
             WHEN EXISTS (
@@ -1091,7 +1263,12 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
             ) THEN 'source_ordinal_unmatched'
             ELSE 'source_identity_missing'
         END
-        WHERE owner_link_status <> CASE
+        WHERE record_id IN (
+            SELECT record.record_id
+            FROM records AS record
+            JOIN affected_sessions AS affected USING(session_key)
+        )
+          AND owner_link_status <> CASE
             WHEN message_record_id IS NOT NULL THEN 'linked'
             WHEN message_identity IS NOT NULL THEN 'source_identity_unmatched'
             WHEN EXISTS (
@@ -1115,6 +1292,7 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         SELECT record.session_key, call.source_tool_use_id, MIN(call.record_id)
         FROM tool_calls AS call
         JOIN records AS record ON record.record_id = call.record_id
+        JOIN affected_sessions AS affected USING(session_key)
         WHERE call.source_tool_use_id IS NOT NULL
         GROUP BY record.session_key, call.source_tool_use_id;
 
@@ -1127,6 +1305,7 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         SELECT result.record_id, call.call_id
         FROM tool_results AS result
         JOIN records AS record ON record.record_id = result.record_id
+        JOIN affected_sessions AS affected USING(session_key)
         JOIN tool_call_identity_links AS call
           ON call.session_key = record.session_key
          AND call.source_tool_use_id = result.source_tool_use_id
@@ -1143,7 +1322,12 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
             WHEN source_tool_use_id IS NOT NULL THEN 'source_identity_unmatched'
             ELSE 'source_identity_missing'
         END
-        WHERE call_link_status <> CASE
+        WHERE record_id IN (
+            SELECT record.record_id
+            FROM records AS record
+            JOIN affected_sessions AS affected USING(session_key)
+        )
+          AND call_link_status <> CASE
             WHEN tool_call_record_id IS NOT NULL THEN 'linked'
             WHEN source_tool_use_id IS NOT NULL THEN 'source_identity_unmatched'
             ELSE 'source_identity_missing'
@@ -1164,6 +1348,7 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
                ) - 1
         FROM tool_calls AS call
         JOIN records AS record ON record.record_id = call.record_id
+        JOIN affected_sessions AS affected USING(session_key)
         WHERE call.message_record_id IS NOT NULL;
         UPDATE tool_calls AS call
         SET call_index = ordinal.call_index
@@ -1185,6 +1370,7 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
                ) - 1
         FROM tool_results AS result
         JOIN records AS record ON record.record_id = result.record_id
+        JOIN affected_sessions AS affected USING(session_key)
         WHERE result.tool_call_record_id IS NOT NULL;
         UPDATE tool_results AS result
         SET event_index = ordinal.event_index
@@ -1196,6 +1382,9 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         UPDATE records AS child_record
         SET interaction_id = owner_record.interaction_id
         FROM thinking AS child
+        JOIN records AS affected_record ON affected_record.record_id = child.record_id
+        JOIN affected_sessions AS affected
+          ON affected.session_key = affected_record.session_key
         JOIN records AS owner_record
           ON owner_record.record_id = child.message_record_id
         WHERE child_record.record_id = child.record_id
@@ -1204,6 +1393,9 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         UPDATE records AS child_record
         SET interaction_id = owner_record.interaction_id
         FROM tool_calls AS child
+        JOIN records AS affected_record ON affected_record.record_id = child.record_id
+        JOIN affected_sessions AS affected
+          ON affected.session_key = affected_record.session_key
         JOIN records AS owner_record
           ON owner_record.record_id = child.message_record_id
         WHERE child_record.record_id = child.record_id
@@ -1212,12 +1404,16 @@ pub(crate) fn link_relations(conn: &Connection) -> Result<()> {
         UPDATE records AS result_record
         SET interaction_id = call_record.interaction_id
         FROM tool_results AS result
+        JOIN records AS affected_record ON affected_record.record_id = result.record_id
+        JOIN affected_sessions AS affected
+          ON affected.session_key = affected_record.session_key
         JOIN records AS call_record
           ON call_record.record_id = result.tool_call_record_id
         WHERE result_record.record_id = result.record_id
           AND result_record.interaction_id IS NULL
           AND call_record.interaction_id IS NOT NULL;
 
+        DROP TABLE temp.affected_sessions;
         "#,
     )?;
     Ok(())
@@ -1237,7 +1433,8 @@ fn record_by_key(conn: &Connection, record_key: &str) -> Result<Option<Record>> 
                    record.source_tool_use_id, record.source_tool_assistant_uuid,
                    COALESCE(record.message_ordinal, message.ordinal),
                    call.call_index, result.event_index,
-                   result.status, result.source_status, message.model,
+                   COALESCE(result.status, call.status),
+                   COALESCE(result.source_status, call.source_status), message.model,
                    message.input_tokens, message.cache_read_tokens, message.cache_write_tokens,
                    message.output_tokens, message.reasoning_tokens,
                    call.skill_name, call.file_path,
@@ -1659,7 +1856,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = CatalogStore::open(tmp.path().join("catalog.sqlite")).expect("catalog");
         seed_session(&store.conn);
-        let original = record("tool_use", "{\"path\":\"Cargo.toml\"}".to_string());
+        let mut original = record("tool_use", "{\"path\":\"Cargo.toml\"}".to_string());
+        original.links.status = Some("pending".to_string());
+        original.links.source_status = Some("in_progress".to_string());
 
         upsert_record(&store.conn, &original).expect("insert");
         let hydrated = store
@@ -1669,6 +1868,8 @@ mod tests {
 
         assert_eq!(hydrated.text, original.text);
         assert_eq!(hydrated.tool_input.as_deref(), Some(original.text.as_str()));
+        assert_eq!(hydrated.links.status.as_deref(), Some("pending"));
+        assert_eq!(hydrated.links.source_status.as_deref(), Some("in_progress"));
         let stored_copies: i64 = store
             .conn
             .query_row(
@@ -1827,6 +2028,60 @@ mod tests {
         assert_eq!(message_key.as_deref(), Some("rk-message"));
         assert_eq!(tool_call_key.as_deref(), Some("rk-call"));
         assert_eq!(result_interaction.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn incremental_relation_linking_is_scoped_to_affected_sessions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(tmp.path().join("catalog.sqlite")).expect("catalog");
+        let mut session_keys = Vec::new();
+        for (offset, session_id) in ["session-a", "session-b"].into_iter().enumerate() {
+            let source_path = format!("/tmp/{session_id}.jsonl");
+            let mut call = record("tool_use", "{}".to_string());
+            call.record_key = format!("rk-{session_id}-call");
+            call.doc_id = (offset * 2 + 1) as u64;
+            call.session_id = session_id.to_string();
+            call.source_path = source_path.clone();
+            call.links.event_id = Some(format!("{session_id}-call"));
+            call.links.parent_event_id = Some(format!("{session_id}-message"));
+
+            let mut message = record("assistant", "owner".to_string());
+            message.record_key = format!("rk-{session_id}-message");
+            message.doc_id = (offset * 2 + 2) as u64;
+            message.session_id = session_id.to_string();
+            message.source_path = source_path;
+            message.links.event_id = Some(format!("{session_id}-message"));
+
+            bulk_insert_record(&store.conn, &call).expect("insert call");
+            bulk_insert_record(&store.conn, &message).expect("insert message");
+            session_keys.push(stable_session_key(&message));
+        }
+
+        link_relations_for_sessions(&store.conn, [session_keys[0].as_str()])
+            .expect("link affected session");
+
+        let statuses = store
+            .conn
+            .prepare(
+                "SELECT record.session_id, call.owner_link_status
+                 FROM tool_calls AS call
+                 JOIN records AS record ON record.record_id = call.record_id
+                 ORDER BY record.session_id",
+            )
+            .expect("prepare statuses")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query statuses")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect statuses");
+        assert_eq!(
+            statuses,
+            vec![
+                ("session-a".to_string(), "linked".to_string()),
+                ("session-b".to_string(), "pending".to_string()),
+            ]
+        );
     }
 
     #[test]

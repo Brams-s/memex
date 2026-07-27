@@ -3,6 +3,7 @@ use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags};
+use sha2::{Digest, Sha256};
 use simd_json::BorrowedValue;
 use simd_json::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -14,7 +15,7 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 3,
+    index: 4,
     usage: 3,
 };
 
@@ -48,6 +49,96 @@ pub fn message_root() -> PathBuf {
 
 pub fn parts_root() -> PathBuf {
     storage_root().join("part")
+}
+
+fn parts_root_for_session(session_dir: &Path) -> PathBuf {
+    session_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(|storage| storage.join("part"))
+        .unwrap_or_else(parts_root)
+}
+
+/// Fingerprint every file that contributes to one OpenCode session projection. OpenCode stores
+/// messages and their mutable tool state in separate trees, so watching only the message
+/// directory misses status/output-only updates.
+pub(crate) fn session_dependency_fingerprint(
+    session_dir: &Path,
+) -> Result<(u64, i64, i64, String)> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    let mut dependencies = Vec::new();
+    let parts_root = parts_root_for_session(session_dir);
+    for entry in std::fs::read_dir(session_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let mut message_id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string);
+        if let Ok(mut bytes) = std::fs::read(&path)
+            && let Ok(message) = simd_json::to_borrowed_value(&mut bytes)
+        {
+            message_id = message
+                .get("id")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .or(message_id);
+        }
+        dependencies.push(path);
+        if let Some(message_id) = message_id {
+            let part_dir = parts_root.join(message_id);
+            if let Ok(entries) = std::fs::read_dir(part_dir) {
+                dependencies.extend(
+                    entries.flatten().map(|entry| entry.path()).filter(|path| {
+                        path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                    }),
+                );
+            }
+        }
+    }
+    dependencies.sort();
+
+    let mut total_size = 0u64;
+    let mut newest_seconds = 0i64;
+    let mut newest_ns = 0i64;
+    let mut hasher = Sha256::new();
+    for path in dependencies {
+        let metadata = match path.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let modified_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
+        total_size = total_size.saturating_add(metadata.len());
+        newest_ns = newest_ns.max(modified_ns);
+        newest_seconds = newest_seconds.max(modified_ns / 1_000_000_000);
+        let path = path.to_string_lossy();
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(metadata.len().to_le_bytes());
+        hasher.update(modified_ns.to_le_bytes());
+        #[cfg(unix)]
+        {
+            hasher.update(metadata.dev().to_le_bytes());
+            hasher.update(metadata.ino().to_le_bytes());
+        }
+    }
+    Ok((
+        total_size,
+        newest_seconds,
+        newest_ns,
+        format!("{:x}", hasher.finalize()),
+    ))
 }
 
 pub fn discover_sessions() -> anyhow::Result<Vec<SourceFile>> {
@@ -225,7 +316,7 @@ pub(crate) fn parse_index_records(
     let mut turn_id = state.turn_id;
     for (message_id, timestamp, role, message_facts) in messages {
         let message_ordinal = turn_id;
-        let part_dir = parts_root().join(&message_id);
+        let part_dir = parts_root_for_session(session_dir).join(&message_id);
         if !part_dir.exists() {
             continue;
         }
@@ -290,6 +381,9 @@ pub(crate) fn parse_index_records(
             call_links.event_id = call_id.clone();
             call_links.call_index = Some(tool_call_index);
             call_links.model = message_facts.model.clone();
+            call_links.status =
+                super::common::normalized_tool_status(source_status.as_deref(), None);
+            call_links.source_status = source_status.clone();
             tool_call_index += 1;
             emit(Record {
                 source: SourceKind::Opencode,
@@ -615,6 +709,8 @@ mod tests {
             records[2].links.message_ordinal
         );
         assert_eq!(records[0].links.call_index, Some(0));
+        assert_eq!(records[0].links.status.as_deref(), Some("success"));
+        assert_eq!(records[0].links.source_status.as_deref(), Some("completed"));
         assert_eq!(records[1].links.status.as_deref(), Some("success"));
         assert!(records[2].text.is_empty());
         assert_eq!(records[2].links.input_tokens, Some(15));
@@ -624,6 +720,38 @@ mod tests {
         assert_eq!(records[2].links.reasoning_tokens, Some(2));
         assert_eq!(records[1].links.event_index, Some(0));
         assert_eq!(records[2].links.model.as_deref(), Some("opencode-test"));
+    }
+
+    #[test]
+    fn session_fingerprint_changes_when_only_a_tool_part_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let session_dir = storage.join("message/ses_test");
+        let part_dir = storage.join("part/msg_test");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&part_dir).unwrap();
+        std::fs::write(
+            session_dir.join("msg_test.json"),
+            r#"{"id":"msg_test","role":"assistant","time":{"created":10}}"#,
+        )
+        .unwrap();
+        let part = part_dir.join("01-tool.json");
+        std::fs::write(
+            &part,
+            r#"{"type":"tool","callID":"call-1","state":{"status":"running"}}"#,
+        )
+        .unwrap();
+        let before = session_dependency_fingerprint(&session_dir).unwrap();
+
+        std::fs::write(
+            &part,
+            r#"{"type":"tool","callID":"call-1","state":{"status":"completed","output":"done"}}"#,
+        )
+        .unwrap();
+        let after = session_dependency_fingerprint(&session_dir).unwrap();
+
+        assert_ne!(before.3, after.3);
+        assert!(after.0 > before.0);
     }
 
     #[test]

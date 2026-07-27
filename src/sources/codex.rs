@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 5,
+    index: 6,
     usage: 4,
 };
 
@@ -683,6 +683,13 @@ pub(crate) fn parse_index_records(
                 if let Some(call_id) = &call_id {
                     links.event_id = Some(call_id.clone());
                 }
+                let source_status = payload
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                links.status =
+                    super::common::normalized_tool_status(source_status.as_deref(), None);
+                links.source_status = source_status;
                 let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
                 if let Some(call_id) = call_id {
                     let replaced = pending_tool_calls.insert(
@@ -1856,5 +1863,42 @@ mod tests {
             first_records[0].links.message_ordinal
         );
         assert_eq!(second_records[0].links.call_index, Some(0));
+    }
+
+    #[test]
+    fn search_call_lifecycle_status_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codex.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\",\"cwd\":\"/repo\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"web_search_call\",\"call_id\":\"search-1\",\"status\":\"in_progress\",\"query\":\"rust\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"tool_search_call\",\"call_id\":\"search-2\",\"status\":\"completed\",\"arguments\":{\"q\":\"sqlite\"}}}\n",
+            ),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let calls: Vec<_> = records
+            .iter()
+            .filter(|record| record.role == "tool_use")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].links.status.as_deref(), Some("pending"));
+        assert_eq!(calls[0].links.source_status.as_deref(), Some("in_progress"));
+        assert_eq!(calls[1].links.status.as_deref(), Some("success"));
+        assert_eq!(calls[1].links.source_status.as_deref(), Some("completed"));
     }
 }

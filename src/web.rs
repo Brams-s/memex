@@ -272,19 +272,19 @@ fn add_activity_value(
 
 #[derive(Debug)]
 struct SessionRequest {
-    session_id: String,
+    session_key: String,
     offset: usize,
     limit: usize,
 }
 
 impl SessionRequest {
     fn from_url(url: &RequestUrl) -> Result<Self> {
-        let mut session_id = None;
+        let mut session_key = None;
         let mut offset = 0;
         let mut limit = 100;
         for (key, value) in url.query_pairs() {
             match key {
-                "id" if !value.is_empty() => session_id = Some(value.to_string()),
+                "key" if !value.is_empty() => session_key = Some(value.to_string()),
                 "offset" => {
                     offset = value
                         .parse::<usize>()
@@ -303,7 +303,7 @@ impl SessionRequest {
             return Err(anyhow!("offset must not exceed {MAX_SESSION_OFFSET}"));
         }
         Ok(Self {
-            session_id: session_id.ok_or_else(|| anyhow!("missing session id"))?,
+            session_key: session_key.ok_or_else(|| anyhow!("missing session key"))?,
             offset,
             limit,
         })
@@ -497,6 +497,7 @@ struct SearchPayload {
 
 #[derive(Serialize)]
 struct SessionSummary {
+    session_key: String,
     session_id: String,
     project: String,
     source: String,
@@ -537,10 +538,13 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         let mut seen = HashSet::new();
         let mut summaries = Vec::new();
         for (score, record) in records {
-            if !seen.insert(record.session_id.clone()) {
+            let session_key =
+                crate::catalog::session_key(record.source, &record.session_id, &record.source_path);
+            if !seen.insert(session_key.clone()) {
                 continue;
             }
             summaries.push(SessionSummary {
+                session_key,
                 session_id: record.session_id,
                 project: record.project,
                 source: record.source.label().to_string(),
@@ -598,6 +602,7 @@ fn recent_search_payload(paths: &Paths, params: &SearchRequest) -> Result<Search
             .map(|record| (record.role, summarize(&record.text, 360)))
             .unwrap_or_else(|| (String::new(), String::new()));
         results.push(SessionSummary {
+            session_key: stable_session_key,
             session_id: session.session_id,
             project: session.project,
             source: session.source.label().to_string(),
@@ -618,6 +623,7 @@ fn recent_search_payload(paths: &Paths, params: &SearchRequest) -> Result<Search
 
 #[derive(Serialize)]
 struct SessionPayload {
+    session_key: String,
     session_id: String,
     project: String,
     source: String,
@@ -646,12 +652,25 @@ struct MessagePayload {
     parent_tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_tool_use_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_status: Option<String>,
 }
 
 fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<SessionPayload>> {
+    let analytics = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+    let Some(session) = analytics.session_by_key(&params.session_key)? else {
+        return Ok(None);
+    };
     let index = open_index(paths)?;
-    let (records, total) =
-        index.records_by_session_id_page(&params.session_id, params.offset, params.limit)?;
+    let (records, total) = index.records_by_canonical_session_page(
+        session.source,
+        &session.session_id,
+        &session.source_path,
+        params.offset,
+        params.limit,
+    )?;
     if total == 0 {
         return Ok(None);
     }
@@ -659,11 +678,10 @@ fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<Sess
         return Err(anyhow!("session page offset is past the end"));
     }
 
-    let first = records.first().expect("records is not empty");
-    let project = first.project.clone();
-    let source = first.source.label().to_string();
-    let started_at = records.iter().map(|record| record.ts).min().unwrap_or(0);
-    let ended_at = records.iter().map(|record| record.ts).max().unwrap_or(0);
+    let project = session.project;
+    let source = session.source.label().to_string();
+    let started_at = session.started_at;
+    let ended_at = session.last_at;
     let messages = records
         .into_iter()
         .map(|record| MessagePayload {
@@ -677,11 +695,14 @@ fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<Sess
             parent_event_id: record.links.parent_event_id,
             parent_tool_use_id: record.links.parent_tool_use_id,
             source_tool_use_id: record.links.source_tool_use_id,
+            status: record.links.status,
+            source_status: record.links.source_status,
         })
         .collect();
 
     Ok(Some(SessionPayload {
-        session_id: params.session_id.clone(),
+        session_key: params.session_key.clone(),
+        session_id: session.session_id,
         project,
         source,
         started_at,
@@ -799,10 +820,10 @@ mod tests {
 
     #[test]
     fn session_request_decodes_and_caps_page_size() {
-        let url = parse_url("/api/session?id=session-a&offset=40&limit=1000").unwrap();
+        let url = parse_url("/api/session?key=sk_test&offset=40&limit=1000").unwrap();
         let request = SessionRequest::from_url(&url).unwrap();
 
-        assert_eq!(request.session_id, "session-a");
+        assert_eq!(request.session_key, "sk_test");
         assert_eq!(request.offset, 40);
         assert_eq!(request.limit, 200);
     }
@@ -810,7 +831,7 @@ mod tests {
     #[test]
     fn session_request_rejects_excessive_offsets() {
         let url = parse_url(&format!(
-            "/api/session?id=session-a&offset={}&limit=200",
+            "/api/session?key=sk_test&offset={}&limit=200",
             MAX_SESSION_OFFSET + 1
         ))
         .unwrap();
@@ -923,7 +944,11 @@ mod tests {
         let first_session_page = session_payload(
             &paths,
             &SessionRequest {
-                session_id: "session-a".to_string(),
+                session_key: crate::catalog::session_key(
+                    SourceKind::Claude,
+                    "session-a",
+                    "/tmp/session-a.jsonl",
+                ),
                 offset: 0,
                 limit: 1,
             },
@@ -943,7 +968,11 @@ mod tests {
         let page = session_payload(
             &paths,
             &SessionRequest {
-                session_id: "session-a".to_string(),
+                session_key: crate::catalog::session_key(
+                    SourceKind::Claude,
+                    "session-a",
+                    "/tmp/session-a.jsonl",
+                ),
                 offset: 1,
                 limit: 1,
             },
@@ -1004,6 +1033,98 @@ mod tests {
         )
         .unwrap();
         assert!(filtered.results.is_empty());
+    }
+
+    #[test]
+    fn canonical_session_keys_keep_equal_source_ids_separate() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        let mut catalog =
+            crate::analytics::AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for (doc_id, source, source_path, text) in [
+            (
+                1,
+                SourceKind::Claude,
+                "/tmp/shared.jsonl",
+                "canonical collision claude",
+            ),
+            (
+                2,
+                SourceKind::Codex,
+                "/tmp/shared.jsonl",
+                "canonical collision codex",
+            ),
+            (
+                3,
+                SourceKind::Claude,
+                "/tmp/shared-subagent.jsonl",
+                "canonical collision claude subagent",
+            ),
+        ] {
+            let mut record = Record {
+                source,
+                record_key: String::new(),
+                doc_id,
+                ts: doc_id * 1_000,
+                project: "memex".to_string(),
+                session_id: "shared".to_string(),
+                turn_id: doc_id as u32,
+                role: "assistant".to_string(),
+                text: text.to_string(),
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                links: RecordLinks::default(),
+                source_path: source_path.to_string(),
+            };
+            record.ensure_record_key();
+            catalog.record(&record).unwrap();
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        catalog.flush().unwrap();
+        writer.commit().unwrap();
+
+        let payload = search_payload(
+            &paths,
+            &SearchRequest {
+                query: "canonical collision".to_string(),
+                source: None,
+                project: None,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(payload.results.len(), 2);
+        assert_ne!(
+            payload.results[0].session_key,
+            payload.results[1].session_key
+        );
+
+        for result in payload.results {
+            let session = session_payload(
+                &paths,
+                &SessionRequest {
+                    session_key: result.session_key,
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                session.total,
+                if result.source == SourceKind::Claude.label() {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert_eq!(session.source, result.source);
+        }
     }
 
     #[test]
