@@ -101,6 +101,10 @@ pub struct UserConfig {
     /// Background index service poll interval in seconds.
     #[serde(alias = "index_service_watch_interval")]
     pub index_service_poll_interval: Option<u64>,
+    /// Serve the local Web UI from the continuous background index service.
+    pub index_service_web_ui: Option<bool>,
+    /// Address and port for the background Web UI.
+    pub index_service_web_listen: Option<String>,
     /// Background index service launchd label.
     pub index_service_label: Option<String>,
     /// Background index service stdout log path.
@@ -271,6 +275,10 @@ impl UserConfig {
 
     pub fn index_service_poll_interval(&self) -> u64 {
         self.index_service_poll_interval.unwrap_or(30)
+    }
+
+    pub fn index_service_web_ui_default(&self) -> bool {
+        self.index_service_web_ui.unwrap_or(false)
     }
 }
 
