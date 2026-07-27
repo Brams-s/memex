@@ -362,9 +362,6 @@ body {
 
 .home-chart-select {
   width: 108px;
-  height: 32px;
-  color: var(--muted-foreground);
-  font-size: 11px;
 }
 
 .home-activity-note {
@@ -415,9 +412,6 @@ body {
 
 .home-filter-select {
   width: 126px;
-  height: 32px;
-  color: var(--muted-foreground);
-  font-size: 11px;
 }
 
 .home-project-select {

@@ -219,7 +219,11 @@ impl SearchIndex {
         let term = Term::from_field_text(self.fields.session_id, session_id);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
         let total = searcher.search(&query, &Count)?;
-        let collector = TopDocs::with_limit(limit.max(1))
+        if offset >= total {
+            return Ok((Vec::new(), total));
+        }
+        let page_limit = limit.max(1).min(total - offset);
+        let collector = TopDocs::with_limit(page_limit)
             .and_offset(offset)
             .order_by_fast_field::<u64>("turn_id", Order::Asc);
         let top_docs: Vec<(u64, tantivy::DocAddress)> = searcher.search(&query, &collector)?;

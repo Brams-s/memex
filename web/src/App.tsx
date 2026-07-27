@@ -36,6 +36,7 @@ import {
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectTrigger,
   SelectValue,
@@ -545,13 +546,17 @@ function HomeActivityChart({
         >
           <SelectTrigger
             aria-label="Activity metric"
-            className="home-chart-select shadow-none"
+            className="home-chart-select"
+            size="sm"
+            variant="ghost"
           >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="sessions">Sessions</SelectItem>
-            <SelectItem value="tokens">Tokens</SelectItem>
+            <SelectGroup>
+              <SelectItem value="sessions">Sessions</SelectItem>
+              <SelectItem value="tokens">Tokens</SelectItem>
+            </SelectGroup>
           </SelectContent>
         </Select>
       </div>
@@ -1058,19 +1063,23 @@ function App() {
             <Select onValueChange={setSource} value={source}>
               <SelectTrigger
                 aria-label="Source"
-                className="home-filter-select shadow-none"
+                className="home-filter-select"
+                size="sm"
+                variant="ghost"
               >
                 <SelectValue placeholder="all sources" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="all">all sources</SelectItem>
-                <SelectItem value="claude">Claude</SelectItem>
-                <SelectItem value="codex">Codex</SelectItem>
-                <SelectItem value="opencode">OpenCode</SelectItem>
-                <SelectItem value="cursor">Cursor</SelectItem>
-                <SelectItem value="pi">Pi</SelectItem>
-                <SelectItem value="openclaw">OpenClaw</SelectItem>
-                <SelectItem value="copilot">Copilot</SelectItem>
+                <SelectGroup>
+                  <SelectItem value="all">all sources</SelectItem>
+                  <SelectItem value="claude">Claude</SelectItem>
+                  <SelectItem value="codex">Codex</SelectItem>
+                  <SelectItem value="opencode">OpenCode</SelectItem>
+                  <SelectItem value="cursor">Cursor</SelectItem>
+                  <SelectItem value="pi">Pi</SelectItem>
+                  <SelectItem value="openclaw">OpenClaw</SelectItem>
+                  <SelectItem value="copilot">Copilot</SelectItem>
+                </SelectGroup>
               </SelectContent>
             </Select>
             <Select
@@ -1079,17 +1088,21 @@ function App() {
             >
               <SelectTrigger
                 aria-label="Project"
-                className="home-filter-select home-project-select shadow-none"
+                className="home-filter-select home-project-select"
+                size="sm"
+                variant="ghost"
               >
                 <SelectValue placeholder="All projects" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="all">All projects</SelectItem>
-                {knownProjects.map((option) => (
-                  <SelectItem key={option} value={option}>
-                    {option}
-                  </SelectItem>
-                ))}
+                <SelectGroup>
+                  <SelectItem value="all">All projects</SelectItem>
+                  {knownProjects.map((option) => (
+                    <SelectItem key={option} value={option}>
+                      {option}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
               </SelectContent>
             </Select>
           </div>
@@ -1326,14 +1339,16 @@ function App() {
                         <SelectValue placeholder="All sources" />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="all">All sources</SelectItem>
-                        <SelectItem value="claude">Claude</SelectItem>
-                        <SelectItem value="codex">Codex</SelectItem>
-                        <SelectItem value="opencode">OpenCode</SelectItem>
-                        <SelectItem value="cursor">Cursor</SelectItem>
-                        <SelectItem value="pi">Pi</SelectItem>
-                        <SelectItem value="openclaw">OpenClaw</SelectItem>
-                        <SelectItem value="copilot">Copilot</SelectItem>
+                        <SelectGroup>
+                          <SelectItem value="all">All sources</SelectItem>
+                          <SelectItem value="claude">Claude</SelectItem>
+                          <SelectItem value="codex">Codex</SelectItem>
+                          <SelectItem value="opencode">OpenCode</SelectItem>
+                          <SelectItem value="cursor">Cursor</SelectItem>
+                          <SelectItem value="pi">Pi</SelectItem>
+                          <SelectItem value="openclaw">OpenClaw</SelectItem>
+                          <SelectItem value="copilot">Copilot</SelectItem>
+                        </SelectGroup>
                       </SelectContent>
                     </Select>
                   </div>

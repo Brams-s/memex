@@ -12,6 +12,7 @@ use std::thread::JoinHandle;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:6363";
+const MAX_SESSION_OFFSET: usize = 100_000;
 const UI_HTML: &str = include_str!("../web/dist/index.html");
 const UI_CSS: &[u8] = include_bytes!("../web/dist/assets/app.css");
 const UI_JS: &[u8] = include_bytes!("../web/dist/assets/app.js");
@@ -297,6 +298,9 @@ impl SessionRequest {
                 }
                 _ => {}
             }
+        }
+        if offset > MAX_SESSION_OFFSET {
+            return Err(anyhow!("offset must not exceed {MAX_SESSION_OFFSET}"));
         }
         Ok(Self {
             session_id: session_id.ok_or_else(|| anyhow!("missing session id"))?,
@@ -751,6 +755,22 @@ mod tests {
     }
 
     #[test]
+    fn session_request_rejects_excessive_offsets() {
+        let url = parse_url(&format!(
+            "/api/session?id=session-a&offset={}&limit=200",
+            MAX_SESSION_OFFSET + 1
+        ))
+        .unwrap();
+
+        let error = SessionRequest::from_url(&url).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("offset must not exceed {MAX_SESSION_OFFSET}")
+        );
+    }
+
+    #[test]
     fn activity_request_parses_metric_filters_and_range() {
         let url =
             parse_url("/api/activity?metric=tokens&source=codex&project=memex&days=1000").unwrap();
@@ -854,6 +874,12 @@ mod tests {
         assert_eq!(page.total, 2);
         assert_eq!(page.offset, 1);
         assert_eq!(page.messages.len(), 1);
+
+        let (records, total) = index
+            .records_by_session_id_page("session-a", usize::MAX, 200)
+            .unwrap();
+        assert!(records.is_empty());
+        assert_eq!(total, 2);
 
         let filtered = search_payload(
             &paths,
