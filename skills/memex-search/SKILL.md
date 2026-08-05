@@ -152,6 +152,21 @@ background index service or `index --watch`, and consider setting
 
 Both commands return JSON by default.
 
+## List Sessions
+
+`memex sessions` lists indexed sessions (newest first) as JSONL with `session_id`, `source`,
+`project`, `cwd`, `git_root`, `started_at`, `last_at`, `message_count`, and a ready-to-run
+`resume_cmd`:
+
+```
+memex sessions --limit 5
+memex sessions --cwd .              # sessions from the current repo (cwd or git root match)
+memex sessions --source claude --since 2026-08-01
+```
+
+Use it to find "the session where we worked on X in this repo" before fetching the transcript
+with `memex session <session_id>`.
+
 ## Human Output
 
 Use `-v/--verbose` for human-readable output:
