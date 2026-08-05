@@ -33,12 +33,23 @@ OPENED=""
 # (The guarded expansion below keeps an empty array safe under `set -u` on bash 3.2.)
 PANE_ENV=()
 
-# The workspace directory to scope a resume to. Without jq we simply lose the scoping and let
-# memex pick the most recent session overall — a degraded result beats a refusal.
+# The workspace directory to scope a resume to. ctx_state records whether the context was
+# actually readable: "ok" (parsed; ctx_cwd may still be legitimately empty), "nojq", or
+# "unparsable". Modes that scope by directory must refuse on the failure states rather than
+# treat them as "no context" — silently dropping the scope would resume some other project's
+# session (resume-last) or misreport why scoping failed (recent-here).
 ctx_cwd=""
+ctx_state="ok"
 if [ -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ]; then
-  ctx_cwd=$(printf '%s' "$HERDR_PLUGIN_CONTEXT_JSON" |
-    jq -r '.focused_pane_cwd // .workspace_cwd // empty' 2>/dev/null)
+  if ! command -v jq >/dev/null 2>&1; then
+    ctx_state="nojq"
+  elif ctx_cwd=$(printf '%s' "$HERDR_PLUGIN_CONTEXT_JSON" |
+    jq -r '.focused_pane_cwd // .workspace_cwd // empty' 2>/dev/null); then
+    :
+  else
+    ctx_cwd=""
+    ctx_state="unparsable"
+  fi
 fi
 
 # Config, re-read every run; an unknown value falls back to the default beside it.
@@ -146,6 +157,7 @@ recent-here)
   require_workspace
   # The palette scoped to this repo: memex projects are directory basenames, so scope to the
   # git root's name when there is one, else the focused directory's own name.
+  [ "$ctx_state" = "ok" ] || refuse "cannot read pane context ($ctx_state)"
   [ -n "$ctx_cwd" ] || refuse "no directory context (invoke from inside herdr)"
   repo=$(git -C "$ctx_cwd" rev-parse --show-toplevel 2>/dev/null) || repo="$ctx_cwd"
   project=$(basename "$repo")
@@ -185,6 +197,10 @@ close | toggle | open)
 resume-last)
   MEMEX=$(resolve_memex) ||
     refuse "memex binary not found (run 'herdr plugin install nicosuave/memex', or 'cargo build --release' in a linked checkout)"
+  # A context we could not read is not the same as no context: proceeding without the cwd
+  # scope would resume the most recent session of some other project.
+  [ "$ctx_state" = "ok" ] ||
+    refuse "cannot read pane context ($ctx_state); refusing to resume without directory scoping"
   # memex resolves the most recent resumable session and opens it in a new herdr tab itself,
   # driving the herdr CLI with the HERDR_* env this action already carries.
   args=(herdr resume-last)

@@ -332,9 +332,15 @@ impl AnalyticsStore {
         }
         if let Some(cwd) = cwd {
             let root = cwd.trim_end_matches('/').to_string();
-            clauses.push("(cwd = ? OR cwd LIKE ? OR git_root = ?)".to_string());
+            // Escape LIKE wildcards so a path like /tmp/foo_bar doesn't also
+            // match sessions under /tmp/fooXbar.
+            let escaped = root
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            clauses.push("(cwd = ? OR cwd LIKE ? ESCAPE '\\' OR git_root = ?)".to_string());
             values.push(rusqlite::types::Value::Text(root.clone()));
-            values.push(rusqlite::types::Value::Text(format!("{root}/%")));
+            values.push(rusqlite::types::Value::Text(format!("{escaped}/%")));
             values.push(rusqlite::types::Value::Text(root));
         }
         if let Some(since_ms) = since_ms {
@@ -1138,6 +1144,53 @@ mod tests {
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].session_id, "s-in");
         assert_eq!(scoped[0].cwd.as_deref(), Some(&*nested.to_string_lossy()));
+    }
+
+    #[test]
+    fn detailed_sessions_cwd_filter_escapes_like_wildcards() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("foo_bar");
+        let sibling = tmp.path().join("fooXbar");
+        fs::create_dir_all(target.join("sub")).expect("mkdir");
+        fs::create_dir_all(sibling.join("sub")).expect("mkdir");
+        let mut transcripts = Vec::new();
+        for (name, cwd) in [
+            ("target.jsonl", target.join("sub")),
+            ("sibling.jsonl", sibling.join("sub")),
+        ] {
+            let transcript = tmp.path().join(name);
+            fs::write(
+                &transcript,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                    cwd.display()
+                ),
+            )
+            .expect("write transcript");
+            transcripts.push(transcript);
+        }
+        let db = tmp.path().join("analytics.sqlite");
+        let mut writer = AnalyticsWriter::open(&db).expect("open analytics");
+        writer
+            .record(&record("foo_bar", "s-target", &transcripts[0], 10))
+            .expect("record");
+        writer
+            .record(&record("fooXbar", "s-sibling", &transcripts[1], 20))
+            .expect("record");
+        writer.flush().expect("flush");
+
+        let store = AnalyticsStore::open_read_only(&db).expect("open read only");
+        let scoped = store
+            .query_sessions_detailed(
+                None,
+                None,
+                Some(target.to_string_lossy().as_ref()),
+                None,
+                None,
+            )
+            .expect("scoped sessions");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].session_id, "s-target");
     }
 
     #[test]
