@@ -431,6 +431,10 @@ The skill definitions are bundled in `skills/`.
 This repo is also a herdr plugin: it turns the memex TUI into a herdr-native session desk. Browse
 and search every past agent session from a herdr pane, then resume one into a new herdr tab.
 
+![memex session palette resuming a session into a herdr tab](docs/herdr/resume.svg)
+
+![memex transcript preview](docs/herdr/browse.svg)
+
 ```bash
 herdr plugin install nicosuave/memex
 ```
