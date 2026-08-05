@@ -127,6 +127,8 @@ pub struct UserConfig {
     pub pi_resume_cmd: Option<String>,
     /// Resume command template for GitHub Copilot CLI sessions.
     pub copilot_resume_cmd: Option<String>,
+    /// How resume behaves inside a herdr pane: "tab" (default), "split", or "off".
+    pub herdr_resume: Option<String>,
     /// Multi-machine search and control defaults.
     #[serde(default)]
     pub multi_machine: MultiMachineConfig,

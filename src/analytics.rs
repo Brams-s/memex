@@ -29,6 +29,24 @@ pub struct SessionRow {
     pub message_count: u64,
 }
 
+/// A session row with every stored column, for `memex sessions`.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionDetailRow {
+    pub source: SourceKind,
+    pub session_id: String,
+    pub source_path: String,
+    pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_root: Option<String>,
+    pub started_at: u64,
+    pub last_at: u64,
+    pub message_count: u64,
+}
+
 pub struct AnalyticsStore {
     conn: Connection,
 }
@@ -266,6 +284,95 @@ impl AnalyticsStore {
                 cwd: row.get(5)?,
                 last_at: row.get::<_, i64>(6)?.max(0) as u64,
                 message_count: row.get::<_, i64>(7)?.max(0) as u64,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Sessions with full stored metadata, newest first. `cwd` restricts to
+    /// sessions whose working directory is the given path, lives under it,
+    /// or whose git root is the given path (so a repo path matches sessions
+    /// started in any of its subdirectories).
+    pub fn query_sessions_detailed(
+        &self,
+        source: Option<SourceFilter>,
+        project: Option<&str>,
+        cwd: Option<&str>,
+        since_ms: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<SessionDetailRow>> {
+        let mut sql = String::from(
+            "SELECT source, session_id, source_path, project, repo_project,
+                    cwd, git_root, started_at, last_at, message_count
+             FROM sessions",
+        );
+        let mut clauses = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(source) = source {
+            let labels = source.storage_labels();
+            let placeholders = std::iter::repeat_n("?", labels.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!("source IN ({placeholders})"));
+            values.extend(
+                labels
+                    .iter()
+                    .map(|label| rusqlite::types::Value::Text((*label).to_string())),
+            );
+        }
+        if let Some(project) = project {
+            clauses.push("COALESCE(NULLIF(repo_project, ''), project) = ?".to_string());
+            values.push(rusqlite::types::Value::Text(project.to_string()));
+        }
+        if let Some(cwd) = cwd {
+            let root = cwd.trim_end_matches('/').to_string();
+            // Escape LIKE wildcards so a path like /tmp/foo_bar doesn't also
+            // match sessions under /tmp/fooXbar.
+            let escaped = root
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            clauses.push("(cwd = ? OR cwd LIKE ? ESCAPE '\\' OR git_root = ?)".to_string());
+            values.push(rusqlite::types::Value::Text(root.clone()));
+            values.push(rusqlite::types::Value::Text(format!("{escaped}/%")));
+            values.push(rusqlite::types::Value::Text(root));
+        }
+        if let Some(since_ms) = since_ms {
+            clauses.push("last_at >= ?".to_string());
+            values.push(rusqlite::types::Value::Integer(since_ms as i64));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY last_at DESC");
+        if let Some(limit) = limit {
+            sql.push_str(" LIMIT ?");
+            values.push(rusqlite::types::Value::Integer(limit as i64));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            let source_label: String = row.get(0)?;
+            let source = SourceKind::from_label(&source_label).unwrap_or(SourceKind::Claude);
+            let repo_project: Option<String> = row.get(4)?;
+            Ok(SessionDetailRow {
+                source,
+                session_id: row.get(1)?,
+                source_path: row.get(2)?,
+                project: row.get(3)?,
+                repo_project: repo_project.filter(|value| !value.is_empty()),
+                cwd: row.get::<_, Option<String>>(5)?.filter(|v| !v.is_empty()),
+                git_root: row.get::<_, Option<String>>(6)?.filter(|v| !v.is_empty()),
+                started_at: row.get::<_, i64>(7)?.max(0) as u64,
+                last_at: row.get::<_, i64>(8)?.max(0) as u64,
+                message_count: row.get::<_, i64>(9)?.max(0) as u64,
             })
         })?;
 
@@ -985,6 +1092,105 @@ mod tests {
         assert_eq!(rows[0].session_id, "s1");
         assert_eq!(rows[0].message_count, 2);
         assert_eq!(rows[0].last_at, 20);
+    }
+
+    #[test]
+    fn detailed_sessions_filter_by_cwd_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("crates/core");
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&nested).expect("mkdir");
+        fs::create_dir_all(&other).expect("mkdir");
+        let mut transcripts = Vec::new();
+        for (name, cwd) in [("in.jsonl", &nested), ("out.jsonl", &other)] {
+            let transcript = tmp.path().join(name);
+            fs::write(
+                &transcript,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                    cwd.display()
+                ),
+            )
+            .expect("write transcript");
+            transcripts.push(transcript);
+        }
+        let db = tmp.path().join("analytics.sqlite");
+        let mut writer = AnalyticsWriter::open(&db).expect("open analytics");
+        writer
+            .record(&record("repo", "s-in", &transcripts[0], 10))
+            .expect("record");
+        writer
+            .record(&record("other", "s-out", &transcripts[1], 20))
+            .expect("record");
+        writer.flush().expect("flush");
+
+        let store = AnalyticsStore::open_read_only(&db).expect("open read only");
+        let all = store
+            .query_sessions_detailed(None, None, None, None, None)
+            .expect("all sessions");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].session_id, "s-out");
+
+        let scoped = store
+            .query_sessions_detailed(
+                None,
+                None,
+                Some(repo.to_string_lossy().as_ref()),
+                None,
+                None,
+            )
+            .expect("scoped sessions");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].session_id, "s-in");
+        assert_eq!(scoped[0].cwd.as_deref(), Some(&*nested.to_string_lossy()));
+    }
+
+    #[test]
+    fn detailed_sessions_cwd_filter_escapes_like_wildcards() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("foo_bar");
+        let sibling = tmp.path().join("fooXbar");
+        fs::create_dir_all(target.join("sub")).expect("mkdir");
+        fs::create_dir_all(sibling.join("sub")).expect("mkdir");
+        let mut transcripts = Vec::new();
+        for (name, cwd) in [
+            ("target.jsonl", target.join("sub")),
+            ("sibling.jsonl", sibling.join("sub")),
+        ] {
+            let transcript = tmp.path().join(name);
+            fs::write(
+                &transcript,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                    cwd.display()
+                ),
+            )
+            .expect("write transcript");
+            transcripts.push(transcript);
+        }
+        let db = tmp.path().join("analytics.sqlite");
+        let mut writer = AnalyticsWriter::open(&db).expect("open analytics");
+        writer
+            .record(&record("foo_bar", "s-target", &transcripts[0], 10))
+            .expect("record");
+        writer
+            .record(&record("fooXbar", "s-sibling", &transcripts[1], 20))
+            .expect("record");
+        writer.flush().expect("flush");
+
+        let store = AnalyticsStore::open_read_only(&db).expect("open read only");
+        let scoped = store
+            .query_sessions_detailed(
+                None,
+                None,
+                Some(target.to_string_lossy().as_ref()),
+                None,
+                None,
+            )
+            .expect("scoped sessions");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].session_id, "s-target");
     }
 
     #[test]

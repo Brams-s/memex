@@ -236,6 +236,12 @@ OUTPUT FIELDS (--fields):
     },
     /// Interactive terminal UI for browsing sessions
     Tui {
+        /// Start with this search query
+        #[arg(long)]
+        query: Option<String>,
+        /// Start with this project filter
+        #[arg(long)]
+        project: Option<String>,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -279,6 +285,42 @@ EXAMPLES:
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    /// List indexed sessions with cwd and git metadata (newest first)
+    #[command(after_help = "\
+EXAMPLES:
+    memex sessions                        # 20 most recent sessions as JSONL
+    memex sessions --cwd .                # sessions from the current repo
+    memex sessions --source claude --limit 5
+    memex sessions --json-array")]
+    Sessions {
+        /// Only sessions whose cwd is this path, lives under it, or whose git root is it
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Filter by project (repository grouping)
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Only include sessions active on or after this date/timestamp
+        #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
+        since: Option<String>,
+        /// Maximum number of sessions
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit one JSON array instead of JSON Lines
+        #[arg(long)]
+        json_array: bool,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Herdr plugin helpers (used by herdr/plugin.sh)
+    #[command(hide = true)]
+    Herdr {
+        #[command(subcommand)]
+        action: HerdrCommand,
     },
     /// Show index statistics (document count, vector count, storage paths)
     Stats {
@@ -402,6 +444,33 @@ EXAMPLES:
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum HerdrCommand {
+    /// Resume the most recent resumable session, opening a new herdr tab
+    ResumeLast {
+        /// Prefer sessions from this directory (falls back to the global latest)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Resume a specific session by id, opening a new herdr tab
+    Resume {
+        /// Session ID (from `memex sessions` or search results)
+        session_id: String,
+        /// Filter by source when a session id appears in multiple backends
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 enum TransferTarget {
@@ -499,10 +568,17 @@ enum IndexServiceCommand {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     // Bare `memex` opens the TUI home screen.
-    let command = cli.command.unwrap_or(Commands::Tui { root: None });
+    let command = cli.command.unwrap_or(Commands::Tui {
+        query: None,
+        project: None,
+        root: None,
+    });
     let should_check = !matches!(
         command,
-        Commands::Tui { .. } | Commands::Update { .. } | Commands::Rpc { .. }
+        Commands::Tui { .. }
+            | Commands::Update { .. }
+            | Commands::Rpc { .. }
+            | Commands::Herdr { .. }
     );
     if should_check {
         check_for_update_async(None);
@@ -580,10 +656,14 @@ pub fn run() -> Result<()> {
                 machine,
             )?;
         }
-        Commands::Tui { root } => {
+        Commands::Tui {
+            query,
+            project,
+            root,
+        } => {
             let (update_tx, update_rx) = std::sync::mpsc::channel();
             check_for_update_async(Some(update_tx));
-            tui::run(root, Some(update_rx))?;
+            tui::run(root, Some(update_rx), query, project)?;
         }
         Commands::Web { listen, root } => {
             crate::web::serve(root, &listen)?;
@@ -639,6 +719,29 @@ pub fn run() -> Result<()> {
         } => {
             run_show(doc_id, verbose, root)?;
         }
+        Commands::Sessions {
+            cwd,
+            project,
+            source,
+            since,
+            limit,
+            json_array,
+            root,
+        } => {
+            run_sessions(cwd, project, source, since, limit, json_array, root)?;
+        }
+        Commands::Herdr { action } => match action {
+            HerdrCommand::ResumeLast { cwd, source, root } => {
+                run_herdr_resume(None, cwd, source, root)?;
+            }
+            HerdrCommand::Resume {
+                session_id,
+                source,
+                root,
+            } => {
+                run_herdr_resume(Some(session_id), None, source, root)?;
+            }
+        },
         Commands::Stats { root } => {
             run_stats(root)?;
         }
@@ -1961,6 +2064,162 @@ fn format_usd(value: f64) -> String {
     } else {
         format!("${value:.2}")
     }
+}
+
+fn open_analytics_read_only(paths: &Paths) -> Result<AnalyticsStore> {
+    let db = analytics_path(&paths.state);
+    if !db.exists() {
+        return Err(anyhow!(
+            "no analytics cache at {} (run `memex index` first)",
+            db.display()
+        ));
+    }
+    AnalyticsStore::open_read_only(&db)
+}
+
+fn canonical_cwd_filter(cwd: Option<PathBuf>) -> Option<String> {
+    let cwd = cwd?;
+    let resolved = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    Some(resolved.to_string_lossy().to_string())
+}
+
+fn source_dir_of(source_path: &str) -> String {
+    std::path::Path::new(source_path)
+        .parent()
+        .map(|dir| dir.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn session_resume_command(
+    config: &UserConfig,
+    row: &crate::analytics::SessionDetailRow,
+) -> Option<(String, String)> {
+    let template = crate::resume::resume_template(config, row.source, false)?;
+    let source_dir = source_dir_of(&row.source_path);
+    let cwd = row.cwd.clone().unwrap_or_else(|| source_dir.clone());
+    let command = crate::resume::expand_resume_template(
+        &template,
+        &crate::resume::ResumeSession {
+            source: row.source,
+            session_id: &row.session_id,
+            project: &row.project,
+            source_path: &row.source_path,
+            source_dir: &source_dir,
+        },
+        &cwd,
+    );
+    Some((command, cwd))
+}
+
+fn run_sessions(
+    cwd: Option<PathBuf>,
+    project: Option<String>,
+    source: Option<SourceFilter>,
+    since: Option<String>,
+    limit: usize,
+    json_array: bool,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let store = open_analytics_read_only(&paths)?;
+    let since_ms = parse_ts_millis(since)?;
+    let cwd_filter = canonical_cwd_filter(cwd);
+    let rows = store.query_sessions_detailed(
+        source,
+        project.as_deref(),
+        cwd_filter.as_deref(),
+        since_ms,
+        Some(limit),
+    )?;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut items = Vec::new();
+    for row in &rows {
+        let resume_cmd = session_resume_command(&config, row).map(|(command, _)| command);
+        let mut value = serde_json::to_value(row)?;
+        let object = value
+            .as_object_mut()
+            .expect("session row serializes to object");
+        object.insert(
+            "started_at".into(),
+            Value::String(format_ts(row.started_at)),
+        );
+        object.insert("last_at".into(), Value::String(format_ts(row.last_at)));
+        if let Some(resume_cmd) = resume_cmd {
+            object.insert("resume_cmd".into(), Value::String(resume_cmd));
+        }
+        if json_array {
+            items.push(value);
+        } else {
+            writeln!(out, "{value}")?;
+        }
+    }
+    if json_array {
+        writeln!(out, "{}", Value::Array(items))?;
+    }
+    Ok(())
+}
+
+fn run_herdr_resume(
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    source: Option<SourceFilter>,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let store = open_analytics_read_only(&paths)?;
+    let cwd_filter = canonical_cwd_filter(cwd);
+
+    let mut rows =
+        store.query_sessions_detailed(source, None, cwd_filter.as_deref(), None, None)?;
+    if let Some(session_id) = &session_id {
+        rows.retain(|row| &row.session_id == session_id);
+        if rows.is_empty() {
+            return Err(anyhow!("session '{session_id}' not found"));
+        }
+    } else if rows.is_empty() && cwd_filter.is_some() {
+        // No sessions recorded for this directory; fall back to the global latest.
+        rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
+    }
+
+    let Some((row, command, cwd)) = rows
+        .iter()
+        .find_map(|row| session_resume_command(&config, row).map(|(cmd, cwd)| (row, cmd, cwd)))
+    else {
+        return Err(anyhow!("no resumable session found"));
+    };
+
+    if crate::herdr::inside_herdr() {
+        let placement = crate::herdr::resume_placement(&config);
+        if placement == crate::herdr::ResumePlacement::Off {
+            return Err(anyhow!("herdr resume is disabled (herdr_resume = \"off\")"));
+        }
+        let label = row
+            .repo_project
+            .clone()
+            .unwrap_or_else(|| row.project.clone());
+        let pane_id =
+            crate::herdr::open_resume_pane(placement, Some(cwd.as_str()), &label, &command)?;
+        println!(
+            "resumed {} ({}) in herdr pane {pane_id}",
+            row.session_id,
+            row.source.label()
+        );
+        return Ok(());
+    }
+
+    // Outside herdr, run the resume command directly.
+    let status = std::process::Command::new("sh")
+        .args(["-lc", &command])
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("resume command exited with {status}"));
+    }
+    println!("resumed {} ({})", row.session_id, row.source.label());
+    Ok(())
 }
 
 fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {

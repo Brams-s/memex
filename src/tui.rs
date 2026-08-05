@@ -8,6 +8,7 @@ use crate::machine::{
     federated_usage_activity, machine_by_id, remote_shell_command, session_context,
     session_records,
 };
+use crate::resume::{find_in_path, resume_template, shell_quote};
 use crate::types::{Record, SourceFilter, SourceKind};
 use crate::usage::{CostMode, UsageQuery, scan_usage_activity};
 use anyhow::Result;
@@ -839,6 +840,8 @@ fn open_tui_index(paths: &Paths, auto_index: bool) -> Result<SearchIndex> {
 pub fn run(
     root: Option<PathBuf>,
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
+    initial_query: Option<String>,
+    initial_project: Option<String>,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
@@ -875,6 +878,14 @@ pub fn run(
     );
     app.stdio_redirect = Some(StdIoRedirect::new()?);
     app.update_rx = update_rx;
+    // Seed filters before the first search so the TUI opens pre-scoped (the
+    // herdr plugin uses this for its palette and "recent here" actions).
+    if let Some(query) = initial_query {
+        app.query = query;
+    }
+    if let Some(project) = initial_project {
+        app.project = project;
+    }
     app.kickoff_index_refresh(false);
     app.kickoff_search();
     app.kickoff_home_activity();
@@ -2332,40 +2343,7 @@ impl App {
             return Ok(());
         };
         let remote = session.machine != LOCAL_MACHINE_ID;
-        let template = match session.source {
-            SourceKind::Claude => self
-                .config
-                .claude_resume_cmd
-                .clone()
-                .or_else(|| default_resume_template("claude", remote)),
-            SourceKind::Codex => self
-                .config
-                .codex_resume_cmd
-                .clone()
-                .or_else(|| default_resume_template("codex", remote)),
-            SourceKind::Opencode => self
-                .config
-                .opencode_resume_cmd
-                .clone()
-                .or_else(|| default_resume_template("opencode", remote)),
-            SourceKind::Cursor => self
-                .config
-                .cursor_resume_cmd
-                .clone()
-                .or_else(|| default_resume_template("cursor", remote)),
-            SourceKind::Pi => self
-                .config
-                .pi_resume_cmd
-                .clone()
-                .or_else(|| default_resume_template("pi", remote)),
-            SourceKind::OpenClaw => None,
-            SourceKind::Copilot => self
-                .config
-                .copilot_resume_cmd
-                .clone()
-                .or_else(|| default_resume_template("copilot", remote)),
-        };
-        let Some(template) = template else {
+        let Some(template) = resume_template(&self.config, session.source, remote) else {
             self.set_status("resume command not configured in config.toml");
             return Ok(());
         };
@@ -2391,6 +2369,36 @@ impl App {
         } else {
             local_command
         };
+        // Inside a herdr pane, open the session in a new herdr tab/split so
+        // the browser stays up; fall back to inline suspend on any failure.
+        if crate::herdr::inside_herdr() {
+            let placement = crate::herdr::resume_placement(&self.config);
+            if placement != crate::herdr::ResumePlacement::Off {
+                let herdr_cwd = (!remote).then_some(cwd.as_str());
+                match crate::herdr::open_resume_pane(
+                    placement,
+                    herdr_cwd,
+                    &session.project,
+                    &command,
+                ) {
+                    Ok(_) => {
+                        self.set_status(format!(
+                            "resumed {} in a new herdr {}",
+                            session.session_id,
+                            if placement == crate::herdr::ResumePlacement::Split {
+                                "split"
+                            } else {
+                                "tab"
+                            }
+                        ));
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        self.set_status(format!("herdr resume failed ({err}); running inline"));
+                    }
+                }
+            }
+        }
         run_external_command(self, terminal, &command)?;
         self.set_status(format!("ran: {command}"));
         Ok(())
@@ -5486,67 +5494,17 @@ fn build_detail_lines_from_records(
 }
 
 fn expand_resume_template(template: &str, session: &SessionSummary, cwd: &str) -> String {
-    template
-        .replace("{session_id}", &session.session_id)
-        .replace("{project}", &session.project)
-        .replace("{source}", session.source.label())
-        .replace("{source_path_shell}", &shell_quote(&session.source_path))
-        .replace("{source_path}", &session.source_path)
-        .replace("{source_dir_shell}", &shell_quote(&session.source_dir))
-        .replace("{source_dir}", &session.source_dir)
-        .replace("{cwd_shell}", &shell_quote(cwd))
-        .replace("{cwd}", cwd)
-}
-
-fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
-    match cmd {
-        "claude" if remote || find_in_path("claude").is_some() => {
-            Some("cd {cwd_shell} && claude --resume {session_id}".to_string())
-        }
-        "codex" if remote || find_in_path("codex").is_some() => {
-            Some("codex resume {session_id}".to_string())
-        }
-        "opencode" if remote || find_in_path("opencode").is_some() => {
-            Some("opencode resume {session_id}".to_string())
-        }
-        "cursor" => (remote || find_in_path("cursor-agent").is_some())
-            .then(|| "cursor-agent --resume {session_id}".to_string()),
-        "pi" if remote || find_in_path("pi").is_some() => {
-            Some("pi --session {source_path_shell}".to_string())
-        }
-        "copilot" if remote || find_in_path("copilot").is_some() => {
-            Some("copilot --resume {session_id}".to_string())
-        }
-        _ => None,
-    }
-}
-
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
-}
-
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    crate::resume::expand_resume_template(
+        template,
+        &crate::resume::ResumeSession {
+            source: session.source,
+            session_id: &session.session_id,
+            project: &session.project,
+            source_path: &session.source_path,
+            source_dir: &session.source_dir,
+        },
+        cwd,
+    )
 }
 
 fn run_external_command(app: &mut App, terminal: &mut TuiTerminal, command: &str) -> Result<()> {
