@@ -145,6 +145,7 @@ fn handle_request(
             "application/javascript; charset=utf-8",
             false,
         ),
+        "/healthz" => respond_text(request, StatusCode(200), "ok", "text/plain"),
         "/api/stats" => match stats_payload(paths) {
             Ok(payload) => respond_json(request, StatusCode(200), &payload),
             Err(err) => respond_json_error(request, StatusCode(503), &err.to_string()),
@@ -1080,6 +1081,15 @@ mod tests {
             "GET / HTTP/1.1\r\nHost: localhost:6363\r\nConnection: close\r\n\r\n".to_string(),
         );
         assert!(bootstrap_page.starts_with("HTTP/1.1 200"));
+
+        let health = http_round_trip(
+            &paths,
+            &auth,
+            "GET /healthz HTTP/1.1\r\nHost: localhost:6363\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        );
+        assert!(health.starts_with("HTTP/1.1 200"));
+        assert!(health.ends_with("ok"));
 
         let unauthorized = http_round_trip(
             &paths,

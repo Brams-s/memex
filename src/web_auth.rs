@@ -136,19 +136,80 @@ fn load_or_create_secret(paths: &Paths) -> Result<[u8; ACCESS_TOKEN_BYTES]> {
     std::fs::create_dir_all(&paths.root)
         .with_context(|| format!("failed to create {}", paths.root.display()))?;
     let path = token_path(paths);
-    match open_secret_for_create(&path) {
-        Ok(mut file) => {
-            let mut secret = [0_u8; ACCESS_TOKEN_BYTES];
-            fill_random(&mut secret)?;
-            let encoded = URL_SAFE_NO_PAD.encode(secret);
+    match publish_new_secret(&path)? {
+        Some(secret) => Ok(secret),
+        None => read_secret(&path),
+    }
+}
+
+fn publish_new_secret(path: &Path) -> Result<Option<[u8; ACCESS_TOKEN_BYTES]>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("web auth token path has no parent: {}", path.display()))?;
+    let mut secret = [0_u8; ACCESS_TOKEN_BYTES];
+    fill_random(&mut secret)?;
+    let encoded = URL_SAFE_NO_PAD.encode(secret);
+
+    for _ in 0..16 {
+        let mut suffix = [0_u8; 16];
+        fill_random(&mut suffix)?;
+        let temp_path = parent.join(format!(
+            ".{TOKEN_FILE}.{}.tmp",
+            URL_SAFE_NO_PAD.encode(suffix)
+        ));
+        let mut file = match open_secret_for_create(&temp_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to create {}", temp_path.display()));
+            }
+        };
+
+        let write_result = (|| -> std::io::Result<()> {
             file.write_all(encoded.as_bytes())?;
             file.write_all(b"\n")?;
-            file.sync_all()?;
-            Ok(secret)
+            file.sync_all()
+        })();
+        if let Err(err) = write_result {
+            drop(file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err).with_context(|| format!("failed to write {}", temp_path.display()));
         }
-        Err(err) if err.kind() == ErrorKind::AlreadyExists => read_secret(&path),
-        Err(err) => Err(err).with_context(|| format!("failed to create {}", path.display())),
+        drop(file);
+
+        match std::fs::hard_link(&temp_path, path) {
+            Ok(()) => {
+                std::fs::remove_file(&temp_path).with_context(|| {
+                    format!("failed to remove temporary token {}", temp_path.display())
+                })?;
+                sync_directory(parent)?;
+                return Ok(Some(secret));
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Ok(None);
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(err).with_context(|| format!("failed to publish {}", path.display()));
+            }
+        }
     }
+
+    bail!("failed to allocate a temporary web auth token file")
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to sync {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn read_secret(path: &Path) -> Result<[u8; ACCESS_TOKEN_BYTES]> {
@@ -251,6 +312,39 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn concurrent_first_use_publishes_one_complete_access_token() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let paths = Paths::new(Some(root)).unwrap();
+                    barrier.wait();
+                    WebAuth::load_or_create(&paths).unwrap()
+                })
+            })
+            .collect();
+        let auths: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let paths = Paths::new(Some(root)).unwrap();
+        let token = std::fs::read_to_string(token_path(&paths)).unwrap();
+
+        assert!(auths.iter().all(|auth| auth.authorize_bearer(token.trim())));
+        assert_eq!(
+            std::fs::read_dir(&paths.root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1
         );
     }
 
