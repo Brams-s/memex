@@ -549,6 +549,56 @@ enum IndexServiceCommand {
         #[arg(long)]
         systemd_dir: Option<PathBuf>,
     },
+    /// Regenerate and restart the background indexing service using current config
+    Restart {
+        #[command(flatten)]
+        index: IndexArgs,
+        /// Service label/name [default: com.memex.index (macOS) or memex-index (Linux)]
+        #[arg(long)]
+        label: Option<String>,
+        /// Run as a long-lived process instead of periodic execution
+        #[arg(long)]
+        continuous: bool,
+        /// Seconds between index checks in continuous mode [default: 30]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
+        poll_interval: Option<u64>,
+        /// Seconds between invocations in interval mode [default: 3600]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
+        interval: Option<u64>,
+        /// Serve the local Web UI (implies continuous mode)
+        #[arg(long)]
+        web_ui: bool,
+        /// Web UI address and port [default: 127.0.0.1:6363] (implies --web-ui)
+        #[arg(long, value_name = "ADDRESS")]
+        web_listen: Option<String>,
+        /// Path for stdout log file [default: ~/.memex/index-service.log] (macOS only)
+        #[arg(long)]
+        stdout: Option<PathBuf>,
+        /// Path for stderr log file [default: ~/.memex/index-service.err.log] (macOS only)
+        #[arg(long)]
+        stderr: Option<PathBuf>,
+        /// Path to write launchd plist (macOS only) [default: ~/.memex/index-service.plist]
+        #[arg(long)]
+        plist: Option<PathBuf>,
+        /// Path to systemd user directory (Linux only) [default: ~/.config/systemd/user]
+        #[arg(long)]
+        systemd_dir: Option<PathBuf>,
+    },
+    /// Show the registered service state and Web UI status
+    Status {
+        /// Service label/name [default: com.memex.index (macOS) or memex-index (Linux)]
+        #[arg(long)]
+        label: Option<String>,
+        /// Path to launchd plist (macOS only) [default: ~/.memex/index-service.plist]
+        #[arg(long)]
+        plist: Option<PathBuf>,
+        /// Path to systemd user directory (Linux only) [default: ~/.config/systemd/user]
+        #[arg(long)]
+        systemd_dir: Option<PathBuf>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Disable and remove the background indexing service
     Disable {
         /// Service label/name [default: com.memex.index (macOS) or memex-index (Linux)]
@@ -696,6 +746,41 @@ pub fn run() -> Result<()> {
                     plist,
                     systemd_dir,
                 )?;
+            }
+            IndexServiceCommand::Restart {
+                index,
+                label,
+                continuous,
+                poll_interval,
+                interval,
+                web_ui,
+                web_listen,
+                stdout,
+                stderr,
+                plist,
+                systemd_dir,
+            } => {
+                run_index_service_enable(
+                    &index,
+                    label,
+                    continuous,
+                    poll_interval,
+                    interval,
+                    web_ui,
+                    web_listen,
+                    stdout,
+                    stderr,
+                    plist,
+                    systemd_dir,
+                )?;
+            }
+            IndexServiceCommand::Status {
+                label,
+                plist,
+                systemd_dir,
+                root,
+            } => {
+                run_index_service_status(label, plist, systemd_dir, root)?;
             }
             IndexServiceCommand::Disable {
                 label,
@@ -2919,22 +3004,28 @@ fn run_index_service_enable_systemd(
         return Err(anyhow!("systemctl daemon-reload failed"));
     }
 
-    // Enable and start the appropriate unit
+    // Enable and restart the appropriate unit. Restarting is necessary when an
+    // existing service was regenerated with different arguments from config.
+    let unit = if continuous {
+        format!("{}.service", label)
+    } else {
+        format!("{}.timer", label)
+    };
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "enable", &unit])
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("systemctl enable failed"));
+    }
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "restart", &unit])
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("systemctl restart failed"));
+    }
     if continuous {
-        let status = std::process::Command::new("systemctl")
-            .args(["--user", "enable", "--now", &format!("{}.service", label)])
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!("systemctl enable failed"));
-        }
         println!("enabled systemd service: {}", label);
     } else {
-        let status = std::process::Command::new("systemctl")
-            .args(["--user", "enable", "--now", &format!("{}.timer", label)])
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!("systemctl enable failed"));
-        }
         println!("enabled systemd timer: {}", label);
     }
 
@@ -2958,6 +3049,172 @@ fn run_index_service_disable(
         Err(anyhow!(
             "background service scheduling is only supported on macOS and Linux"
         ))
+    }
+}
+
+fn run_index_service_status(
+    label: Option<String>,
+    plist: Option<PathBuf>,
+    systemd_dir: Option<PathBuf>,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+
+    if cfg!(target_os = "macos") {
+        run_index_service_status_launchd(&config, &paths, label, plist)
+    } else if cfg!(target_os = "linux") {
+        run_index_service_status_systemd(&config, label, systemd_dir)
+    } else {
+        Err(anyhow!(
+            "background service scheduling is only supported on macOS and Linux"
+        ))
+    }
+}
+
+fn run_index_service_status_launchd(
+    config: &UserConfig,
+    paths: &Paths,
+    label: Option<String>,
+    plist: Option<PathBuf>,
+) -> Result<()> {
+    let label = label
+        .or_else(|| config.index_service_label.clone())
+        .unwrap_or_else(default_index_service_label);
+    let plist_path = plist
+        .or_else(|| config.index_service_plist.clone())
+        .unwrap_or_else(|| default_index_service_plist(&paths.root));
+    validate_service_label(&label)?;
+    let (_domain_target, service_target) = launchctl_targets(&label)?;
+    let output = std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(&service_target)
+        .output()?;
+
+    if !output.status.success() {
+        if launchctl_not_found(&output) {
+            println!("index service: stopped");
+            println!("label: {label}");
+            println!("definition: {}", plist_path.display());
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "launchctl print failed: {}",
+            format_command_output(&output)
+        ));
+    }
+
+    let state = String::from_utf8_lossy(&output.stdout);
+    let service_state = service_output_value(&state, "state").unwrap_or("loaded");
+    println!("index service: {service_state}");
+    println!("label: {label}");
+    println!(
+        "mode: {}",
+        if service_output_has_arg(&state, "--watch") {
+            "continuous"
+        } else {
+            "interval"
+        }
+    );
+    print_service_web_ui_status(&state);
+    println!("definition: {}", plist_path.display());
+    Ok(())
+}
+
+fn run_index_service_status_systemd(
+    config: &UserConfig,
+    label: Option<String>,
+    systemd_dir: Option<PathBuf>,
+) -> Result<()> {
+    let systemd_dir = systemd_dir
+        .or_else(|| config.index_service_systemd_dir.clone())
+        .unwrap_or_else(default_systemd_user_dir);
+    let label = label
+        .or_else(|| config.index_service_label.clone())
+        .unwrap_or_else(|| "memex-index".to_string());
+    validate_service_label(&label)?;
+
+    let service_path = systemd_dir.join(format!("{}.service", label));
+    let timer_path = systemd_dir.join(format!("{}.timer", label));
+    if !service_path.exists() && !timer_path.exists() {
+        println!("index service: stopped");
+        println!("label: {label}");
+        println!("definition: {}", service_path.display());
+        return Ok(());
+    }
+
+    let timer_state = systemd_unit_state(&format!("{}.timer", label))?;
+    let service_state = systemd_unit_state(&format!("{}.service", label))?;
+    let interval_mode = timer_path.exists() && timer_state == "active";
+    println!(
+        "index service: {}",
+        if interval_mode {
+            &timer_state
+        } else {
+            &service_state
+        }
+    );
+    println!("label: {label}");
+    println!(
+        "mode: {}",
+        if interval_mode {
+            "interval"
+        } else {
+            "continuous"
+        }
+    );
+    let definition = std::fs::read_to_string(&service_path).unwrap_or_default();
+    print_service_web_ui_status(&definition);
+    println!("definition: {}", service_path.display());
+    if interval_mode {
+        println!("timer: {}", timer_path.display());
+    }
+    Ok(())
+}
+
+fn systemd_unit_state(unit: &str) -> Result<String> {
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", unit])
+        .output()?;
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if state.is_empty() {
+        "inactive".to_string()
+    } else {
+        state
+    })
+}
+
+fn service_output_value<'a>(output: &'a str, key: &str) -> Option<&'a str> {
+    output.lines().find_map(|line| {
+        let (candidate, value) = line.trim().split_once(" = ")?;
+        (candidate == key).then_some(value.trim())
+    })
+}
+
+fn service_output_has_arg(output: &str, arg: &str) -> bool {
+    output.lines().any(|line| line.trim() == arg)
+}
+
+fn service_output_arg_value<'a>(output: &'a str, arg: &str) -> Option<&'a str> {
+    let mut lines = output.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line == arg {
+            return lines.next().filter(|value| !value.is_empty());
+        }
+        if let Some((_, tail)) = line.split_once(arg) {
+            return tail.split_whitespace().next();
+        }
+    }
+    None
+}
+
+fn print_service_web_ui_status(output: &str) {
+    if service_output_has_arg(output, "--web-ui") || output.contains(" --web-ui") {
+        let listen =
+            service_output_arg_value(output, "--web-listen").unwrap_or(crate::web::DEFAULT_LISTEN);
+        println!("web UI: http://{listen}");
+    } else {
+        println!("web UI: disabled");
     }
 }
 
@@ -4019,6 +4276,63 @@ mod tests {
         };
         assert!(!web_ui);
         assert_eq!(web_listen.as_deref(), Some("127.0.0.1:6363"));
+    }
+
+    #[test]
+    fn index_service_restart_accepts_service_options() {
+        let cli = Cli::try_parse_from([
+            "memex",
+            "index-service",
+            "restart",
+            "--web-listen",
+            "127.0.0.1:8080",
+        ])
+        .unwrap();
+
+        let Some(Commands::IndexService {
+            action:
+                IndexServiceCommand::Restart {
+                    web_ui, web_listen, ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected index service restart command");
+        };
+        assert!(!web_ui);
+        assert_eq!(web_listen.as_deref(), Some("127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn index_service_status_is_accepted() {
+        let cli = Cli::try_parse_from(["memex", "index-service", "status"]).unwrap();
+
+        let Some(Commands::IndexService {
+            action: IndexServiceCommand::Status { .. },
+        }) = cli.command
+        else {
+            panic!("expected index service status command");
+        };
+    }
+
+    #[test]
+    fn service_status_reads_registered_web_ui_arguments() {
+        let output = "\
+state = running
+arguments = {
+    /opt/homebrew/bin/memex
+    index
+    --watch
+    --web-ui
+    --web-listen
+    127.0.0.1:6363
+}";
+
+        assert_eq!(service_output_value(output, "state"), Some("running"));
+        assert!(service_output_has_arg(output, "--web-ui"));
+        assert_eq!(
+            service_output_arg_value(output, "--web-listen"),
+            Some("127.0.0.1:6363")
+        );
     }
 
     #[test]

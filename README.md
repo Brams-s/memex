@@ -294,6 +294,16 @@ memex index-service enable --continuous
 memex index-service enable --web-ui
 ```
 
+Regenerate the service from current config and restart it:
+```
+memex index-service restart
+```
+
+Inspect the registered service and whether it is serving the Web UI:
+```
+memex index-service status
+```
+
 Disable:
 ```
 memex index-service disable
