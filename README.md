@@ -304,6 +304,11 @@ Inspect the registered service and whether it is serving the Web UI:
 memex index-service status
 ```
 
+Open an authenticated browser session:
+```
+memex index-service open
+```
+
 Disable:
 ```
 memex index-service disable
@@ -318,17 +323,30 @@ On successful enable, memex writes `auto_index_on_search = false` to config when
 `http://127.0.0.1:6363`. It mirrors the TUI's core workflow with search-as-you-type,
 source and project filters, a persistent session list, and Matches/History transcript
 previews. The server binds to loopback by default because the index
-contains private conversation history. Override the address explicitly when needed:
+contains private conversation history. Memex refuses non-loopback HTTP listeners. If
+remote access is required, use an authenticated TLS reverse proxy to `127.0.0.1` that
+injects the installation bearer token into upstream requests. To use a different local port:
 
 ```
 memex index-service enable --web-listen 127.0.0.1:8080
+memex index-service open --listen 127.0.0.1:8080
 ```
+
+The first Web UI start creates `~/.memex/web-auth-token` with mode `0600`. Private API
+routes require that token as `Authorization: Bearer ...` or a browser session established
+by `index-service open`. Browser links carry a signed, one-time credential in the URL
+fragment, remove it before navigation continues, and exchange it for an ephemeral bearer
+token held only in page memory. The browser token is never stored in a cookie,
+`localStorage`, or session storage. Browser sessions expire after 12 hours, disappear when
+the page closes, and are invalidated whenever the daemon restarts.
 
 To run the same UI in the foreground without changing the background service:
 
 ```
 memex web
 ```
+
+Then run `memex index-service open` from another terminal.
 
 The browser frontend lives in `web/`, uses React and shadcn components, and is
 built with `cd web && bun install && bun run build`. The generated static assets

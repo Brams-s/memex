@@ -16,7 +16,7 @@ use crate::tui;
 use crate::types::{RecordLinks, SourceFilter};
 use crate::usage::{CostMode, UsageQuery, scan_usage};
 use crate::vector::VectorIndex;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::SecondsFormat;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -584,6 +584,15 @@ enum IndexServiceCommand {
         #[arg(long)]
         systemd_dir: Option<PathBuf>,
     },
+    /// Open the authenticated Web UI in the default browser
+    Open {
+        /// Web UI address and port [default: config or 127.0.0.1:6363]
+        #[arg(long, value_name = "ADDRESS")]
+        listen: Option<String>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Show the registered service state and Web UI status
     Status {
         /// Service label/name [default: com.memex.index (macOS) or memex-index (Linux)]
@@ -781,6 +790,9 @@ pub fn run() -> Result<()> {
                 root,
             } => {
                 run_index_service_status(label, plist, systemd_dir, root)?;
+            }
+            IndexServiceCommand::Open { listen, root } => {
+                run_index_service_open(listen, root)?;
             }
             IndexServiceCommand::Disable {
                 label,
@@ -2782,6 +2794,9 @@ fn run_index_service_enable(
     };
     let poll_interval = poll_interval.unwrap_or(config.index_service_poll_interval());
     let interval = interval.unwrap_or(config.index_service_interval());
+    if web_ui {
+        crate::web::validate_listener(&web_listen)?;
+    }
 
     let exe = std::env::current_exe()?;
     let program_args =
@@ -2982,6 +2997,15 @@ fn run_index_service_enable_systemd(
 
     let service_path = systemd_dir.join(format!("{}.service", label));
     let timer_path = systemd_dir.join(format!("{}.timer", label));
+    let existing_mode = registered_systemd_mode(&service_path, &timer_path)?;
+    if let Some(counterpart) =
+        systemd_counterpart_unit(&label, continuous, existing_mode, timer_path.exists())
+    {
+        run_systemctl(
+            &["--user", "disable", "--now", &counterpart],
+            "systemctl disable counterpart",
+        )?;
+    }
 
     let env_vars = service_environment_variables(None)?;
     let service_contents =
@@ -2994,15 +3018,13 @@ fn run_index_service_enable_systemd(
         let timer_contents = build_systemd_timer(interval);
         std::fs::write(&timer_path, timer_contents)?;
         println!("wrote systemd timer: {}", timer_path.display());
+    } else if timer_path.exists() {
+        std::fs::remove_file(&timer_path)?;
+        println!("removed obsolete systemd timer: {}", timer_path.display());
     }
 
     // Reload systemd user daemon
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("systemctl daemon-reload failed"));
-    }
+    run_systemctl(&["--user", "daemon-reload"], "systemctl daemon-reload")?;
 
     // Enable and restart the appropriate unit. Restarting is necessary when an
     // existing service was regenerated with different arguments from config.
@@ -3011,18 +3033,8 @@ fn run_index_service_enable_systemd(
     } else {
         format!("{}.timer", label)
     };
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "enable", &unit])
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("systemctl enable failed"));
-    }
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "restart", &unit])
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("systemctl restart failed"));
-    }
+    run_systemctl(&["--user", "enable", &unit], "systemctl enable service")?;
+    run_systemctl(&["--user", "restart", &unit], "systemctl restart service")?;
     if continuous {
         println!("enabled systemd service: {}", label);
     } else {
@@ -3070,6 +3082,29 @@ fn run_index_service_status(
             "background service scheduling is only supported on macOS and Linux"
         ))
     }
+}
+
+fn run_index_service_open(listen: Option<String>, root: Option<PathBuf>) -> Result<()> {
+    let paths = Paths::new(root.clone())?;
+    let config = UserConfig::load(&paths)?;
+    let listen = listen
+        .or(config.index_service_web_listen)
+        .unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string());
+    let url = crate::web::bootstrap_url(root, &listen)?;
+    let status = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&url).status()?
+    } else if cfg!(target_os = "linux") {
+        std::process::Command::new("xdg-open").arg(&url).status()?
+    } else {
+        return Err(anyhow!(
+            "opening a browser is only supported on macOS and Linux"
+        ));
+    };
+    if !status.success() {
+        return Err(anyhow!("failed to open the authenticated Web UI"));
+    }
+    println!("opened authenticated web UI");
+    Ok(())
 }
 
 fn run_index_service_status_launchd(
@@ -3143,30 +3178,31 @@ fn run_index_service_status_systemd(
         return Ok(());
     }
 
-    let timer_state = systemd_unit_state(&format!("{}.timer", label))?;
-    let service_state = systemd_unit_state(&format!("{}.service", label))?;
-    let interval_mode = timer_path.exists() && timer_state == "active";
-    println!(
-        "index service: {}",
-        if interval_mode {
-            &timer_state
-        } else {
-            &service_state
-        }
-    );
+    let mode = registered_systemd_mode(&service_path, &timer_path)?
+        .ok_or_else(|| anyhow!("unable to determine registered systemd service mode"))?;
+    let unit = match mode {
+        SystemdServiceMode::Continuous => format!("{}.service", label),
+        SystemdServiceMode::Interval => format!("{}.timer", label),
+    };
+    let state = systemd_unit_state(&unit)?;
+    println!("index service: {state}");
     println!("label: {label}");
     println!(
         "mode: {}",
-        if interval_mode {
-            "interval"
-        } else {
-            "continuous"
+        match mode {
+            SystemdServiceMode::Continuous => "continuous",
+            SystemdServiceMode::Interval => "interval",
         }
     );
-    let definition = std::fs::read_to_string(&service_path).unwrap_or_default();
+    let definition = if service_path.exists() {
+        std::fs::read_to_string(&service_path)
+            .with_context(|| format!("failed to read {}", service_path.display()))?
+    } else {
+        String::new()
+    };
     print_service_web_ui_status(&definition);
     println!("definition: {}", service_path.display());
-    if interval_mode {
+    if mode == SystemdServiceMode::Interval {
         println!("timer: {}", timer_path.display());
     }
     Ok(())
@@ -3176,12 +3212,93 @@ fn systemd_unit_state(unit: &str) -> Result<String> {
     let output = std::process::Command::new("systemctl")
         .args(["--user", "is-active", unit])
         .output()?;
+    parse_systemd_unit_state(unit, &output)
+}
+
+fn parse_systemd_unit_state(unit: &str, output: &std::process::Output) -> Result<String> {
     let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(if state.is_empty() {
-        "inactive".to_string()
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() || (stderr.trim().is_empty() && is_known_systemd_unit_state(&state))
+    {
+        return Ok(if state.is_empty() {
+            "inactive".to_string()
+        } else {
+            state
+        });
+    }
+    Err(anyhow!(
+        "systemctl is-active {unit} failed: {}",
+        format_command_output(output)
+    ))
+}
+
+fn is_known_systemd_unit_state(state: &str) -> bool {
+    matches!(
+        state,
+        "active"
+            | "reloading"
+            | "inactive"
+            | "failed"
+            | "activating"
+            | "deactivating"
+            | "maintenance"
+            | "refreshing"
+            | "unknown"
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemdServiceMode {
+    Continuous,
+    Interval,
+}
+
+fn registered_systemd_mode(
+    service_path: &std::path::Path,
+    timer_path: &std::path::Path,
+) -> Result<Option<SystemdServiceMode>> {
+    if service_path.exists() {
+        let service = std::fs::read_to_string(service_path)
+            .with_context(|| format!("failed to read {}", service_path.display()))?;
+        if service.lines().any(|line| line.trim() == "Type=oneshot") {
+            return Ok(Some(SystemdServiceMode::Interval));
+        }
+        if service.lines().any(|line| line.trim() == "Type=simple") {
+            return Ok(Some(SystemdServiceMode::Continuous));
+        }
+    }
+    if timer_path.exists() {
+        return Ok(Some(SystemdServiceMode::Interval));
+    }
+    Ok(None)
+}
+
+fn systemd_counterpart_unit(
+    label: &str,
+    continuous: bool,
+    existing_mode: Option<SystemdServiceMode>,
+    timer_exists: bool,
+) -> Option<String> {
+    if continuous && timer_exists {
+        Some(format!("{label}.timer"))
+    } else if !continuous && existing_mode == Some(SystemdServiceMode::Continuous) {
+        Some(format!("{label}.service"))
     } else {
-        state
-    })
+        None
+    }
+}
+
+fn run_systemctl(args: &[&str], operation: &str) -> Result<()> {
+    let output = std::process::Command::new("systemctl")
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{operation} failed: {}",
+            format_command_output(&output)
+        ));
+    }
+    Ok(())
 }
 
 fn service_output_value<'a>(output: &'a str, key: &str) -> Option<&'a str> {
@@ -4315,6 +4432,26 @@ mod tests {
     }
 
     #[test]
+    fn index_service_open_accepts_local_listener() {
+        let cli = Cli::try_parse_from([
+            "memex",
+            "index-service",
+            "open",
+            "--listen",
+            "127.0.0.1:8080",
+        ])
+        .unwrap();
+
+        let Some(Commands::IndexService {
+            action: IndexServiceCommand::Open { listen, .. },
+        }) = cli.command
+        else {
+            panic!("expected index service open command");
+        };
+        assert_eq!(listen.as_deref(), Some("127.0.0.1:8080"));
+    }
+
+    #[test]
     fn service_status_reads_registered_web_ui_arguments() {
         let output = "\
 state = running
@@ -4487,5 +4624,168 @@ arguments = {
             "Environment=\"PI_CODING_AGENT_SESSION_DIR=/tmp/pi \\\"sessions\\\" 100%%\"\n"
         ));
         assert!(service.contains("ExecStart=/usr/bin/memex index --no-pi\n"));
+    }
+
+    #[test]
+    fn registered_systemd_mode_comes_from_definition_not_activity_or_stale_timer() {
+        let temp = TempDir::new().unwrap();
+        let service_path = temp.path().join("memex-index.service");
+        let timer_path = temp.path().join("memex-index.timer");
+        std::fs::write(
+            &service_path,
+            build_systemd_service("/usr/bin/memex", &[], true, &[]),
+        )
+        .unwrap();
+        std::fs::write(&timer_path, build_systemd_timer(60)).unwrap();
+
+        assert_eq!(
+            registered_systemd_mode(&service_path, &timer_path).unwrap(),
+            Some(SystemdServiceMode::Continuous)
+        );
+
+        std::fs::write(
+            &service_path,
+            build_systemd_service("/usr/bin/memex", &[], false, &[]),
+        )
+        .unwrap();
+        std::fs::remove_file(&timer_path).unwrap();
+        assert_eq!(
+            registered_systemd_mode(&service_path, &timer_path).unwrap(),
+            Some(SystemdServiceMode::Interval)
+        );
+    }
+
+    #[test]
+    fn systemd_mode_changes_disable_the_previous_unit() {
+        assert_eq!(
+            systemd_counterpart_unit(
+                "memex-index",
+                false,
+                Some(SystemdServiceMode::Continuous),
+                false,
+            )
+            .as_deref(),
+            Some("memex-index.service")
+        );
+        assert_eq!(
+            systemd_counterpart_unit(
+                "memex-index",
+                true,
+                Some(SystemdServiceMode::Interval),
+                true,
+            )
+            .as_deref(),
+            Some("memex-index.timer")
+        );
+        assert_eq!(
+            systemd_counterpart_unit(
+                "memex-index",
+                true,
+                Some(SystemdServiceMode::Continuous),
+                true,
+            )
+            .as_deref(),
+            Some("memex-index.timer")
+        );
+        assert_eq!(
+            systemd_counterpart_unit(
+                "memex-index",
+                false,
+                Some(SystemdServiceMode::Interval),
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn systemd_regeneration_stops_counterpart_and_removes_obsolete_timer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_lock();
+        let temp = TempDir::new().unwrap();
+        let bin_dir = temp.path().join("bin");
+        let systemd_dir = temp.path().join("systemd");
+        let log_path = temp.path().join("systemctl.log");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&systemd_dir).unwrap();
+        let systemctl = bin_dir.join("systemctl");
+        std::fs::write(
+            &systemctl,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MEMEX_TEST_SYSTEMCTL_LOG\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bin_path = bin_dir.as_os_str();
+        let log_path_os = log_path.as_os_str();
+        let _env = EnvVarGuard::set_os(&[
+            ("PATH", Some(bin_path)),
+            ("MEMEX_TEST_SYSTEMCTL_LOG", Some(log_path_os)),
+        ]);
+        let service_path = systemd_dir.join("memex-index.service");
+        let timer_path = systemd_dir.join("memex-index.timer");
+        std::fs::write(
+            &service_path,
+            build_systemd_service("/usr/bin/memex", &[], true, &[]),
+        )
+        .unwrap();
+
+        run_index_service_enable_systemd(
+            &UserConfig::default(),
+            Some("memex-index".to_string()),
+            false,
+            60,
+            30,
+            Some(systemd_dir.clone()),
+            std::path::Path::new("/usr/bin/memex"),
+            &["index".to_string()],
+        )
+        .unwrap();
+        assert!(timer_path.exists());
+
+        run_index_service_enable_systemd(
+            &UserConfig::default(),
+            Some("memex-index".to_string()),
+            true,
+            60,
+            30,
+            Some(systemd_dir),
+            std::path::Path::new("/usr/bin/memex"),
+            &["index".to_string(), "--watch".to_string()],
+        )
+        .unwrap();
+        assert!(!timer_path.exists());
+
+        let commands = std::fs::read_to_string(log_path).unwrap();
+        assert!(commands.contains("--user disable --now memex-index.service"));
+        assert!(commands.contains("--user restart memex-index.timer"));
+        assert!(commands.contains("--user disable --now memex-index.timer"));
+        assert!(commands.contains("--user restart memex-index.service"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn systemd_unit_state_accepts_inactive_and_propagates_manager_failures() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let inactive = std::process::Output {
+            status: std::process::ExitStatus::from_raw(3 << 8),
+            stdout: b"inactive\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            parse_systemd_unit_state("memex-index.service", &inactive).unwrap(),
+            "inactive"
+        );
+
+        let unavailable = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"Failed to connect to bus".to_vec(),
+        };
+        let error = parse_systemd_unit_state("memex-index.service", &unavailable).unwrap_err();
+        assert!(error.to_string().contains("Failed to connect to bus"));
     }
 }
