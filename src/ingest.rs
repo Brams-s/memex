@@ -35,6 +35,7 @@ pub struct IngestOptions {
     pub include_opencode: bool,
     pub include_cursor: bool,
     pub include_pi: bool,
+    pub include_omp: bool,
     pub include_openclaw: bool,
     pub include_copilot: bool,
     pub embeddings: bool,
@@ -565,6 +566,32 @@ pub fn ingest_all(
         }
     }
 
+    if options.include_omp {
+        let omp_files = crate::sources::omp::discover();
+        for source_file in omp_files {
+            let path = source_file.path;
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Omp,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+
     if options.include_openclaw {
         for source_file in crate::sources::openclaw::discover() {
             let path = source_file.path;
@@ -720,6 +747,14 @@ pub fn ingest_all(
                     &next_doc_id,
                     &progress,
                     &opencode_session_links,
+                ),
+                SourceKind::Omp => parse_omp_file(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
                 ),
                 SourceKind::Cursor => {
                     parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)
@@ -1241,6 +1276,38 @@ fn parse_pi_file(
         parsed,
     )
 }
+fn parse_omp_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::omp::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Omp, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Omp,
+        source_path,
+        parsed,
+    )
+}
 fn parse_openclaw_file(
     task: &FileTask,
     include_reasoning: bool,
@@ -1472,6 +1539,7 @@ mod tests {
             include_opencode: false,
             include_cursor: false,
             include_pi: false,
+            include_omp: false,
             include_openclaw: false,
             include_copilot: false,
             embeddings,
@@ -2326,6 +2394,7 @@ mod tests {
             include_opencode: false,
             include_cursor: false,
             include_pi: false,
+            include_omp: false,
             include_openclaw: false,
             include_copilot: false,
             embeddings: false,
@@ -2685,6 +2754,7 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let pi_root = tmp.path().join("pi-agent");
+        let omp_root = tmp.path().join("omp");
         let sessions_root = pi_root.join("sessions").join("--Users-nico-Code-memex--");
         fs::create_dir_all(&sessions_root).expect("create pi sessions");
         let session_file =
@@ -2705,7 +2775,12 @@ mod tests {
 "#,
         )
         .expect("write pi fixture");
-        let _env = EnvVarGuard::set_os(&[("PI_CODING_AGENT_DIR", Some(pi_root.as_os_str()))]);
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CODING_AGENT_DIR", Some(pi_root.as_os_str())),
+            ("PI_CODING_AGENT_SESSION_DIR", None),
+            ("PI_CONFIG_DIR", Some(omp_root.as_os_str())),
+            ("XDG_DATA_HOME", None),
+        ]);
 
         let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
         paths.ensure_dirs().expect("ensure dirs");
@@ -2718,6 +2793,7 @@ mod tests {
             include_opencode: false,
             include_cursor: false,
             include_pi: true,
+            include_omp: false,
             include_openclaw: false,
             include_copilot: false,
             embeddings: false,
@@ -2808,6 +2884,66 @@ mod tests {
             Some("branch")
         );
         assert!(!records.iter().any(|record| record.text.contains("secret")));
+    }
+
+    #[test]
+    fn ingest_omp_session_from_agent_root_override() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let omp_agent_root = tmp.path().join("omp-agent");
+        let pi_sessions = tmp.path().join("pi-sessions");
+        let session_dir = omp_agent_root
+            .join("sessions")
+            .join("--Users-nico-Code-omp--");
+        fs::create_dir_all(&session_dir).expect("create omp session dir");
+        let session_file = session_dir.join("omp-session.jsonl");
+        fs::write(
+            &session_file,
+            include_str!("../fixtures/trajectory_parity/omp.jsonl"),
+        )
+        .expect("write omp fixture");
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CONFIG_DIR", None),
+            ("PI_CODING_AGENT_SESSION_DIR", Some(pi_sessions.as_os_str())),
+            ("PI_CODING_AGENT_DIR", Some(omp_agent_root.as_os_str())),
+            ("XDG_DATA_HOME", None),
+        ]);
+
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = SearchIndex::open_or_create(&paths.index).expect("index");
+        let mut options = ingest_options(false, ModelChoice::default());
+        options.include_omp = true;
+        let lease = ingest_lease(&paths);
+        let report = ingest_all(&paths, &index, &options, &lease).expect("ingest");
+        assert_eq!(report.files_scanned, 1);
+        assert_eq!(report.records_added, 4);
+
+        let records = index
+            .records_by_session_id("omp-session")
+            .expect("records by session");
+        assert_eq!(records.len(), 4);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source == SourceKind::Omp)
+        );
+        assert!(records.iter().all(|record| record.project == "omp-project"));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.text == "Inspect the project")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.text == "project contents")
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source_path == session_file.to_string_lossy())
+        );
     }
 
     #[test]
@@ -2927,8 +3063,8 @@ mod tests {
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
         let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, meta.len(), 0],
-            [0, 0, 0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 0, meta.len(), 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0, 0],
             false,
         ));
 

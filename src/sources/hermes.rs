@@ -735,7 +735,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let invalid_directory = std::ffi::OsString::from_vec(b"profile-\xFF".to_vec());
         let directory = temp.path().join(invalid_directory);
-        fs::create_dir(&directory).unwrap();
+        if let Err(error) = fs::create_dir(&directory) {
+            if error.kind() == std::io::ErrorKind::InvalidInput
+                || error.raw_os_error() == Some(libc::EILSEQ)
+            {
+                return;
+            }
+            panic!("create invalid-UTF-8 directory: {error}");
+        }
         let path = directory.join("state.db");
         db(&path, false);
         let conn = Connection::open(&path).unwrap();

@@ -33,7 +33,7 @@ use std::time::Duration;
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, OpenClaw, Copilot, and Hermes",
+    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, and Hermes",
     after_help = "\
 QUICK START:
     memex                           # Browse sessions interactively
@@ -81,6 +81,12 @@ struct IndexArgs {
     /// Skip indexing Pi sessions
     #[arg(long = "no-pi", default_value_t = false)]
     no_pi: bool,
+    /// Index Oh My Pi sessions from ~/.omp/agent/sessions [default: true]
+    #[arg(long, default_value_t = true)]
+    omp: bool,
+    /// Skip indexing Oh My Pi sessions
+    #[arg(long = "no-omp", default_value_t = false)]
+    no_omp: bool,
     /// Index OpenClaw sessions from ~/.openclaw or ~/.clawdbot [default: true]
     #[arg(long, default_value_t = true)]
     openclaw: bool,
@@ -113,7 +119,7 @@ struct IndexArgs {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Index Claude, Codex, Cursor, OpenCode, Pi, OpenClaw, and Copilot conversation history
+    /// Index Claude, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, and Copilot conversation history
     #[command(after_help = "\
 EXAMPLES:
     memex index                         # Index all supported local history
@@ -183,7 +189,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, copilot, or hermes
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -301,7 +307,7 @@ EXAMPLES:
         /// Filter by project (repository grouping)
         #[arg(long)]
         project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, copilot, or hermes
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include sessions active on or after this date/timestamp
@@ -336,7 +342,7 @@ EXAMPLES:
     memex usage --source codex --since 2026-07-01
     memex usage --json")]
     Usage {
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, copilot, or hermes
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include events on or after this date/timestamp
@@ -449,10 +455,13 @@ EXAMPLES:
 enum HerdrCommand {
     /// Resume the most recent resumable session, opening a new herdr tab
     ResumeLast {
-        /// Prefer sessions from this directory (falls back to the global latest)
+        /// Prefer sessions from this directory (falls back to the global latest unless strict)
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, copilot, or hermes
+        /// Refuse when no resumable session exists in --cwd instead of using another project
+        #[arg(long)]
+        strict_cwd: bool,
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -829,15 +838,20 @@ pub fn run() -> Result<()> {
             run_sessions(cwd, project, source, since, limit, json_array, root)?;
         }
         Commands::Herdr { action } => match action {
-            HerdrCommand::ResumeLast { cwd, source, root } => {
-                run_herdr_resume(None, cwd, source, root)?;
+            HerdrCommand::ResumeLast {
+                cwd,
+                strict_cwd,
+                source,
+                root,
+            } => {
+                run_herdr_resume(None, cwd, strict_cwd, source, root)?;
             }
             HerdrCommand::Resume {
                 session_id,
                 source,
                 root,
             } => {
-                run_herdr_resume(Some(session_id), None, source, root)?;
+                run_herdr_resume(Some(session_id), None, false, source, root)?;
             }
         },
         Commands::Stats { root } => {
@@ -924,6 +938,7 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
         index.opencode && !index.no_opencode,
         index.cursor,
         index.pi && !index.no_pi,
+        index.omp && !index.no_omp,
         index.openclaw && !index.no_openclaw,
         index.copilot && !index.no_copilot,
         index.embeddings,
@@ -944,6 +959,7 @@ fn run_index(
     opencode: bool,
     cursor: bool,
     pi: bool,
+    omp: bool,
     openclaw: bool,
     copilot: bool,
     embeddings_flag: bool,
@@ -983,6 +999,7 @@ fn run_index(
         include_opencode: opencode,
         include_cursor: cursor,
         include_pi: pi,
+        include_omp: omp,
         include_openclaw: openclaw,
         include_copilot: copilot,
         embeddings,
@@ -1229,6 +1246,7 @@ fn run_search(
             include_opencode: true,
             include_cursor: true,
             include_pi: true,
+            include_omp: true,
             include_openclaw: true,
             include_copilot: true,
             embeddings: config.embeddings_default(),
@@ -2283,6 +2301,7 @@ fn run_sessions(
 fn run_herdr_resume(
     session_id: Option<String>,
     cwd: Option<PathBuf>,
+    strict_cwd: bool,
     source: Option<SourceFilter>,
     root: Option<PathBuf>,
 ) -> Result<()> {
@@ -2298,8 +2317,9 @@ fn run_herdr_resume(
         if rows.is_empty() {
             return Err(anyhow!("session '{session_id}' not found"));
         }
-    } else if rows.is_empty() && cwd_filter.is_some() {
-        // No sessions recorded for this directory; fall back to the global latest.
+    } else if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
+        // The public CLI keeps its historical global fallback unless the Herdr plugin
+        // explicitly requires the focused directory to match.
         rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
     }
 
@@ -2390,13 +2410,28 @@ fn run_setup(force: bool) -> Result<()> {
     let codex_path = find_in_path("codex");
     let opencode_path = find_in_path("opencode");
     let pi_path = find_in_path("pi");
+    let omp_path = find_in_path("omp");
 
-    if claude_path.is_none() && codex_path.is_none() && opencode_path.is_none() && pi_path.is_none()
+    if claude_path.is_none()
+        && codex_path.is_none()
+        && opencode_path.is_none()
+        && pi_path.is_none()
+        && omp_path.is_none()
     {
         return Err(anyhow!(
-            "Neither claude, codex, opencode, nor pi found in PATH"
+            "Neither claude, codex, opencode, pi, nor omp found in PATH"
         ));
     }
+
+    let shared_agents = [
+        ("Codex", codex_path.as_ref()),
+        ("Opencode", opencode_path.as_ref()),
+        ("Pi", pi_path.as_ref()),
+        ("Oh My Pi", omp_path.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, path)| path.map(|_| name))
+    .collect::<Vec<_>>();
 
     // Show what will be installed
     let action = if force { "install/update" } else { "install" };
@@ -2404,14 +2439,11 @@ fn run_setup(force: bool) -> Result<()> {
     if claude_path.is_some() {
         println!("  Claude Code: memex-search skill, instruction-improver skill");
     }
-    if codex_path.is_some() {
-        println!("  Codex: memex-search skill");
-    }
-    if opencode_path.is_some() {
-        println!("  Opencode: memex-search skill");
-    }
-    if pi_path.is_some() {
-        println!("  Pi: memex-search skill");
+    if !shared_agents.is_empty() {
+        println!(
+            "  Shared agents ({}): memex-search skill",
+            shared_agents.join(", ")
+        );
     }
     if force {
         println!();
@@ -2427,16 +2459,11 @@ fn run_setup(force: bool) -> Result<()> {
         items.push(("claude", format!("Claude Code ({})", path.display())));
         defaults.push(true);
     }
-    if let Some(path) = &codex_path {
-        items.push(("codex", format!("Codex ({})", path.display())));
-        defaults.push(true);
-    }
-    if let Some(path) = &opencode_path {
-        items.push(("opencode", format!("Opencode ({})", path.display())));
-        defaults.push(true);
-    }
-    if let Some(path) = &pi_path {
-        items.push(("pi", format!("Pi ({})", path.display())));
+    if !shared_agents.is_empty() {
+        items.push((
+            "agents",
+            format!("Shared agents ({})", shared_agents.join(", ")),
+        ));
         defaults.push(true);
     }
 
@@ -2470,6 +2497,12 @@ fn run_setup(force: bool) -> Result<()> {
         home.join(".codex/skills/memex-search.md"),
         home.join(".local/share/opencode/skills/memex-search.md"),
         pi_agent_root().join("skills/memex-search.md"),
+        omp_agent_root().join("skills/memex-search.md"),
+        // Gen 3: agent-specific copies superseded by the shared agentskills.io root
+        home.join(".codex/skills/memex-search"),
+        home.join(".local/share/opencode/skills/memex-search"),
+        pi_agent_root().join("skills/memex-search"),
+        omp_agent_root().join("skills/memex-search"),
     ];
     for path in &stale_paths {
         if path.is_dir() {
@@ -2487,11 +2520,8 @@ fn run_setup(force: bool) -> Result<()> {
         }
     }
 
-    let claude_skill = include_str!("../skills/memex-search/SKILL.md");
+    let memex_skill = include_str!("../skills/memex-search/SKILL.md");
     let instruction_improver_skill = include_str!("../skills/instruction-improver/SKILL.md");
-    let codex_skill = include_str!("../skills/codex/memex-search/SKILL.md");
-    let opencode_skill = include_str!("../skills/opencode/memex-search/SKILL.md");
-    let pi_skill = include_str!("../skills/pi/memex-search/SKILL.md");
 
     for index in selected {
         let (tool, _) = &items[index];
@@ -2507,7 +2537,7 @@ fn run_setup(force: bool) -> Result<()> {
                     );
                 } else {
                     std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, claude_skill)?;
+                    std::fs::write(&dest, memex_skill)?;
                     let verb = if dest.exists() {
                         "Updated"
                     } else {
@@ -2541,66 +2571,23 @@ fn run_setup(force: bool) -> Result<()> {
                     );
                 }
             }
-            "codex" => {
-                let dest_dir = home.join(".codex").join("skills").join("memex-search");
+            "agents" => {
+                let dest_dir = home.join(".agents").join("skills").join("memex-search");
                 let dest = dest_dir.join("SKILL.md");
                 if dest.exists() && !force {
                     println!(
-                        "Skipping Codex skill (already installed at {}). Use --force to overwrite.",
+                        "Skipping shared memex-search skill (already installed at {}). Use --force to overwrite.",
                         dest.display()
                     );
                 } else {
                     std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, codex_skill)?;
+                    std::fs::write(&dest, memex_skill)?;
                     let verb = if dest.exists() {
                         "Updated"
                     } else {
                         "Installed"
                     };
-                    println!("{verb} Codex skill at {}.", dest.display());
-                }
-            }
-            "opencode" => {
-                let dest_dir = home
-                    .join(".local")
-                    .join("share")
-                    .join("opencode")
-                    .join("skills")
-                    .join("memex-search");
-                let dest = dest_dir.join("SKILL.md");
-                if dest.exists() && !force {
-                    println!(
-                        "Skipping Opencode skill (already installed at {}). Use --force to overwrite.",
-                        dest.display()
-                    );
-                } else {
-                    std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, opencode_skill)?;
-                    let verb = if dest.exists() {
-                        "Updated"
-                    } else {
-                        "Installed"
-                    };
-                    println!("{verb} Opencode skill at {}.", dest.display());
-                }
-            }
-            "pi" => {
-                let dest_dir = pi_agent_root().join("skills").join("memex-search");
-                let dest = dest_dir.join("SKILL.md");
-                if dest.exists() && !force {
-                    println!(
-                        "Skipping Pi skill (already installed at {}). Use --force to overwrite.",
-                        dest.display()
-                    );
-                } else {
-                    std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, pi_skill)?;
-                    let verb = if dest.exists() {
-                        "Updated"
-                    } else {
-                        "Installed"
-                    };
-                    println!("{verb} Pi skill at {}.", dest.display());
+                    println!("{verb} shared memex-search skill at {}.", dest.display());
                 }
             }
             _ => {}
@@ -2608,7 +2595,7 @@ fn run_setup(force: bool) -> Result<()> {
     }
 
     println!();
-    println!("Done! Restart Claude Code, Codex, Opencode, or Pi to pick up changes.");
+    println!("Done! Restart Claude Code, Codex, Opencode, Pi, or Oh My Pi to pick up changes.");
 
     Ok(())
 }
@@ -2641,6 +2628,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Pi => "pi",
         crate::types::SourceKind::OpenClaw => "openclaw",
         crate::types::SourceKind::Copilot => "copilot",
+        crate::types::SourceKind::Omp => "omp",
         crate::types::SourceKind::Hermes => "hermes",
     };
     let source_path = &record.source_path;
@@ -2727,6 +2715,10 @@ fn pi_agent_root() -> PathBuf {
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/"));
     home.join(".pi").join("agent")
+}
+
+fn omp_agent_root() -> PathBuf {
+    crate::sources::omp::agent_root()
 }
 
 #[cfg(unix)]
@@ -3557,6 +3549,9 @@ fn build_index_command_args(
     if !index.pi || index.no_pi {
         args.push("--no-pi".to_string());
     }
+    if !index.omp || index.no_omp {
+        args.push("--no-omp".to_string());
+    }
     if !index.openclaw || index.no_openclaw {
         args.push("--no-openclaw".to_string());
     }
@@ -4313,11 +4308,13 @@ mod tests {
             opencode: false,
             cursor: false,
             pi: false,
+            omp: false,
             openclaw: false,
             copilot: false,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
+            no_omp: false,
             no_openclaw: false,
             no_copilot: false,
             embeddings: false,
@@ -4334,6 +4331,7 @@ mod tests {
         assert!(args.contains(&"--no-cursor".to_string()));
         assert!(args.contains(&"--no-pi".to_string()));
         assert!(args.contains(&"--no-openclaw".to_string()));
+        assert!(args.contains(&"--no-omp".to_string()));
         assert!(args.contains(&"--no-copilot".to_string()));
     }
 
@@ -4347,11 +4345,13 @@ mod tests {
             opencode: true,
             cursor: true,
             pi: true,
+            omp: true,
             openclaw: true,
             copilot: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
+            no_omp: false,
             no_openclaw: false,
             no_copilot: false,
             embeddings: false,

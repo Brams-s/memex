@@ -513,11 +513,12 @@ fn assemble_usage_events(
     };
     type SourceScanner =
         fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
-    const SCANNERS: [(SourceFilter, SourceScanner); 8] = [
+    const SCANNERS: [(SourceFilter, SourceScanner); 9] = [
         (SourceFilter::Claude, scan_claude),
         (SourceFilter::Codex, scan_codex),
         (SourceFilter::Opencode, scan_opencode),
         (SourceFilter::Pi, scan_pi),
+        (SourceFilter::Omp, scan_omp),
         (SourceFilter::OpenClaw, scan_openclaw),
         (SourceFilter::Cursor, scan_cursor),
         (SourceFilter::Copilot, scan_copilot),
@@ -849,7 +850,10 @@ impl UsageCache {
                 let size = row.get::<_, i64>(1)? as u64;
                 let mtime_ns = row.get::<_, i64>(2)?;
                 let scanned_at_ms = row.get::<_, i64>(3)?;
-                let events_blob = row.get::<_, Vec<u8>>(4)?;
+                let Ok(events_blob) = row.get::<_, Vec<u8>>(4) else {
+                    invalid_paths.push(path);
+                    continue;
+                };
                 let Ok(deps_blob) = row.get::<_, Vec<u8>>(5) else {
                     invalid_paths.push(path);
                     continue;
@@ -1254,6 +1258,30 @@ fn scan_pi(
     Ok(())
 }
 
+fn scan_omp(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::omp::discover()
+        .into_iter()
+        .map(|file| file.path)
+        .collect::<Vec<_>>();
+    scan_files_cached(
+        SourceScan {
+            source: "omp",
+            parser_version: crate::sources::omp::VERSIONS.usage,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::omp::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
 fn scan_openclaw(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
@@ -1552,6 +1580,67 @@ mod tests {
             .connection
             .query_row(
                 "SELECT count(*) FROM usage_file_cache WHERE source = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+    #[test]
+    fn malformed_dependency_rows_are_quarantined() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&path).expect("open cache");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('omp', '/tmp/session.jsonl', 1, 10, 20, 30, ?1, ?2)",
+                params![
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                    vec![0xff_u8]
+                ],
+            )
+            .expect("seed malformed cache row");
+
+        assert!(cache.load_source("omp", 1).expect("load cache").is_empty());
+        let rows: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'omp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn malformed_event_rows_are_quarantined() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&path).expect("open cache");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('omp', '/tmp/session.jsonl', 1, 10, 20, 30, ?1, ?2)",
+                params![
+                    "not a blob",
+                    postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()
+                ],
+            )
+            .expect("seed malformed cache row");
+
+        assert!(cache.load_source("omp", 1).expect("load cache").is_empty());
+        let rows: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'omp'",
                 [],
                 |row| row.get(0),
             )
@@ -3019,6 +3108,7 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let agent_root = tmp.path().join("pi-agent");
+        let omp_root = tmp.path().join("omp");
         let session_root = agent_root.join("custom/sessions/--C--Users-alice-Code-memex--");
         std::fs::create_dir_all(&session_root).expect("create session root");
         std::fs::write(
@@ -3037,6 +3127,8 @@ mod tests {
         let _env = EnvVarGuard::set_os(&[
             ("PI_CODING_AGENT_SESSION_DIR", None),
             ("PI_CODING_AGENT_DIR", Some(agent_root.as_os_str())),
+            ("PI_CONFIG_DIR", Some(omp_root.as_os_str())),
+            ("XDG_DATA_HOME", None),
         ]);
         let report = scan_usage(&UsageQuery {
             source: Some(SourceFilter::Pi),
@@ -3064,6 +3156,7 @@ mod tests {
 
         let _guard = env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
+        let omp_root = tmp.path().join("omp");
         let session_root = tmp.path().join("--Users-nico-Code-other--");
         std::fs::create_dir_all(&session_root).expect("create session root");
 
@@ -3094,8 +3187,12 @@ mod tests {
         )
         .expect("write filename session");
 
-        let _env =
-            EnvVarGuard::set_os(&[("PI_CODING_AGENT_SESSION_DIR", Some(tmp.path().as_os_str()))]);
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CODING_AGENT_SESSION_DIR", Some(tmp.path().as_os_str())),
+            ("PI_CODING_AGENT_DIR", None),
+            ("PI_CONFIG_DIR", Some(omp_root.as_os_str())),
+            ("XDG_DATA_HOME", None),
+        ]);
         let mut query = UsageQuery {
             source: Some(SourceFilter::Pi),
             include_events: true,

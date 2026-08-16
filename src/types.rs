@@ -12,11 +12,12 @@ pub enum SourceKind {
     Pi,
     OpenClaw,
     Copilot,
+    Omp,
     Hermes,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 8] = [
+    pub const ALL: [SourceKind; 9] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -24,6 +25,7 @@ impl SourceKind {
         SourceKind::Pi,
         SourceKind::OpenClaw,
         SourceKind::Copilot,
+        SourceKind::Omp,
         SourceKind::Hermes,
     ];
     pub const COUNT: usize = Self::ALL.len();
@@ -37,7 +39,8 @@ impl SourceKind {
             SourceKind::Pi => 4,
             SourceKind::OpenClaw => 5,
             SourceKind::Copilot => 6,
-            SourceKind::Hermes => 7,
+            SourceKind::Omp => 7,
+            SourceKind::Hermes => 8,
         }
     }
 
@@ -50,7 +53,8 @@ impl SourceKind {
             4 => Some(SourceKind::Pi),
             5 => Some(SourceKind::OpenClaw),
             6 => Some(SourceKind::Copilot),
-            7 => Some(SourceKind::Hermes),
+            7 => Some(SourceKind::Omp),
+            8 => Some(SourceKind::Hermes),
             _ => None,
         }
     }
@@ -64,6 +68,7 @@ impl SourceKind {
             SourceKind::Pi => "pi",
             SourceKind::OpenClaw => "openclaw",
             SourceKind::Copilot => "copilot",
+            SourceKind::Omp => "omp",
             SourceKind::Hermes => "hermes",
         }
     }
@@ -77,6 +82,7 @@ impl SourceKind {
             SourceKind::Pi => "pi",
             SourceKind::OpenClaw => "openclaw",
             SourceKind::Copilot => "copilot",
+            SourceKind::Omp => "omp",
             SourceKind::Hermes => "hermes",
         }
     }
@@ -94,6 +100,7 @@ impl SourceKind {
             "pi" => Some(SourceKind::Pi),
             "openclaw" => Some(SourceKind::OpenClaw),
             "copilot" => Some(SourceKind::Copilot),
+            "omp" => Some(SourceKind::Omp),
             "hermes" => Some(SourceKind::Hermes),
             _ => None,
         }
@@ -112,6 +119,7 @@ pub enum SourceFilter {
     #[value(name = "openclaw", alias = "open-claw")]
     OpenClaw,
     Copilot,
+    Omp,
     Hermes,
 }
 
@@ -125,6 +133,7 @@ impl SourceFilter {
             SourceFilter::Pi => source == SourceKind::Pi,
             SourceFilter::OpenClaw => source == SourceKind::OpenClaw,
             SourceFilter::Copilot => source == SourceKind::Copilot,
+            SourceFilter::Omp => source == SourceKind::Omp,
             SourceFilter::Hermes => source == SourceKind::Hermes,
         }
     }
@@ -138,6 +147,7 @@ impl SourceFilter {
             SourceFilter::Pi => &["pi"],
             SourceFilter::OpenClaw => &["openclaw"],
             SourceFilter::Copilot => &["copilot"],
+            SourceFilter::Omp => &["omp"],
             SourceFilter::Hermes => &["hermes"],
         }
     }
@@ -151,6 +161,7 @@ impl SourceFilter {
             SourceFilter::Pi => "pi",
             SourceFilter::OpenClaw => "openclaw",
             SourceFilter::Copilot => "copilot",
+            SourceFilter::Omp => "omp",
             SourceFilter::Hermes => "hermes",
         }
     }

@@ -80,6 +80,13 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .collect(),
     );
 
+    push(
+        SourceKind::Omp,
+        super::omp::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
     groups
         .into_iter()
         .map(|(kind, files)| audit_files(kind, &deduplicate(files)))
@@ -186,7 +193,7 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
                 }
             }
         }
-        SourceKind::Pi | SourceKind::OpenClaw => {
+        SourceKind::Pi | SourceKind::OpenClaw | SourceKind::Omp => {
             if top_level == "message"
                 && let Some(message) = value.get("message").and_then(Value::as_object)
             {
