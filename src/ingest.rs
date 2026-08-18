@@ -38,6 +38,7 @@ pub struct IngestOptions {
     pub include_omp: bool,
     pub include_openclaw: bool,
     pub include_copilot: bool,
+    pub exclude_patterns: Vec<String>,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
     pub model: ModelChoice,
@@ -383,6 +384,49 @@ pub fn ingest_if_stale(
     Ok(Some(report))
 }
 
+/// Glob-based path exclusion applied at discovery time so matched
+/// transcripts never enter the index. Empty pattern sets disable matching.
+#[derive(Debug, Clone)]
+struct PathExcluder {
+    set: Option<globset::GlobSet>,
+}
+
+impl PathExcluder {
+    fn build(patterns: &[String]) -> Result<Self> {
+        if patterns.is_empty() {
+            return Ok(Self { set: None });
+        }
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in patterns {
+            builder.add(
+                globset::GlobBuilder::new(pattern)
+                    .literal_separator(false)
+                    .build()
+                    .with_context(|| format!("invalid exclude pattern: {pattern}"))?,
+            );
+        }
+        let set = builder
+            .build()
+            .context("failed to compile exclude patterns")?;
+        Ok(Self { set: Some(set) })
+    }
+
+    fn is_excluded(&self, path: &Path) -> bool {
+        let Some(set) = &self.set else {
+            return false;
+        };
+        set.is_match(path)
+            || path
+                .canonicalize()
+                .is_ok_and(|canonical| canonical != path && set.is_match(&canonical))
+    }
+}
+
+fn build_path_excluder(options: &IngestOptions) -> Result<PathExcluder> {
+    let expanded = crate::config::expand_exclude_patterns(options.exclude_patterns.clone());
+    PathExcluder::build(&expanded)
+}
+
 pub fn ingest_all(
     paths: &Paths,
     index: &SearchIndex,
@@ -400,6 +444,19 @@ pub fn ingest_all(
             std::fs::create_dir_all(&paths.vectors)?;
         }
     }
+
+    // Index-time exclusion: matched transcripts never enter the index, and
+    // records previously indexed from now-excluded paths are removed.
+    let excluder = build_path_excluder(options)?;
+    let mut excluded_state_paths: Vec<String> = Vec::new();
+    state.files.retain(|key, _| {
+        if excluder.is_excluded(Path::new(key)) {
+            excluded_state_paths.push(key.clone());
+            false
+        } else {
+            true
+        }
+    });
     let next_doc_id = Arc::new(AtomicU64::new(state.next_doc_id));
 
     let mut tasks = Vec::new();
@@ -412,6 +469,10 @@ pub fn ingest_all(
             crate::sources::claude::discover(&options.claude_source, options.include_agents)?;
         for source_file in claude_files {
             let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
             let Some(meta) = discovered_metadata(&path)? else {
                 files_skipped += 1;
                 continue;
@@ -439,6 +500,10 @@ pub fn ingest_all(
         let codex_files = crate::sources::codex::discover_rollouts();
         for source_file in codex_files {
             let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
             if let Some(id) = crate::sources::codex::session_id_from_path(&path) {
                 session_ids.insert(id);
             }
@@ -466,6 +531,10 @@ pub fn ingest_all(
 
     if options.include_codex {
         for history_path in crate::sources::codex::history_paths() {
+            if excluder.is_excluded(&history_path) {
+                files_skipped += 1;
+                continue;
+            }
             let Some(meta) = discovered_metadata(&history_path)? else {
                 files_skipped += 1;
                 continue;
@@ -492,6 +561,10 @@ pub fn ingest_all(
         let opencode_files = crate::sources::opencode::discover_sessions()?;
         for source_file in opencode_files {
             let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
             let Some(meta) = discovered_metadata(&path)? else {
                 files_skipped += 1;
                 continue;
@@ -518,6 +591,10 @@ pub fn ingest_all(
         let cursor_files = crate::sources::cursor::discover_transcripts();
         for source_file in cursor_files {
             let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
             let Some(meta) = discovered_metadata(&path)? else {
                 files_skipped += 1;
                 continue;
@@ -544,6 +621,10 @@ pub fn ingest_all(
         let pi_files = crate::sources::pi::discover();
         for source_file in pi_files {
             let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
             let Some(meta) = discovered_metadata(&path)? else {
                 files_skipped += 1;
                 continue;
@@ -570,6 +651,10 @@ pub fn ingest_all(
         let omp_files = crate::sources::omp::discover();
         for source_file in omp_files {
             let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
             let Some(meta) = discovered_metadata(&path)? else {
                 files_skipped += 1;
                 continue;
@@ -595,6 +680,10 @@ pub fn ingest_all(
     if options.include_openclaw {
         for source_file in crate::sources::openclaw::discover() {
             let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
             let Some(meta) = discovered_metadata(&path)? else {
                 files_skipped += 1;
                 continue;
@@ -621,6 +710,10 @@ pub fn ingest_all(
         let copilot_files = crate::sources::copilot::discover_sessions();
         for source_file in copilot_files {
             let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
             let Some(meta) = discovered_metadata(&path)? else {
                 files_skipped += 1;
                 continue;
@@ -643,18 +736,44 @@ pub fn ingest_all(
         }
     }
 
+    // Previously indexed records under now-excluded paths must be deleted even
+    // when there is no ingest state entry for them (e.g. state loss or legacy runs).
+    let mut excluded_index_paths: Vec<String> = Vec::new();
+    if excluder.set.is_some() {
+        index.for_each_record(|record| {
+            if excluder.is_excluded(Path::new(&record.source_path)) {
+                excluded_index_paths.push(record.source_path.clone());
+            }
+            Ok(())
+        })?;
+        excluded_index_paths.sort();
+        excluded_index_paths.dedup();
+    }
+    files_skipped += excluded_state_paths.len();
+
     let opencode_session_links = if tasks.iter().any(|task| task.source == SourceKind::Opencode) {
         crate::sources::opencode::session_links_by_id()
     } else {
         HashMap::new()
     };
 
+    if !excluded_state_paths.is_empty() {
+        state.save(&state_path)?;
+    }
+
+    let mut delete_paths: Vec<String> = excluded_state_paths;
+    for path in excluded_index_paths {
+        if !delete_paths.contains(&path) {
+            delete_paths.push(path);
+        }
+    }
+
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
     let analytics_db = analytics_path(&paths.state);
     let analytics_needs_backfill =
         !AnalyticsStore::is_complete(&analytics_db) && index.doc_count()? > 0;
-    if tasks.is_empty() && can_skip_noop_index(paths, index, options)? {
+    if tasks.is_empty() && delete_paths.is_empty() && can_skip_noop_index(paths, index, options)? {
         if analytics_needs_backfill {
             backfill_from_index(&analytics_db, index)?;
         }
@@ -681,11 +800,12 @@ pub fn ingest_all(
     );
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
 
-    let delete_paths: Vec<String> = tasks
-        .iter()
-        .filter(|t| t.delete_first)
-        .map(|t| t.path.to_string_lossy().to_string())
-        .collect();
+    delete_paths.extend(
+        tasks
+            .iter()
+            .filter(|t| t.delete_first)
+            .map(|t| t.path.to_string_lossy().to_string()),
+    );
     let writer = index
         .writer()
         .context("failed to initialize the Tantivy index writer")?;
@@ -1533,6 +1653,7 @@ mod tests {
     fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         IngestOptions {
             claude_source: PathBuf::from("/does/not/exist"),
+            exclude_patterns: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             include_codex: false,
@@ -1548,6 +1669,91 @@ mod tests {
             embed_runtime: EmbedRuntimeConfig::default(),
             tool_content_limits: IndexedToolContentLimits::default(),
         }
+    }
+
+    #[test]
+    fn exclusion_filters_new_and_previously_indexed_transcripts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let claude_root = tmp.path().join("claude-projects");
+        let keep_dir = claude_root.join("-Users-nico-Code-personal");
+        let drop_dir = claude_root.join("-Users-nico-Code-client-x");
+        fs::create_dir_all(&keep_dir).expect("create keep dir");
+        fs::create_dir_all(&drop_dir).expect("create drop dir");
+        let keep_file = keep_dir.join("keep.jsonl");
+        let drop_file = drop_dir.join("drop.jsonl");
+        let line = br#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]},"uuid":"u1","timestamp":"2024-01-01T00:00:00Z"}
+"#;
+        fs::write(&keep_file, line).expect("write keep");
+        fs::write(&drop_file, line).expect("write drop");
+
+        let paths = Paths::new(Some(tmp.path().join("memex-root"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = open_search_index(&paths);
+
+        // First run with no exclusions indexes both transcripts.
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_source = claude_root.clone();
+        let lease = ingest_lease(&paths);
+        let report = ingest_all(&paths, &index, &options, &lease).expect("first ingest");
+        assert_eq!(report.records_added, 2);
+        assert!(index.doc_count().expect("doc count") >= 2);
+
+        // Adding an exclusion removes the previously indexed transcript and
+        // never indexes newly discovered files under matched paths.
+        let drop_pattern = format!("{}/*-client-*/*.jsonl", claude_root.to_string_lossy());
+        options.exclude_patterns = vec![drop_pattern];
+        let new_drop = drop_dir.join("new-drop.jsonl");
+        fs::write(&new_drop, line).expect("write new drop");
+        let report = ingest_all(&paths, &index, &options, &lease).expect("second ingest");
+        assert_eq!(
+            report.records_added, 0,
+            "excluded files must not be indexed"
+        );
+
+        let mut remaining = Vec::new();
+        index
+            .for_each_record(|record| {
+                remaining.push(record.source_path.clone());
+                Ok(())
+            })
+            .expect("collect remaining records");
+        assert!(
+            remaining.iter().all(|p| !p.contains("-client-")),
+            "excluded transcripts must be purged from the index, got: {remaining:?}"
+        );
+        assert!(
+            remaining.iter().any(|p| p.contains("keep.jsonl")),
+            "non-excluded transcripts must remain indexed, got: {remaining:?}"
+        );
+
+        // Ingest state must not retain entries for excluded paths.
+        let state = IngestState::load(&paths.state.join("ingest.json")).expect("load state");
+        assert!(
+            state.files.keys().all(|k| !k.contains("-client-")),
+            "excluded paths must be pruned from ingest state"
+        );
+    }
+
+    #[test]
+    fn exclusion_glob_star_matches_path_separators() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("work/deep/project/session.jsonl");
+        let patterns = vec![format!("{}/work/**", tmp.path().to_string_lossy())];
+        let excluder = PathExcluder::build(&patterns).expect("build excluder");
+        assert!(excluder.is_excluded(&nested));
+        assert!(!excluder.is_excluded(&tmp.path().join("other/session.jsonl")));
+    }
+
+    #[test]
+    fn exclusion_invalid_pattern_is_rejected() {
+        let result = PathExcluder::build(&["[unclosed".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exclusion_empty_patterns_match_nothing() {
+        let excluder = PathExcluder::build(&[]).expect("build excluder");
+        assert!(!excluder.is_excluded(Path::new("/anything/at/all.jsonl")));
     }
 
     fn save_vector_store(paths: &Paths, model: &str, dimensions: usize) {
@@ -2388,6 +2594,7 @@ mod tests {
         let index = SearchIndex::open_or_create(&paths.index).expect("index");
         let options = IngestOptions {
             claude_source: claude_root,
+            exclude_patterns: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             include_codex: false,
@@ -2787,6 +2994,7 @@ mod tests {
         let index = SearchIndex::open_or_create(&paths.index).expect("index");
         let options = IngestOptions {
             claude_source: tmp.path().join("missing-claude"),
+            exclude_patterns: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             include_codex: false,

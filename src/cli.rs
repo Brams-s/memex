@@ -114,6 +114,11 @@ struct IndexArgs {
     /// Print aggregate parser diagnostics without transcript content
     #[arg(long)]
     diagnostics: bool,
+    /// Exclude transcripts whose source path matches this glob (repeatable).
+    /// Matched transcripts are never indexed. Also configurable via
+    /// `exclude_paths` in ~/.memex/config.toml.
+    #[arg(long = "exclude", value_name = "GLOB")]
+    exclude: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -945,6 +950,7 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
         index.no_embeddings,
         index.model.clone(),
         index.root.clone(),
+        index.exclude.clone(),
         reindex,
         index.diagnostics,
     )
@@ -966,11 +972,15 @@ fn run_index(
     no_embeddings: bool,
     model: Option<String>,
     root: Option<PathBuf>,
+    mut excludes: Vec<String>,
     reindex: bool,
     print_diagnostics: bool,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+
+    // Config exclusions apply to every index run; CLI --exclude adds one-off patterns.
+    excludes.extend(config.exclude_path_patterns());
 
     // Model priority: CLI flag > config file > env var > default
     let model_choice = config.resolve_model(model)?;
@@ -1002,6 +1012,7 @@ fn run_index(
         include_omp: omp,
         include_openclaw: openclaw,
         include_copilot: copilot,
+        exclude_patterns: excludes,
         embeddings,
         backfill_embeddings: false,
         model: model_choice,
@@ -1249,6 +1260,7 @@ fn run_search(
             include_omp: true,
             include_openclaw: true,
             include_copilot: true,
+            exclude_patterns: config.exclude_path_patterns(),
             embeddings: config.embeddings_default(),
             backfill_embeddings: false,
             model: model_choice,
@@ -3537,6 +3549,10 @@ fn build_index_command_args(
     if index.include_reasoning {
         args.push("--include-reasoning".to_string());
     }
+    for pattern in &index.exclude {
+        args.push("--exclude".to_string());
+        args.push(pattern.clone());
+    }
     if !index.codex || index.no_codex {
         args.push("--no-codex".to_string());
     }
@@ -4304,6 +4320,7 @@ mod tests {
             source: None,
             include_agents: false,
             include_reasoning: false,
+            exclude: Vec::new(),
             codex: false,
             opencode: false,
             cursor: false,
@@ -4336,11 +4353,47 @@ mod tests {
     }
 
     #[test]
+    fn build_index_command_args_forwards_exclude_patterns() {
+        let index = IndexArgs {
+            source: None,
+            include_agents: false,
+            include_reasoning: false,
+            exclude: vec!["~/work/**".to_string(), "/tmp/secret/*.jsonl".to_string()],
+            codex: true,
+            opencode: true,
+            cursor: true,
+            pi: true,
+            omp: true,
+            openclaw: true,
+            copilot: true,
+            no_codex: false,
+            no_opencode: false,
+            no_pi: false,
+            no_omp: false,
+            no_openclaw: false,
+            no_copilot: false,
+            embeddings: false,
+            no_embeddings: false,
+            model: None,
+            root: None,
+            diagnostics: false,
+        };
+
+        let args = build_index_command_args(&index, false, 30, false, "127.0.0.1:7777");
+
+        let mut pairs = args.windows(2);
+        assert!(pairs.any(|w| w == ["--exclude", "~/work/**"]));
+        let mut pairs = args.windows(2);
+        assert!(pairs.any(|w| w == ["--exclude", "/tmp/secret/*.jsonl"]));
+    }
+
+    #[test]
     fn build_index_command_args_includes_web_ui_options() {
         let index = IndexArgs {
             source: None,
             include_agents: false,
             include_reasoning: false,
+            exclude: Vec::new(),
             codex: true,
             opencode: true,
             cursor: true,

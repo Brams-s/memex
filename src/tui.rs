@@ -1102,6 +1102,7 @@ impl App {
                     include_omp: true,
                     include_openclaw: true,
                     include_copilot: true,
+                    exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
                     model: model_choice,
