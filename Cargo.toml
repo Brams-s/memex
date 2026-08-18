@@ -36,6 +36,7 @@ tantivy = "0.22"
 usearch = "2"
 toml = "0.8"
 walkdir = "2.5"
+globset = "0.4"
 indicatif = "0.17"
 ratatui = { version = "0.30", default-features = false, features = [
     "crossterm_0_29",

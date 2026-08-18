@@ -428,6 +428,7 @@ compute_units = "ane"  # CoreML only: ane, gpu, cpu, all
 scan_cache_ttl = 3600  # seconds (default 1 hour)
 max_indexed_tool_input_bytes = 65536  # 64 KiB default
 max_indexed_tool_output_bytes = 262144  # 256 KiB default
+exclude_paths = ["~/.claude/projects/*-client-*", "~/work/**"]  # never index matched transcripts
 index_service_mode = "interval"  # interval or continuous
 index_service_interval = 3600  # seconds (ignored when mode = "continuous")
 index_service_poll_interval = 30  # seconds
@@ -454,6 +455,10 @@ and redacted reasoning payloads are always excluded.
 unchanged. memex keeps roughly the first three quarters and final quarter, with a marker reporting
 the omitted middle. Each value must be at least 1024 bytes. Run `memex index --reindex` to apply
 new limits to records that are already indexed.
+`exclude_paths` takes glob patterns matched against transcript source paths at index time, so
+matched transcripts never enter the index (a leading `~/` is expanded to your home directory).
+Adding a pattern also removes records previously indexed from matched paths — no `--reindex`
+required. For one-off runs, pass `--exclude GLOB` (repeatable) to `memex index`.
 `execution_provider` applies to ONNX-backed models; `potion` uses the model2vec backend.
 `cuda_library_paths` and `cudnn_library_paths` accept path lists and are only used
 when `execution_provider = "cuda"`.

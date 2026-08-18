@@ -131,6 +131,9 @@ pub struct UserConfig {
     pub copilot_resume_cmd: Option<String>,
     /// How resume behaves inside a herdr pane: "tab" (default), "split", or "off".
     pub herdr_resume: Option<String>,
+    /// Glob patterns matched against transcript source paths; matched files are
+    /// never indexed. Applied during source discovery, not at query time.
+    pub exclude_paths: Option<Vec<String>>,
     /// Multi-machine search and control defaults.
     #[serde(default)]
     pub multi_machine: MultiMachineConfig,
@@ -233,6 +236,12 @@ impl UserConfig {
 
     pub fn token_usage_enabled(&self) -> bool {
         self.token_usage.unwrap_or(false)
+    }
+
+    /// Exclusion patterns from config, with a leading `~/` expanded to the
+    /// user's home directory so patterns match absolute transcript paths.
+    pub fn exclude_path_patterns(&self) -> Vec<String> {
+        expand_exclude_patterns(self.exclude_paths.clone().unwrap_or_default())
     }
 
     pub fn resolve_model(&self, cli_model: Option<String>) -> Result<ModelChoice> {
@@ -361,6 +370,29 @@ impl UserConfig {
     }
 }
 
+/// Expand a leading `~/` (or bare `~`) in exclusion patterns to the current
+/// home directory. Other patterns are returned unchanged.
+pub fn expand_exclude_patterns(patterns: Vec<String>) -> Vec<String> {
+    let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    patterns
+        .into_iter()
+        .map(|pattern| {
+            if pattern == "~" {
+                home.as_ref()
+                    .map(|h| h.to_string_lossy().to_string())
+                    .unwrap_or(pattern)
+            } else if let Some(rest) = pattern.strip_prefix("~/") {
+                match &home {
+                    Some(h) => format!("{}/{rest}", h.to_string_lossy()),
+                    None => pattern,
+                }
+            } else {
+                pattern
+            }
+        })
+        .collect()
+}
+
 fn indexed_tool_content_limit(value: Option<usize>, default: usize, key: &str) -> Result<usize> {
     let value = value.unwrap_or(default);
     if value < MIN_INDEXED_TOOL_CONTENT_BYTES {
@@ -375,6 +407,30 @@ fn indexed_tool_content_limit(value: Option<usize>, default: usize, key: &str) -
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, env_lock};
+
+    #[test]
+    fn exclude_paths_parse_and_expand_tilde() {
+        let config: UserConfig = toml::from_str(
+            r#"
+                exclude_paths = ["~/.claude/projects/*-client-*", "/opt/work/**"]
+            "#,
+        )
+        .expect("parse config");
+        let patterns = config.exclude_path_patterns();
+        assert_eq!(patterns.len(), 2);
+        let home = directories::BaseDirs::new()
+            .expect("home dir")
+            .home_dir()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(patterns[0], format!("{home}/.claude/projects/*-client-*"));
+        assert_eq!(patterns[1], "/opt/work/**");
+    }
+
+    #[test]
+    fn exclude_paths_default_to_empty() {
+        assert!(UserConfig::default().exclude_path_patterns().is_empty());
+    }
 
     #[test]
     fn token_usage_is_disabled_by_default() {
