@@ -949,6 +949,62 @@ mod tests {
     }
 
     #[test]
+    fn publishing_waits_for_merges_without_losing_segments() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("generation");
+        let mut writer = index.writer().expect("writer");
+
+        for doc_id in 1..=4 {
+            index
+                .add_record(
+                    &mut writer,
+                    &test_record(doc_id, &format!("unique{doc_id}")),
+                )
+                .expect("add record");
+            writer.commit().expect("commit segment");
+        }
+
+        let segment_ids = index
+            .index
+            .searchable_segment_ids()
+            .expect("segments before merge");
+        assert!(segment_ids.len() > 1);
+        writer.merge(&segment_ids).wait().expect("merge segments");
+        writer.wait_merging_threads().expect("finish writer");
+        index.publish_generation().expect("publish generation");
+
+        let published = SearchIndex::open_or_create(tmp.path()).expect("published generation");
+        assert_eq!(published.doc_count().expect("published count"), 4);
+        assert_eq!(
+            published
+                .index
+                .searchable_segment_ids()
+                .expect("published segments")
+                .len(),
+            1
+        );
+        for doc_id in 1..=4 {
+            assert_eq!(
+                published
+                    .search(&QueryOptions {
+                        query: format!("unique{doc_id}"),
+                        project: None,
+                        role: None,
+                        tool: None,
+                        session_id: None,
+                        source: None,
+                        since: None,
+                        until: None,
+                        limit: 10,
+                    })
+                    .expect("search merged segment")
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn legacy_index_is_adopted_without_rebuilding() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let legacy = SearchIndex::open_or_create(tmp.path()).expect("legacy index");

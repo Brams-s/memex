@@ -968,6 +968,9 @@ mod tests {
                 .unwrap();
         }
         writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
 
         let payload = search_payload(
             &paths,
@@ -1080,7 +1083,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
         paths.ensure_dirs().unwrap();
-        SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        SearchIndex::open_or_create_for_ingest(&paths.index)
+            .unwrap()
+            .publish_generation()
+            .unwrap();
         let auth = WebAuth::load_or_create(&paths).unwrap();
 
         let bootstrap_page = http_round_trip(
@@ -1147,7 +1153,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
         paths.ensure_dirs().unwrap();
-        SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        SearchIndex::open_or_create_for_ingest(&paths.index)
+            .unwrap()
+            .publish_generation()
+            .unwrap();
         let auth = WebAuth::load_or_create(&paths).unwrap();
         let token = std::fs::read_to_string(crate::web_auth::token_path(&paths)).unwrap();
 
