@@ -753,7 +753,7 @@ fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<Sess
 }
 
 fn open_index(paths: &Paths) -> Result<SearchIndex> {
-    if !paths.index.join("meta.json").exists() {
+    if !SearchIndex::exists(&paths.index) {
         return Err(anyhow!(
             "index is not ready yet; run `memex index` or wait for the daemon"
         ));

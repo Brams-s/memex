@@ -1345,7 +1345,7 @@ fn open_index_during_contended_refresh(
     let can_read_committed_index =
         !require_stable_vectors && holder.is_some_and(|holder| holder.operation != "reindex");
     if can_read_committed_index
-        && paths.index.join("meta.json").exists()
+        && SearchIndex::exists(&paths.index)
         && let Ok(index) = SearchIndex::open_or_create(&paths.index)
     {
         return Ok(index);

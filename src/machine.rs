@@ -1410,6 +1410,8 @@ mod tests {
             )
             .unwrap();
         writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
 
         let vector = VectorIndex::open_or_create(&paths.vectors, 64, Some("bge")).unwrap();
         assert_eq!(
