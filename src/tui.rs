@@ -826,7 +826,7 @@ impl StdIoRedirect {
 }
 
 fn open_tui_index(paths: &Paths, auto_index: bool) -> Result<SearchIndex> {
-    let index = if paths.index.join("meta.json").exists() {
+    let index = if SearchIndex::exists(&paths.index) {
         match SearchIndex::open_or_create(&paths.index) {
             Ok(index) => return Ok(index),
             Err(error) if !auto_index => return Err(error),
@@ -6703,7 +6703,15 @@ mod tests {
         let index = open_tui_index(&paths, true).expect("rebuild stale index");
 
         assert_eq!(index.doc_count().expect("doc count"), 0);
-        assert!(!paths.index.join("sentinel").exists());
+        assert!(paths.index.join("sentinel").exists());
+        index.publish_generation().expect("publish rebuilt index");
+        assert_eq!(
+            SearchIndex::open_or_create(&paths.index)
+                .expect("open rebuilt generation")
+                .doc_count()
+                .expect("rebuilt count"),
+            0
+        );
     }
 
     fn record(role: &str, text: &str) -> Record {

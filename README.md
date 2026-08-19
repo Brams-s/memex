@@ -142,6 +142,8 @@ memex tui
 Notes:
 - Embeddings are disabled by default. Pass `--embeddings` to generate them during indexing.
 - Searches run an incremental reindex by default (configurable).
+- Index updates are copy-on-write generations. A writer builds a private generation and atomically
+  publishes it when complete; searches keep using the previous immutable generation until then.
 - Concurrent searches coalesce stale auto-index work: one process refreshes while other lexical
   searches query the last committed index. Semantic and hybrid searches wait for vector writes to
   finish. Explicit `index`, `reindex`, `embed`, and analytics backfill commands wait up to 30

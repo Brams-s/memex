@@ -778,6 +778,7 @@ pub fn ingest_all(
             backfill_from_index(&analytics_db, index)?;
         }
         update_scan_cache(paths, files_scanned, total_bytes)?;
+        index.publish_generation_if_uninitialized()?;
         return Ok(IngestReport {
             records_added: 0,
             records_embedded: 0,
@@ -1138,6 +1139,8 @@ fn writer_loop(
             std::mem::forget(handle);
         }
     }
+    writer.wait_merging_threads()?;
+    index.publish_generation()?;
     Ok((count, embedded_count))
 }
 
