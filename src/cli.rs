@@ -34,7 +34,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
 use std::time::Instant;
@@ -487,9 +487,15 @@ EXAMPLES:
         #[arg(long)]
         source: Option<SourceFilter>,
     },
-    /// Install the memex-search skill for Claude, Codex, Opencode, and/or Pi
+    /// Manage the bundled memex-search skill
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+    /// Deprecated alias for interactive `memex skill install`
+    #[command(hide = true)]
     Setup {
-        /// Overwrite existing skills/prompts (useful after memex update)
+        /// Overwrite existing skill copies
         #[arg(short, long)]
         force: bool,
     },
@@ -555,6 +561,45 @@ EXAMPLES:
         #[arg(long)]
         root: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// Show whether installed skill copies match this memex binary
+    Status {
+        /// Installation destination to inspect
+        #[arg(long, value_enum, default_value = "all")]
+        target: SkillTarget,
+    },
+    /// Install missing skill copies without overwriting differing files
+    Install {
+        /// Installation destination; omit for an interactive selection
+        #[arg(long, value_enum)]
+        target: Option<SkillTarget>,
+    },
+    /// Update existing skill copies without installing new ones
+    Update {
+        /// Installation destination to update
+        #[arg(long, value_enum, default_value = "all")]
+        target: SkillTarget,
+    },
+    /// Remove obsolete Memex skill and prompt paths from older releases
+    Cleanup {
+        /// Print obsolete paths without removing them
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum SkillTarget {
+    /// Shared agentskills.io location used by Codex, OpenCode, Pi, and Oh My Pi
+    Shared,
+    /// Claude Code skill location
+    Claude,
+    /// Both shared and Claude Code locations
+    All,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1041,8 +1086,12 @@ pub fn run() -> Result<()> {
             let audits = crate::sources::audit::audit_installed_sources(source)?;
             println!("{}", serde_json::to_string_pretty(&audits)?);
         }
+        Commands::Skill { command } => {
+            run_skill_command(command)?;
+        }
         Commands::Setup { force } => {
-            run_setup(force)?;
+            eprintln!("warning: `memex setup` is deprecated; use `memex skill install`");
+            run_skill_install(None, force.then_some(SkillWriteMode::Replace))?;
         }
         Commands::Update { yes } => {
             run_update(yes)?;
@@ -2718,12 +2767,80 @@ fn vector_stats_line(vectors_dir: &std::path::Path) -> Result<String> {
     ))
 }
 
-fn run_setup(force: bool) -> Result<()> {
+const MEMEX_SEARCH_SKILL: &str = include_str!("../skills/memex-search/SKILL.md");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillWriteMode {
+    Install,
+    Update,
+    Replace,
+}
+
+fn run_skill_command(command: SkillCommand) -> Result<()> {
+    match command {
+        SkillCommand::Status { target } => run_skill_status(target),
+        SkillCommand::Install { target } => run_skill_install(target, None),
+        SkillCommand::Update { target } => run_skill_write(target, SkillWriteMode::Update),
+        SkillCommand::Cleanup { dry_run } => run_skill_cleanup(dry_run),
+    }
+}
+
+fn home_dir() -> Result<PathBuf> {
+    Ok(directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("cannot determine home directory"))?
+        .home_dir()
+        .to_path_buf())
+}
+
+fn skill_destinations(home: &Path, target: SkillTarget) -> Vec<(&'static str, PathBuf)> {
+    let shared = ("shared", home.join(".agents/skills/memex-search/SKILL.md"));
+    let claude = ("claude", home.join(".claude/skills/memex-search/SKILL.md"));
+    match target {
+        SkillTarget::Shared => vec![shared],
+        SkillTarget::Claude => vec![claude],
+        SkillTarget::All => vec![shared, claude],
+    }
+}
+
+fn run_skill_status(target: SkillTarget) -> Result<()> {
+    let home = home_dir()?;
+    for (label, path) in skill_destinations(&home, target) {
+        let state = match std::fs::read(&path) {
+            Ok(contents) if contents == MEMEX_SEARCH_SKILL.as_bytes() => "current",
+            Ok(_) => "outdated or locally modified",
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => "not installed",
+            Err(err) => return Err(err).with_context(|| format!("read {} skill", path.display())),
+        };
+        println!("{label}: {state} ({})", path.display());
+    }
+    Ok(())
+}
+
+fn run_skill_install(
+    target: Option<SkillTarget>,
+    mode_override: Option<SkillWriteMode>,
+) -> Result<()> {
+    let targets = match target {
+        Some(target) => vec![target],
+        None => select_skill_targets()?,
+    };
+    if targets.is_empty() {
+        println!("Nothing selected.");
+        return Ok(());
+    }
+    let home = home_dir()?;
+    let mode = mode_override.unwrap_or(SkillWriteMode::Install);
+    write_skill_targets(&home, &targets, mode)
+}
+
+fn run_skill_write(target: SkillTarget, mode: SkillWriteMode) -> Result<()> {
+    let home = home_dir()?;
+    write_skill_targets(&home, &[target], mode)
+}
+
+fn select_skill_targets() -> Result<Vec<SkillTarget>> {
     use dialoguer::{MultiSelect, theme::ColorfulTheme};
 
-    let theme = ColorfulTheme::default();
-
-    // Detect installed tools
     let claude_path = find_in_path("claude");
     let codex_path = find_in_path("codex");
     let opencode_path = find_in_path("opencode");
@@ -2741,7 +2858,7 @@ fn run_setup(force: bool) -> Result<()> {
         ));
     }
 
-    let shared_agents = [
+    let shared_agents: Vec<&str> = [
         ("Codex", codex_path.as_ref()),
         ("Opencode", opencode_path.as_ref()),
         ("Pi", pi_path.as_ref()),
@@ -2751,35 +2868,19 @@ fn run_setup(force: bool) -> Result<()> {
     .filter_map(|(name, path)| path.map(|_| name))
     .collect::<Vec<_>>();
 
-    // Show what will be installed
-    let action = if force { "install/update" } else { "install" };
-    println!("This will {action}:");
-    if claude_path.is_some() {
-        println!("  Claude Code: memex-search skill, instruction-improver skill");
-    }
-    if !shared_agents.is_empty() {
-        println!(
-            "  Shared agents ({}): memex-search skill",
-            shared_agents.join(", ")
-        );
-    }
-    if force {
-        println!();
-        println!("(--force: existing files will be overwritten)");
-    }
-    println!();
-
-    // Build selection list (only installed tools)
-    let mut items: Vec<(&str, String)> = Vec::new();
+    let mut items: Vec<(SkillTarget, String)> = Vec::new();
     let mut defaults = Vec::new();
 
     if let Some(path) = &claude_path {
-        items.push(("claude", format!("Claude Code ({})", path.display())));
+        items.push((
+            SkillTarget::Claude,
+            format!("Claude Code ({})", path.display()),
+        ));
         defaults.push(true);
     }
     if !shared_agents.is_empty() {
         items.push((
-            "agents",
+            SkillTarget::Shared,
             format!("Shared agents ({})", shared_agents.join(", ")),
         ));
         defaults.push(true);
@@ -2787,26 +2888,85 @@ fn run_setup(force: bool) -> Result<()> {
 
     let labels: Vec<&str> = items.iter().map(|(_, label)| label.as_str()).collect();
 
-    let selected = MultiSelect::with_theme(&theme)
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt("Select tools to configure")
         .items(&labels)
         .defaults(&defaults)
         .interact()?;
 
-    if selected.is_empty() {
-        println!("Nothing selected.");
-        return Ok(());
+    Ok(selected.into_iter().map(|index| items[index].0).collect())
+}
+
+fn write_skill_targets(home: &Path, targets: &[SkillTarget], mode: SkillWriteMode) -> Result<()> {
+    let mut destinations = Vec::new();
+    for target in targets {
+        for destination in skill_destinations(home, *target) {
+            if !destinations
+                .iter()
+                .any(|(_, path): &(&str, PathBuf)| path == &destination.1)
+            {
+                destinations.push(destination);
+            }
+        }
     }
 
-    println!();
+    if mode == SkillWriteMode::Install {
+        let conflicts = destinations
+            .iter()
+            .filter_map(|(_, path)| match std::fs::read(path) {
+                Ok(contents) if contents != MEMEX_SEARCH_SKILL.as_bytes() => {
+                    Some(path.display().to_string())
+                }
+                Ok(_) => None,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => Some(format!("{} ({err})", path.display())),
+            })
+            .collect::<Vec<_>>();
+        if !conflicts.is_empty() {
+            return Err(anyhow!(
+                "refusing to overwrite existing skill file(s): {}. Use `memex skill update` to replace installed copies",
+                conflicts.join(", ")
+            ));
+        }
+    }
 
-    let home = directories::BaseDirs::new()
-        .ok_or_else(|| anyhow!("cannot determine home directory"))?
-        .home_dir()
-        .to_path_buf();
+    let mut changed = false;
+    for (label, path) in destinations {
+        let existing = match std::fs::read(&path) {
+            Ok(contents) => Some(contents),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err).with_context(|| format!("read {} skill", path.display())),
+        };
+        if existing.as_deref() == Some(MEMEX_SEARCH_SKILL.as_bytes()) {
+            println!("{label}: already current ({})", path.display());
+            continue;
+        }
+        if existing.is_none() && mode == SkillWriteMode::Update {
+            println!("{label}: not installed; skipped ({})", path.display());
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create skill directory {}", parent.display()))?;
+        }
+        std::fs::write(&path, MEMEX_SEARCH_SKILL)
+            .with_context(|| format!("write {} skill", path.display()))?;
+        changed = true;
+        let verb = if existing.is_some() {
+            "updated"
+        } else {
+            "installed"
+        };
+        println!("{label}: {verb} ({})", path.display());
+    }
+    if changed {
+        println!("Restart your agent to pick up skill changes.");
+    }
+    Ok(())
+}
 
-    // Clean up stale skill/prompt files from previous versions
-    let stale_paths: Vec<PathBuf> = vec![
+fn legacy_skill_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
         // Gen 1: automem-era paths
         home.join(".claude/skills/automem-search"),
         home.join(".codex/prompts/automem-search.md"),
@@ -2821,100 +2981,42 @@ fn run_setup(force: bool) -> Result<()> {
         home.join(".local/share/opencode/skills/memex-search"),
         pi_agent_root().join("skills/memex-search"),
         omp_agent_root().join("skills/memex-search"),
-    ];
-    for path in &stale_paths {
+    ]
+}
+
+fn run_skill_cleanup(dry_run: bool) -> Result<()> {
+    let home = home_dir()?;
+    cleanup_legacy_skill_paths(&legacy_skill_paths(&home), dry_run)
+}
+
+fn cleanup_legacy_skill_paths(paths: &[PathBuf], dry_run: bool) -> Result<()> {
+    let mut found = false;
+    for path in paths {
         if path.is_dir() {
-            if let Err(e) = std::fs::remove_dir_all(path) {
-                eprintln!("Warning: failed to remove stale {}: {e}", path.display());
+            found = true;
+            if dry_run {
+                println!("would remove {}", path.display());
             } else {
-                println!("Removed stale {}.", path.display());
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("remove legacy skill directory {}", path.display()))?;
+                println!("removed {}", path.display());
             }
         } else if path.is_file() {
-            if let Err(e) = std::fs::remove_file(path) {
-                eprintln!("Warning: failed to remove stale {}: {e}", path.display());
+            found = true;
+            if dry_run {
+                println!("would remove {}", path.display());
             } else {
-                println!("Removed stale {}.", path.display());
+                std::fs::remove_file(path)
+                    .with_context(|| format!("remove legacy skill file {}", path.display()))?;
+                println!("removed {}", path.display());
             }
         }
     }
-
-    let memex_skill = include_str!("../skills/memex-search/SKILL.md");
-    let instruction_improver_skill = include_str!("../skills/instruction-improver/SKILL.md");
-
-    for index in selected {
-        let (tool, _) = &items[index];
-        match *tool {
-            "claude" => {
-                // Install memex-search skill
-                let dest_dir = home.join(".claude").join("skills").join("memex-search");
-                let dest = dest_dir.join("SKILL.md");
-                if dest.exists() && !force {
-                    println!(
-                        "Skipping Claude skill (already installed at {}). Use --force to overwrite.",
-                        dest.display()
-                    );
-                } else {
-                    std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, memex_skill)?;
-                    let verb = if dest.exists() {
-                        "Updated"
-                    } else {
-                        "Installed"
-                    };
-                    println!("{verb} Claude skill at {}.", dest.display());
-                }
-
-                // Install instruction-improver skill
-                let improver_dir = home
-                    .join(".claude")
-                    .join("skills")
-                    .join("instruction-improver");
-                let improver_dest = improver_dir.join("SKILL.md");
-                if improver_dest.exists() && !force {
-                    println!(
-                        "Skipping instruction-improver skill (already installed at {}). Use --force to overwrite.",
-                        improver_dest.display()
-                    );
-                } else {
-                    std::fs::create_dir_all(&improver_dir)?;
-                    std::fs::write(&improver_dest, instruction_improver_skill)?;
-                    let verb = if improver_dest.exists() {
-                        "Updated"
-                    } else {
-                        "Installed"
-                    };
-                    println!(
-                        "{verb} instruction-improver skill at {}.",
-                        improver_dest.display()
-                    );
-                }
-            }
-            "agents" => {
-                let dest_dir = home.join(".agents").join("skills").join("memex-search");
-                let dest = dest_dir.join("SKILL.md");
-                if dest.exists() && !force {
-                    println!(
-                        "Skipping shared memex-search skill (already installed at {}). Use --force to overwrite.",
-                        dest.display()
-                    );
-                } else {
-                    std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, memex_skill)?;
-                    let verb = if dest.exists() {
-                        "Updated"
-                    } else {
-                        "Installed"
-                    };
-                    println!("{verb} shared memex-search skill at {}.", dest.display());
-                }
-            }
-            _ => {}
-        }
+    if !found {
+        println!("No legacy Memex skill paths found.");
+    } else if dry_run {
+        println!("Dry run only; nothing was removed.");
     }
-
-    println!();
-    println!("Done! Restart Claude Code, Codex, Opencode, Pi, or Oh My Pi to pick up changes.");
-
     Ok(())
 }
 
@@ -4450,7 +4552,7 @@ fn run_update(skip_confirm: bool) -> Result<()> {
 
     println!("Updated memex to v{latest}");
     println!();
-    println!("Run 'memex setup --force' to update installed skills/prompts.");
+    println!("Run 'memex skill update' to update installed skill copies.");
     Ok(())
 }
 
@@ -4996,6 +5098,89 @@ arguments = {
         };
         assert_eq!(dataset, PathBuf::from("dataset.jsonl"));
         assert_eq!(k, 50);
+    }
+
+    #[test]
+    fn skill_management_subcommands_parse_targets_and_cleanup_mode() {
+        let install = Cli::try_parse_from(["memex", "skill", "install", "--target", "shared"])
+            .expect("parse skill install");
+        let Some(Commands::Skill {
+            command: SkillCommand::Install {
+                target: Some(target),
+            },
+        }) = install.command
+        else {
+            panic!("expected skill install command");
+        };
+        assert_eq!(target, SkillTarget::Shared);
+
+        let update = Cli::try_parse_from(["memex", "skill", "update"]).expect("parse skill update");
+        let Some(Commands::Skill {
+            command: SkillCommand::Update { target },
+        }) = update.command
+        else {
+            panic!("expected skill update command");
+        };
+        assert_eq!(target, SkillTarget::All);
+
+        let cleanup = Cli::try_parse_from(["memex", "skill", "cleanup", "--dry-run"])
+            .expect("parse skill cleanup");
+        assert!(matches!(
+            cleanup.command,
+            Some(Commands::Skill {
+                command: SkillCommand::Cleanup { dry_run: true }
+            })
+        ));
+    }
+
+    #[test]
+    fn skill_install_and_update_have_narrow_overwrite_semantics() {
+        let home = TempDir::new().unwrap();
+        let shared = home.path().join(".agents/skills/memex-search/SKILL.md");
+        let claude = home.path().join(".claude/skills/memex-search/SKILL.md");
+
+        write_skill_targets(home.path(), &[SkillTarget::Shared], SkillWriteMode::Install).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&shared).unwrap(),
+            MEMEX_SEARCH_SKILL
+        );
+        assert!(!claude.exists());
+
+        std::fs::write(&shared, "locally modified").unwrap();
+        let error =
+            write_skill_targets(home.path(), &[SkillTarget::Shared], SkillWriteMode::Install)
+                .unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            std::fs::read_to_string(&shared).unwrap(),
+            "locally modified"
+        );
+
+        write_skill_targets(home.path(), &[SkillTarget::All], SkillWriteMode::Update).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&shared).unwrap(),
+            MEMEX_SEARCH_SKILL
+        );
+        assert!(!claude.exists());
+    }
+
+    #[test]
+    fn skill_cleanup_is_explicit_and_supports_dry_run() {
+        let home = TempDir::new().unwrap();
+        let legacy_file = home.path().join("legacy.md");
+        let legacy_dir = home.path().join("legacy-skill");
+        std::fs::write(&legacy_file, "legacy").unwrap();
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("SKILL.md"), "legacy").unwrap();
+        let paths = vec![legacy_file.clone(), legacy_dir.clone()];
+
+        cleanup_legacy_skill_paths(&paths, true).unwrap();
+        assert!(legacy_file.exists());
+        assert!(legacy_dir.exists());
+
+        cleanup_legacy_skill_paths(&paths, false).unwrap();
+        assert!(!legacy_file.exists());
+        assert!(!legacy_dir.exists());
     }
 
     #[test]

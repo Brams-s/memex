@@ -103,17 +103,23 @@ Configure memex declaratively (generates `~/.memex/config.toml`):
 
 </details>
 
-Then run setup to install the skills:
+Then install the shared skill used by Codex, OpenCode, Pi, and Oh My Pi:
 
 ```bash
-memex setup
+memex skill install --target shared
 ```
 
 The shared `memex-search` skill is installed once at
 `~/.agents/skills/memex-search/SKILL.md` for Codex, OpenCode, Pi, and Oh My Pi.
-Claude Code uses `~/.claude/skills/memex-search/SKILL.md`.
+For Claude Code, use `memex skill install --target claude`; its copy lives at
+`~/.claude/skills/memex-search/SKILL.md`.
 
-Restart Claude, Codex, OpenCode, Pi, or Oh My Pi after setup.
+Use `memex skill status` to compare installed copies with the current Memex binary,
+`memex skill update` after upgrading Memex, and `memex skill cleanup` to explicitly
+remove obsolete paths left by older releases. Install never overwrites a differing file;
+update only replaces copies that are already installed.
+
+Restart Claude, Codex, OpenCode, Pi, or Oh My Pi after installing or updating the skill.
 
 ## Quickstart
 
@@ -282,13 +288,13 @@ Binary:
 
 ## Setup (manual)
 
-If you built from source, run setup to install:
+If you built from source, install the skill embedded in that build:
 
 ```bash
-memex setup
+memex skill install --target shared
 ```
 
-This detects which tools are installed (Claude/Codex/OpenCode/Pi/Oh My Pi) and presents an interactive menu to select which to configure.
+Omit `--target` for an interactive menu of detected Claude/Codex/OpenCode/Pi/Oh My Pi installations.
 ## Search modes
 
 | Need | Command |
