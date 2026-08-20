@@ -1,6 +1,6 @@
 ---
 name: memex-search
-description: Retrieve and reconstruct prior agent work from memex history. Use when the user refers to a previous session, decision, fix, investigation, file, command, error, or project; wants analogous prior work; asks what happened before; or needs evidence from Claude/Codex/Cursor/OpenCode/Pi/Oh My Pi/OpenClaw/Copilot history. Adapt retrieval effort to the question, use multiple query views for ambiguous requests, reformulate from retrieved evidence, and hydrate only the context needed to answer.
+description: Retrieve and reconstruct prior agent work from memex history. Use when the user refers to a previous session, decision, fix, investigation, file, command, error, or project; wants analogous prior work; asks what happened before; or needs evidence from Claude/Codex/Cursor/OpenCode/Pi/Oh My Pi/OpenClaw/Copilot history. Adapt retrieval effort to the question, use multiple query views for ambiguous requests, reformulate from retrieved evidence, and fetch only the context needed to answer.
 allowed-tools: Bash(memex:*)
 ---
 
@@ -20,7 +20,7 @@ The goal is to recover the smallest set of source-grounded records or trajectori
 6. **Preserve chronology and interaction boundaries.** When the question is about what happened or how something was fixed, reconstruct the relevant sequence; do not summarize isolated top-ranked messages.
 7. **Treat outcome evidence asymmetrically.** Prefer tool results and explicit user confirmation over the assistant claiming that its own work succeeded.
 8. **Do not confuse retrieval failure with absence.** If a reasonable search fails, say you did not find it. Do not conclude that it never happened.
-9. **Do not dump transcripts into context reflexively.** Retrieve nuclei first; hydrate a full session only when the question requires trajectory-level context.
+9. **Do not dump transcripts into context reflexively.** Retrieve nuclei first; load a full session only when the question requires trajectory-level context.
 10. **Do not repeatedly re-index during one task.** Refresh once only when freshness matters.
 
 These rules intentionally mirror the strongest recurring ideas in adaptive and iterative retrieval work: choose retrieval depth based on query complexity, explicitly rewrite/decompose ambiguous queries, and interleave reasoning with search rather than committing to a single initial query.
@@ -76,7 +76,13 @@ Do not expose this packet unless it helps explain a complex search.
 
 ### Current repository / "work we did here"
 
-Use session metadata first:
+Scope search directly to the current working directory or repository:
+
+```bash
+memex search "query" --cwd . --unique-session --limit 20
+```
+
+Use session metadata first when the goal is navigation, resumption, or discovering recent work in the repository:
 
 ```bash
 memex sessions --cwd . --limit 30 --json-array
@@ -241,11 +247,19 @@ Fetch the full session when you need:
 
 For huge sessions, focus only on the relevant interval after fetching; do not summarize unrelated history.
 
-### Interaction linkage
+### Fetch bounded context around a result
 
 When results expose `event_id`, `parent_event_id`, `logical_parent_event_id`, `parent_tool_use_id`, `source_tool_use_id`, or `source_tool_assistant_uuid`, use them to distinguish actual tool interactions and thread/subagent relationships from nearby but unrelated text.
 
-The current CLI does not provide a direct "N records around this event, closed over the tool interaction" command, so full-session hydration is sometimes unavoidable. Treat this as a Memex capability gap rather than pretending search snippets are equivalent context.
+Fetch a bounded neighborhood around a stable record, local document, or native event ID:
+
+```bash
+memex context --record-id <record_id> --before 5 --after 5
+memex context --event-id <event_id> --session <session_id> --before 5 --after 5 --expand-interactions
+memex context --doc-id <doc_id> --before 5 --after 5
+```
+
+Use `--expand-interactions` when linked tool calls/results matter. It adds the connected interaction records without turning the request into an unbounded full-session fetch. For a result on another machine, use machine-aware `show` or paginated `session` instead.
 
 ## Step 7: Reformulate From Evidence
 
@@ -388,6 +402,8 @@ Useful filters and controls:
 - `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|hermes`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--machine <id>` (repeatable)
+- `--query <query>` (repeatable additional query view, fused with the positional query)
+- `--cwd <path>`
 - `--semantic`
 - `--hybrid`
 - `--top-n-per-session <n>` / `--unique-session`
@@ -396,7 +412,8 @@ Useful filters and controls:
 - `--recency-weight <float>`
 - `--recency-half-life-days <float>`
 - `--json-array`
-- `--fields machine,score,ts,doc_id,session_id,project,role,source,snippet,event_id,parent_event_id`
+- `--trace`
+- `--fields machine,score,ts,doc_id,record_id,session_id,project,role,source,snippet,event_id,parent_event_id`
 
 Hermes currently contributes primarily usage data; do not assume `--source hermes` implies searchable Hermes transcripts are available.
 
@@ -408,12 +425,27 @@ memex sessions --cwd . --limit 20
 memex sessions --project <name> --since <date> --json-array
 ```
 
-### Context hydration
+### Open results and fetch surrounding context
 
 ```bash
 memex show <doc_id>
+memex show <doc_id> --machine <machine_id>
+memex context --record-id <record_id> --before 5 --after 5 --expand-interactions
 memex session <session_id>
+memex session <session_id> --machine <machine_id> --offset 0 --limit 500
+memex hydrate requests.jsonl
 ```
+
+`memex hydrate` accepts JSONL requests and fetches bounded session pages in batches. Use it when several federated search results need context; do not use it for a single local hit.
+
+### Retrieval evaluation
+
+```bash
+memex search "query" --trace
+memex eval-retrieval <dataset.jsonl> --k 20
+```
+
+Tracing records retrieval metadata without transcript contents. Evaluation reports recall, MRR, nDCG, and session diversity against JSONL relevance cases.
 
 ### Index freshness / embeddings
 
@@ -438,16 +470,16 @@ memex index --embeddings --model <minilm|bge|nomic|gemma|potion>
 
 Plaintext reasoning is excluded by default; encrypted/redacted reasoning remains excluded.
 
-## Known Retrieval Gaps Worth Fixing in Memex
+## Native Retrieval Capabilities
 
-The skill can work around these, but native support would materially improve retrieval quality and token efficiency:
+Memex provides native support for:
 
-1. `memex context --event-id/--doc-id --before N --after N --expand-interactions`
-2. native multi-query search with fusion and session-level diversification
-3. `memex search --cwd .` rather than resolving current-repo scope through `memex sessions`
-4. machine-aware `show` / `session` hydration for federated search hits
-5. batch trajectory/session hydration with bounded pagination
-6. stable canonical record IDs and interaction neighborhoods from the normalized catalog work
-7. retrieval tracing/evaluation so search-skill changes can be measured against historical lookup questions
+1. bounded context around a record, document, or event, with optional interaction expansion
+2. multiple query views fused with reciprocal-rank fusion and session-level diversification
+3. direct working-directory/repository scoping with `memex search --cwd`
+4. machine-aware `show` and paginated `session` access for federated search results
+5. bounded JSONL batch fetching for several trajectory/session pages
+6. stable canonical record IDs and interaction neighborhoods
+7. metadata-only retrieval tracing and JSONL relevance evaluation
 
-Until those exist, prefer progressive hydration and explicit query reformulation over pretending one global top-k search is sufficient.
+Prefer progressive context fetching and explicit query reformulation over treating one global top-k search as sufficient.

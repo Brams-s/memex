@@ -211,7 +211,7 @@ to select the configured default set, `local`, or one remote machine. The machin
 project, and query filters are shared by the session results and token chart; the range
 dropdown bounds the chart.
 
-### Hydrating federated results
+### Opening federated results
 
 Search results include the originating machine. Use it when opening a document or
 session from another machine:
@@ -222,7 +222,7 @@ memex session SESSION_ID --machine mini --source-path /path/on/mini/session.json
 memex session SESSION_ID --machine mini --offset 500 --limit 500
 ~~~
 
-Session pages are limited to 500 records. To hydrate several sessions in one bounded
+Session pages are limited to 500 records. To fetch several sessions in one bounded
 request, provide JSONL on stdin or as a file:
 
 ~~~json
