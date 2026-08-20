@@ -9,6 +9,8 @@ pub mod lease;
 pub mod machine;
 pub mod progress;
 pub mod resume;
+pub mod retrieval;
+pub mod retrieval_eval;
 pub mod sources;
 pub mod state;
 pub mod transfer;

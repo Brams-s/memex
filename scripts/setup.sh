@@ -54,4 +54,4 @@ case ":$PATH:" in
 esac
 
 echo ""
-echo "Run 'memex skill-install' to install the Claude Code skill"
+echo "Run 'memex skill install' to install the memex-search skill"

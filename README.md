@@ -103,17 +103,23 @@ Configure memex declaratively (generates `~/.memex/config.toml`):
 
 </details>
 
-Then run setup to install the skills:
+Then install the shared skill used by Codex, OpenCode, Pi, and Oh My Pi:
 
 ```bash
-memex setup
+memex skill install --target shared
 ```
 
 The shared `memex-search` skill is installed once at
 `~/.agents/skills/memex-search/SKILL.md` for Codex, OpenCode, Pi, and Oh My Pi.
-Claude Code uses `~/.claude/skills/memex-search/SKILL.md`.
+For Claude Code, use `memex skill install --target claude`; its copy lives at
+`~/.claude/skills/memex-search/SKILL.md`.
 
-Restart Claude, Codex, OpenCode, Pi, or Oh My Pi after setup.
+Use `memex skill status` to compare installed copies with the current Memex binary,
+`memex skill update` after upgrading Memex, and `memex skill cleanup` to explicitly
+remove obsolete paths left by older releases. Install never overwrites a differing file;
+update only replaces copies that are already installed.
+
+Restart Claude, Codex, OpenCode, Pi, or Oh My Pi after installing or updating the skill.
 
 ## Quickstart
 
@@ -211,6 +217,33 @@ to select the configured default set, `local`, or one remote machine. The machin
 project, and query filters are shared by the session results and token chart; the range
 dropdown bounds the chart.
 
+### Opening federated results
+
+Search results include the originating machine. Use it when opening a document or
+session from another machine:
+
+~~~sh
+memex show 123 --machine mini
+memex session SESSION_ID --machine mini --source-path /path/on/mini/session.jsonl
+memex session SESSION_ID --machine mini --offset 500 --limit 500
+~~~
+
+Session pages are limited to 500 records. To fetch several sessions in one bounded
+request, provide JSONL on stdin or as a file:
+
+~~~json
+{"machine":"mini","session_id":"SESSION_ID","source_path":"/path/on/mini/session.jsonl","offset":0,"limit":500}
+~~~
+
+~~~sh
+memex hydrate requests.jsonl
+cat requests.jsonl | memex hydrate
+~~~
+
+The batch input accepts at most 32 requests and returns one JSONL response per request,
+including machine provenance, pagination metadata, and stable record_id values where
+available.
+
 ## Token usage
 
 Token tracking is disabled by default because it scans and caches local agent logs. Enable it in `~/.memex/config.toml`:
@@ -255,13 +288,13 @@ Binary:
 
 ## Setup (manual)
 
-If you built from source, run setup to install:
+If you built from source, install the skill embedded in that build:
 
 ```bash
-memex setup
+memex skill install --target shared
 ```
 
-This detects which tools are installed (Claude/Codex/OpenCode/Pi/Oh My Pi) and presents an interactive menu to select which to configure.
+Omit `--target` for an interactive menu of detected Claude/Codex/OpenCode/Pi/Oh My Pi installations.
 ## Search modes
 
 | Need | Command |

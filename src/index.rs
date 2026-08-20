@@ -1,5 +1,6 @@
 use crate::types::{Record, RecordLinks, SourceFilter};
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
 use std::ops::Bound;
@@ -12,7 +13,7 @@ use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWrite
 use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
 };
-use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
+use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::Value;
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT,
@@ -124,10 +125,20 @@ pub struct QueryOptions {
     pub role: Option<String>,
     pub tool: Option<String>,
     pub session_id: Option<String>,
+    /// Exact session identities allowed by an external scope such as `--cwd`.
+    /// `Some([])` intentionally matches no records.
+    pub session_scope: Option<Vec<SessionScopeKey>>,
     pub source: Option<crate::types::SourceFilter>,
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionScopeKey {
+    pub source: crate::types::SourceKind,
+    pub session_id: String,
+    pub source_path: String,
 }
 
 impl SearchIndex {
@@ -767,6 +778,48 @@ fn build_query(
         ));
     }
 
+    if let Some(scope) = &options.session_scope {
+        if scope.is_empty() {
+            clauses.push((Occur::Must, Box::new(EmptyQuery)));
+        } else {
+            let alternatives = scope
+                .iter()
+                .map(|key| {
+                    let mut identity: Vec<(Occur, Box<dyn Query>)> = vec![
+                        (
+                            Occur::Must,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(fields.session_id, &key.session_id),
+                                IndexRecordOption::Basic,
+                            )),
+                        ),
+                        (
+                            Occur::Must,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(fields.source_path, &key.source_path),
+                                IndexRecordOption::Basic,
+                            )),
+                        ),
+                    ];
+                    if let Some(source_field) = fields.source {
+                        identity.push((
+                            Occur::Must,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(source_field, key.source.storage_label()),
+                                IndexRecordOption::Basic,
+                            )),
+                        ));
+                    }
+                    (
+                        Occur::Should,
+                        Box::new(BooleanQuery::new(identity)) as Box<dyn Query>,
+                    )
+                })
+                .collect();
+            clauses.push((Occur::Must, Box::new(BooleanQuery::new(alternatives))));
+        }
+    }
+
     if options.since.is_some() || options.until.is_some() {
         let start = options.since.unwrap_or(0);
         let end = options.until.unwrap_or(u64::MAX);
@@ -888,6 +941,50 @@ mod tests {
     }
 
     #[test]
+    fn session_scope_filters_exact_source_session_and_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut first = test_record(1, "shared needle");
+        first.session_id = "first".to_string();
+        first.source_path = "first.jsonl".to_string();
+        let mut second = test_record(2, "shared needle");
+        second.session_id = "second".to_string();
+        second.source_path = "second.jsonl".to_string();
+        let mut writer = index.writer().expect("writer");
+        index.add_record(&mut writer, &first).expect("first");
+        index.add_record(&mut writer, &second).expect("second");
+        writer.commit().expect("commit");
+
+        let options = QueryOptions {
+            query: "shared needle".to_string(),
+            project: None,
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: Some(vec![SessionScopeKey {
+                source: first.source,
+                session_id: first.session_id.clone(),
+                source_path: first.source_path.clone(),
+            }]),
+            source: None,
+            since: None,
+            until: None,
+            limit: 10,
+        };
+        let scoped = index.search(&options).expect("scoped search");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].1.doc_id, first.doc_id);
+
+        let empty = index
+            .search(&QueryOptions {
+                session_scope: Some(Vec::new()),
+                ..options
+            })
+            .expect("empty scope");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn ingest_open_recreates_stale_schema_index() {
         let tmp = tempfile::tempdir().expect("tempdir");
         create_stale_schema_index(tmp.path());
@@ -992,6 +1089,7 @@ mod tests {
                         role: None,
                         tool: None,
                         session_id: None,
+                        session_scope: None,
                         source: None,
                         since: None,
                         until: None,
@@ -1030,6 +1128,7 @@ mod tests {
                     role: None,
                     tool: None,
                     session_id: None,
+                    session_scope: None,
                     source: None,
                     since: None,
                     until: None,
@@ -1068,6 +1167,7 @@ mod tests {
                 role: None,
                 tool: None,
                 session_id: None,
+                session_scope: None,
                 source: None,
                 since: None,
                 until: None,
