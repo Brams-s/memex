@@ -640,6 +640,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                     role: None,
                     tool: None,
                     session_id: None,
+                    session_scope: None,
                     source: params.source,
                     since: None,
                     until: None,

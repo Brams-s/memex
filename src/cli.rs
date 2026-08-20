@@ -1,12 +1,20 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
 use crate::config::{Paths, UserConfig, default_claude_source};
-use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
-use crate::index::{QueryOptions, SearchIndex};
-use crate::ingest::{IngestOptions, ingest_all, ingest_if_stale};
-use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt, LeaseHolder};
+use crate::embed::EmbedderHandle;
+use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
+use crate::ingest::{IngestOptions, ingest_all};
+use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
-    LocatedRecord, SearchMode, SearchSpec, UsageSpec, federated_search, federated_usage,
-    resolve_vector_query_model,
+    LocatedRecord, MAX_HYDRATE_INPUT_BYTES, MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE,
+    MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec, SessionPageRequest, UsageSpec,
+    batch_session_contexts, federated_search, federated_usage, record_by_doc_id,
+    session_page_context,
+};
+use crate::retrieval::canonical_record_id;
+use crate::retrieval::{ContextOptions, ContextSelector, context_records};
+use crate::retrieval_eval::{
+    EvaluationDataset, RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace,
+    fuse_ranked_queries, mean_reciprocal_rank, ndcg_at_k, recall_at_k, unique_sessions_at_k,
 };
 use crate::transfer::{
     TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
@@ -21,13 +29,17 @@ use chrono::SecondsFormat;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use regex::RegexBuilder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
+use std::time::Instant;
+
+static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser)]
 #[command(
@@ -176,12 +188,18 @@ TIMESTAMP FORMAT:
     Unix milliseconds: 1705315800000
 
 OUTPUT FIELDS (--fields):
-    machine, score, ts, doc_id, project, role, session_id, source, source_path, text, snippet, matches
+    machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches
     event_id, parent_event_id, logical_parent_event_id, parent_session_id, thread_source, conversation_kind
     parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
     Search {
         /// Search query (keywords or natural language for semantic search)
         query: String,
+        /// Additional independent query view to fuse with reciprocal-rank fusion (repeatable)
+        #[arg(long = "query", value_name = "QUERY")]
+        additional_queries: Vec<String>,
+        /// Restrict results to sessions from this working directory/repository
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
         /// Filter by project name
         #[arg(long)]
         project: Option<String>,
@@ -245,6 +263,9 @@ OUTPUT FIELDS (--fields):
         /// Machine to search (repeatable). Defaults to multi_machine.default or all configured machines.
         #[arg(long, value_name = "ID")]
         machine: Vec<String>,
+        /// Persist a metadata-only retrieval trace and print its ID to stderr
+        #[arg(long)]
+        trace: bool,
     },
     /// Interactive terminal UI for browsing sessions
     Tui {
@@ -280,6 +301,18 @@ EXAMPLES:
     Session {
         /// Session ID (from search results or TUI)
         session_id: String,
+        /// Originating machine for federated search results
+        #[arg(long, default_value = crate::machine::LOCAL_MACHINE_ID)]
+        machine: String,
+        /// Restrict hydration to this source transcript path
+        #[arg(long)]
+        source_path: Option<String>,
+        /// Number of records to skip before the page
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Return at most this many records (maximum 500)
+        #[arg(long)]
+        limit: Option<usize>,
         /// Show human-readable output with timestamps and role labels
         #[arg(short, long)]
         verbose: bool,
@@ -291,9 +324,77 @@ EXAMPLES:
     Show {
         /// Document ID (from search results)
         doc_id: u64,
+        /// Originating machine for federated search results
+        #[arg(long, default_value = crate::machine::LOCAL_MACHINE_ID)]
+        machine: String,
         /// Pretty-print JSON output
         #[arg(short, long)]
         verbose: bool,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Hydrate bounded session pages from JSONL requests (stdin when omitted)
+    #[command(
+        name = "hydrate",
+        visible_alias = "hydrate-batch",
+        after_help = "\
+REQUEST FORMAT (one JSON object per line):
+    {\"machine\":\"mini\",\"session_id\":\"abc\",\"source_path\":\"/tmp/session.jsonl\",\"offset\":0,\"limit\":100}
+
+EXAMPLES:
+    memex hydrate requests.jsonl
+    cat requests.jsonl | memex hydrate
+
+The input contains at most 32 requests; each page is limited to 500 records."
+    )]
+    Hydrate {
+        /// JSONL request file; omit or use '-' to read stdin
+        input: Option<PathBuf>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Return a bounded context neighborhood around a record, document, or native event ID
+    Context {
+        /// Stable canonical record ID
+        #[arg(long, conflicts_with_all = ["doc_id", "event_id"])]
+        record_id: Option<String>,
+        /// Legacy local Tantivy document ID
+        #[arg(long, conflicts_with_all = ["record_id", "event_id"])]
+        doc_id: Option<u64>,
+        /// Source-native event ID
+        #[arg(long, conflicts_with_all = ["record_id", "doc_id"])]
+        event_id: Option<String>,
+        /// Optional session scope for native event IDs
+        #[arg(long)]
+        session: Option<String>,
+        /// Optional source scope for native event IDs
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Number of records before the anchor
+        #[arg(long, default_value_t = 5)]
+        before: usize,
+        /// Number of records after the anchor
+        #[arg(long, default_value_t = 5)]
+        after: usize,
+        /// Include linked tool calls/results outside the linear window
+        #[arg(long)]
+        expand_interactions: bool,
+        /// Pretty-print the JSON result
+        #[arg(short, long)]
+        verbose: bool,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Run retrieval queries from a JSONL evaluation dataset
+    EvalRetrieval {
+        /// JSONL evaluation dataset path
+        dataset: PathBuf,
+        /// Cutoff used for recall and nDCG metrics
+        #[arg(long, default_value_t = 20)]
+        k: usize,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -683,6 +784,8 @@ pub fn run() -> Result<()> {
         }
         Commands::Search {
             query,
+            additional_queries,
+            cwd,
             project,
             role,
             tool,
@@ -704,9 +807,12 @@ pub fn run() -> Result<()> {
             verbose,
             root,
             machine,
+            trace,
         } => {
             run_search(
                 query,
+                additional_queries,
+                cwd,
                 project,
                 role,
                 tool,
@@ -728,6 +834,7 @@ pub fn run() -> Result<()> {
                 verbose,
                 root,
                 machine,
+                trace,
             )?;
         }
         Commands::Tui {
@@ -819,17 +926,61 @@ pub fn run() -> Result<()> {
         },
         Commands::Session {
             session_id,
+            machine,
+            source_path,
+            offset,
+            limit,
             verbose,
             root,
         } => {
-            run_session(session_id, verbose, root)?;
+            run_session(
+                session_id,
+                machine,
+                source_path,
+                offset,
+                limit,
+                verbose,
+                root,
+            )?;
         }
         Commands::Show {
             doc_id,
+            machine,
             verbose,
             root,
         } => {
-            run_show(doc_id, verbose, root)?;
+            run_show(doc_id, machine, verbose, root)?;
+        }
+        Commands::Hydrate { input, root } => {
+            run_hydrate(input, root)?;
+        }
+        Commands::Context {
+            record_id,
+            doc_id,
+            event_id,
+            session,
+            source,
+            before,
+            after,
+            expand_interactions,
+            verbose,
+            root,
+        } => {
+            run_context(ContextRunArgs {
+                record_id,
+                doc_id,
+                event_id,
+                session,
+                source,
+                before,
+                after,
+                expand_interactions,
+                verbose,
+                root,
+            })?;
+        }
+        Commands::EvalRetrieval { dataset, k, root } => {
+            run_eval_retrieval(dataset, k, root)?;
         }
         Commands::Sessions {
             cwd,
@@ -1152,6 +1303,8 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_search(
     query: String,
+    additional_queries: Vec<String>,
+    cwd: Option<PathBuf>,
     project: Option<String>,
     role: Option<String>,
     tool: Option<String>,
@@ -1173,7 +1326,22 @@ fn run_search(
     verbose: bool,
     root: Option<PathBuf>,
     machines: Vec<String>,
+    trace: bool,
 ) -> Result<()> {
+    let trace_started = Instant::now();
+    let trace_started_at_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let mut queries = vec![query];
+    queries.extend(additional_queries.clone());
+    let mut seen_queries = HashSet::new();
+    queries.retain(|query| {
+        let query = query.trim();
+        !query.is_empty() && seen_queries.insert(query.to_string())
+    });
+    if queries.is_empty() {
+        return Err(anyhow!("at least one non-empty search query is required"));
+    }
+    let query = queries[0].clone();
+    let cwd = canonical_cwd_filter(cwd);
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let options = QueryOptions {
@@ -1182,6 +1350,7 @@ fn run_search(
         role,
         tool,
         session_id: session,
+        session_scope: None,
         source,
         since: parse_ts_millis(since)?,
         until: parse_ts_millis(until)?,
@@ -1205,405 +1374,90 @@ fn run_search(
         limit,
     };
 
-    let candidate_limit = if top_n_per_session.is_some() || options.source.is_some() {
+    let candidate_limit = if queries.len() > 1
+        || top_n_per_session.is_some()
+        || options.source.is_some()
+        || cwd.is_some()
+    {
         (limit * 5).max(limit + 10)
     } else {
         limit
     };
-
-    if !machines.is_empty() || !config.machines.is_empty() {
+    let mode = if hybrid {
+        SearchMode::Hybrid
+    } else if semantic {
+        SearchMode::Semantic
+    } else {
+        SearchMode::Lexical
+    };
+    let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
+    let mut ranked_queries = Vec::with_capacity(queries.len());
+    let mut query_candidate_counts = Vec::with_capacity(queries.len());
+    let mut failures = Vec::new();
+    let mut seen_failures = HashSet::new();
+    for (query_index, query) in queries.iter().enumerate() {
         let spec = SearchSpec {
-            query: options.query.clone(),
+            query: query.clone(),
+            queries: Vec::new(),
             project: options.project.clone(),
             role: options.role.clone(),
             tool: options.tool.clone(),
             session_id: options.session_id.clone(),
+            session_scope: None,
+            cwd: cwd.clone(),
             source: options.source,
             since: options.since,
             until: options.until,
             limit: candidate_limit,
-            mode: if hybrid {
-                SearchMode::Hybrid
-            } else if semantic {
-                SearchMode::Semantic
-            } else {
-                SearchMode::Lexical
-            },
+            mode,
             recency_weight,
             recency_half_life_days,
             min_score,
             project_grouping: None,
         };
-        let mut federated = federated_search(&paths, &config, &machines, &spec, true)?;
-        for (machine, error) in &federated.failures {
-            eprintln!("Warning: machine '{machine}' unavailable: {error}");
-        }
-        let mut merged_render = render.clone();
-        merged_render.min_score = None;
-        federated.items = apply_post_processing_located(federated.items, &merged_render);
-        return render_located_results(federated.items, &render);
-    }
-
-    let model_choice = config.resolve_model(None)?;
-    let embed_runtime = config.resolve_embed_runtime()?;
-    let scan_cache_ttl = config.scan_cache_ttl();
-    let auto_index_options = config.auto_index_on_search_default().then(|| {
-        let tool_content_limits = config.indexed_tool_content_limits()?;
-        Ok::<_, anyhow::Error>(IngestOptions {
-            claude_source: default_claude_source(),
-            include_agents: false,
-            include_reasoning: config.include_reasoning_default(),
-            include_codex: true,
-            include_opencode: true,
-            include_cursor: true,
-            include_pi: true,
-            include_omp: true,
-            include_openclaw: true,
-            include_copilot: true,
-            exclude_patterns: config.exclude_path_patterns(),
-            embeddings: config.embeddings_default(),
-            backfill_embeddings: false,
-            model: model_choice,
-            embed_runtime: embed_runtime.clone(),
-            tool_content_limits,
-        })
-    });
-    let auto_index_options = auto_index_options.transpose()?;
-    let mut refresh_contended = false;
-    let mut refresh_holder = None;
-    if let Some(options) = auto_index_options.as_ref() {
-        paths.ensure_dirs()?;
-        match IngestLease::try_acquire(&paths, "search auto-index")? {
-            LeaseAttempt::Acquired(lease) => {
-                let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
-                let _ = ingest_if_stale(&paths, &index, options, scan_cache_ttl, &lease)?;
-            }
-            LeaseAttempt::Busy(holder) => {
-                refresh_contended = true;
-                refresh_holder = holder;
+        let federated =
+            federated_search(&paths, &config, &selected_machines, &spec, query_index == 0)?;
+        query_candidate_counts.push(federated.candidate_count);
+        for (machine, error) in federated.failures {
+            let message = format!("{machine}: {error}");
+            if seen_failures.insert(message.clone()) {
+                eprintln!("Warning: machine '{machine}' unavailable: {error}");
+                failures.push(message);
             }
         }
+        ranked_queries.push(federated.items);
     }
-    let index = if refresh_contended {
-        open_index_during_contended_refresh(
-            &paths,
-            auto_index_options.as_ref().expect("auto-index options"),
-            scan_cache_ttl,
-            refresh_holder.as_ref(),
-            semantic || hybrid,
-        )?
+    let mut results = if ranked_queries.len() == 1 {
+        ranked_queries.pop().unwrap_or_default()
     } else {
-        SearchIndex::open_or_create(&paths.index)?
+        fuse_ranked_queries(ranked_queries, crate::retrieval_eval::DEFAULT_RRF_K)
     };
-
-    if hybrid {
-        return run_hybrid_search(
-            &index,
-            &options,
-            candidate_limit,
-            &SearchContext {
-                render: &render,
-                paths: &paths,
-                model_choice,
-                embed_runtime: &embed_runtime,
-                recency_weight,
-                recency_half_life_days,
-            },
-        );
+    let mut merged_render = render.clone();
+    merged_render.min_score = None;
+    results = apply_post_processing_located(results, &merged_render);
+    if trace {
+        let mode_label = match (mode, queries.len() > 1) {
+            (SearchMode::Lexical, false) => "lexical",
+            (SearchMode::Semantic, false) => "semantic",
+            (SearchMode::Hybrid, false) => "hybrid",
+            (SearchMode::Lexical, true) => "lexical-rrf",
+            (SearchMode::Semantic, true) => "semantic-rrf",
+            (SearchMode::Hybrid, true) => "hybrid-rrf",
+        };
+        write_retrieval_trace(TraceWriteArgs {
+            paths: &paths,
+            queries: &queries,
+            query_candidate_counts: &query_candidate_counts,
+            cwd,
+            results: &results,
+            mode: mode_label,
+            machines: &selected_machines,
+            failures: &failures,
+            started: trace_started,
+            started_at_ms: trace_started_at_ms,
+        })?;
     }
-    if semantic {
-        return run_semantic_search(
-            &index,
-            &options,
-            candidate_limit,
-            &SearchContext {
-                render: &render,
-                paths: &paths,
-                model_choice,
-                embed_runtime: &embed_runtime,
-                recency_weight,
-                recency_half_life_days,
-            },
-        );
-    }
-    run_lexical_search(
-        &index,
-        &options,
-        &render,
-        recency_weight,
-        recency_half_life_days,
-    )
-}
-
-fn open_index_during_contended_refresh(
-    paths: &Paths,
-    options: &IngestOptions,
-    scan_cache_ttl: u64,
-    holder: Option<&LeaseHolder>,
-    require_stable_vectors: bool,
-) -> Result<SearchIndex> {
-    let can_read_committed_index =
-        !require_stable_vectors && holder.is_some_and(|holder| holder.operation != "reindex");
-    if can_read_committed_index
-        && SearchIndex::exists(&paths.index)
-        && let Ok(index) = SearchIndex::open_or_create(&paths.index)
-    {
-        return Ok(index);
-    }
-
-    let lease = IngestLease::acquire(
-        paths,
-        "search waiting for index initialization",
-        INGEST_LEASE_TIMEOUT,
-    )?;
-    let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
-    let _ = ingest_if_stale(paths, &index, options, scan_cache_ttl, &lease)?;
-    Ok(index)
-}
-
-struct SearchContext<'a> {
-    render: &'a RenderOptions,
-    paths: &'a Paths,
-    model_choice: ModelChoice,
-    embed_runtime: &'a EmbedRuntimeConfig,
-    recency_weight: f32,
-    recency_half_life_days: f32,
-}
-
-fn run_semantic_search(
-    index: &SearchIndex,
-    options: &QueryOptions,
-    limit: usize,
-    ctx: &SearchContext,
-) -> Result<()> {
-    let vector = match VectorIndex::open(&ctx.paths.vectors) {
-        Ok(vector) => vector,
-        Err(err) if is_missing_vector_index_error(&err) => {
-            warn_vector_index_unavailable("semantic");
-            return run_lexical_search(
-                index,
-                options,
-                ctx.render,
-                ctx.recency_weight,
-                ctx.recency_half_life_days,
-            );
-        }
-        Err(err) => return Err(err),
-    };
-    let Some(query_model) = resolve_vector_query_model(&vector, || Ok(ctx.model_choice))? else {
-        warn_vector_index_unavailable("semantic");
-        return run_lexical_search(
-            index,
-            options,
-            ctx.render,
-            ctx.recency_weight,
-            ctx.recency_half_life_days,
-        );
-    };
-    let mut embedder = EmbedderHandle::with_model_and_runtime(query_model, ctx.embed_runtime)?;
-    let embeddings = embedder.embed_texts(&[options.query.as_str()])?;
-    let embedding = embeddings
-        .first()
-        .ok_or_else(|| anyhow!("embedding missing"))?;
-    let mut results = Vec::new();
-    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-    for (doc_id, distance) in vector.search(embedding, limit)? {
-        if let Some(record) = index.get_by_doc_id(doc_id)?
-            && matches_filters(&record, options)
-        {
-            let base = score_from_distance(distance);
-            let score = apply_recency(
-                base,
-                record.ts,
-                now_ms,
-                ctx.recency_weight,
-                ctx.recency_half_life_days,
-            );
-            results.push((score, record));
-        }
-    }
-    let results = apply_post_processing(results, ctx.render);
-    render_results(results, ctx.render)?;
-    Ok(())
-}
-
-fn run_hybrid_search(
-    index: &SearchIndex,
-    options: &QueryOptions,
-    limit: usize,
-    ctx: &SearchContext,
-) -> Result<()> {
-    let vector = match VectorIndex::open(&ctx.paths.vectors) {
-        Ok(vector) => vector,
-        Err(err) if is_missing_vector_index_error(&err) => {
-            warn_vector_index_unavailable("hybrid");
-            return run_lexical_search(
-                index,
-                options,
-                ctx.render,
-                ctx.recency_weight,
-                ctx.recency_half_life_days,
-            );
-        }
-        Err(err) => return Err(err),
-    };
-    let Some(query_model) = resolve_vector_query_model(&vector, || Ok(ctx.model_choice))? else {
-        warn_vector_index_unavailable("hybrid");
-        return run_lexical_search(
-            index,
-            options,
-            ctx.render,
-            ctx.recency_weight,
-            ctx.recency_half_life_days,
-        );
-    };
-    let mut embedder = EmbedderHandle::with_model_and_runtime(query_model, ctx.embed_runtime)?;
-
-    let bm25_k = (limit * 5).clamp(50, 500);
-    let vector_k = (limit * 5).clamp(50, 500);
-
-    let bm25_results = index.search(&QueryOptions {
-        limit: bm25_k,
-        ..options.clone()
-    })?;
-
-    let embeddings = embedder.embed_texts(&[options.query.as_str()])?;
-    let embedding = embeddings
-        .first()
-        .ok_or_else(|| anyhow!("embedding missing"))?;
-    let vector_results = vector.search(embedding, vector_k)?;
-
-    let mut records: HashMap<u64, crate::types::Record> = HashMap::new();
-    let mut scores: HashMap<u64, f32> = HashMap::new();
-    let rrf_k = 60.0;
-
-    for (rank, (_, record)) in bm25_results.into_iter().enumerate() {
-        if !matches_filters(&record, options) {
-            continue;
-        }
-        let r = rank as f32 + 1.0;
-        scores
-            .entry(record.doc_id)
-            .and_modify(|v| *v += 1.0 / (rrf_k + r))
-            .or_insert(1.0 / (rrf_k + r));
-        records.insert(record.doc_id, record);
-    }
-
-    for (rank, (doc_id, _distance)) in vector_results.into_iter().enumerate() {
-        if let Some(record) = index.get_by_doc_id(doc_id)? {
-            if !matches_filters(&record, options) {
-                continue;
-            }
-            let r = rank as f32 + 1.0;
-            scores
-                .entry(doc_id)
-                .and_modify(|v| *v += 1.0 / (rrf_k + r))
-                .or_insert(1.0 / (rrf_k + r));
-            records.entry(doc_id).or_insert(record);
-        }
-    }
-
-    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-    let merged: Vec<(f32, crate::types::Record)> = scores
-        .into_iter()
-        .filter_map(|(doc_id, score)| {
-            records.remove(&doc_id).map(|r| {
-                (
-                    apply_recency(
-                        score,
-                        r.ts,
-                        now_ms,
-                        ctx.recency_weight,
-                        ctx.recency_half_life_days,
-                    ),
-                    r,
-                )
-            })
-        })
-        .collect();
-    let merged = apply_post_processing(merged, ctx.render);
-    render_results(merged, ctx.render)?;
-    Ok(())
-}
-
-fn run_lexical_search(
-    index: &SearchIndex,
-    options: &QueryOptions,
-    render: &RenderOptions,
-    recency_weight: f32,
-    recency_half_life_days: f32,
-) -> Result<()> {
-    let results = index.search(options)?;
-    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-    let mut reranked =
-        apply_recency_to_results(results, now_ms, recency_weight, recency_half_life_days);
-    reranked.retain(|(_, record)| matches_filters(record, options));
-    let reranked = apply_post_processing(reranked, render);
-    render_results(reranked, render)?;
-    Ok(())
-}
-
-fn is_missing_vector_index_error(err: &anyhow::Error) -> bool {
-    err.to_string() == "vector index not found"
-}
-
-fn warn_vector_index_unavailable(mode: &str) {
-    eprintln!(
-        "Warning: {mode} search requested, but the local vector index is not available; falling back to lexical search. Run 'memex embed' to build embeddings."
-    );
-}
-
-fn score_from_distance(distance: f32) -> f32 {
-    1.0 / (1.0 + distance)
-}
-
-fn apply_recency(score: f32, ts: u64, now_ms: u64, weight: f32, half_life_days: f32) -> f32 {
-    if score <= 0.0 || weight <= 0.0 || half_life_days <= 0.0 || ts == 0 {
-        return score;
-    }
-    let age_ms = now_ms.saturating_sub(ts);
-    let age_days = age_ms as f32 / (1000.0 * 60.0 * 60.0 * 24.0);
-    let decay = (-std::f32::consts::LN_2 * age_days / half_life_days).exp();
-    score * (1.0 + weight * decay)
-}
-
-fn matches_filters(record: &crate::types::Record, options: &QueryOptions) -> bool {
-    if let Some(project) = &options.project
-        && &record.project != project
-    {
-        return false;
-    }
-    if let Some(role) = &options.role
-        && &record.role != role
-    {
-        return false;
-    }
-    if let Some(tool) = &options.tool
-        && record.tool_name.as_deref() != Some(tool.as_str())
-    {
-        return false;
-    }
-    if let Some(source) = options.source
-        && !source.matches(record.source)
-    {
-        return false;
-    }
-    if let Some(session_id) = &options.session_id
-        && &record.session_id != session_id
-    {
-        return false;
-    }
-    if let Some(since) = options.since
-        && record.ts < since
-    {
-        return false;
-    }
-    if let Some(until) = options.until
-        && record.ts > until
-    {
-        return false;
-    }
-    true
+    render_located_results(results, &render)
 }
 
 #[derive(Clone)]
@@ -1633,6 +1487,7 @@ struct SearchHit {
     score: f32,
     ts: String,
     doc_id: u64,
+    record_id: String,
     project: String,
     role: String,
     session_id: String,
@@ -1643,20 +1498,6 @@ struct SearchHit {
     matches: Vec<MatchSpan>,
     #[serde(flatten)]
     links: RecordLinks,
-}
-
-fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOptions) -> Result<()> {
-    render_located_results(
-        results
-            .into_iter()
-            .map(|(score, record)| LocatedRecord {
-                machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
-                score,
-                record,
-            })
-            .collect(),
-        render,
-    )
 }
 
 fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -> Result<()> {
@@ -1685,6 +1526,7 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
     } in results
     {
         let ts = format_ts(record.ts);
+        let record_id = canonical_record_id(&record);
         let text_ref = record.text.as_str();
         let wants_snippet = wants_field(&render.fields, "snippet");
         let wants_matches = wants_field(&render.fields, "matches");
@@ -1718,6 +1560,9 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
             }
             if fields.contains("doc_id") {
                 map.insert("doc_id".to_string(), Value::from(record.doc_id));
+            }
+            if fields.contains("record_id") {
+                map.insert("record_id".to_string(), Value::from(record_id.clone()));
             }
             if fields.contains("project") {
                 map.insert("project".to_string(), Value::from(record.project));
@@ -1799,6 +1644,7 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
                 score,
                 ts,
                 doc_id: record.doc_id,
+                record_id,
                 project: record.project,
                 role: record.role,
                 session_id: record.session_id,
@@ -1836,16 +1682,338 @@ fn insert_optional_field(
     }
 }
 
-fn run_session(session_id: String, verbose: bool, root: Option<PathBuf>) -> Result<()> {
+struct ContextRunArgs {
+    record_id: Option<String>,
+    doc_id: Option<u64>,
+    event_id: Option<String>,
+    session: Option<String>,
+    source: Option<SourceFilter>,
+    before: usize,
+    after: usize,
+    expand_interactions: bool,
+    verbose: bool,
+    root: Option<PathBuf>,
+}
+
+fn run_context(args: ContextRunArgs) -> Result<()> {
+    let ContextRunArgs {
+        record_id,
+        doc_id,
+        event_id,
+        session,
+        source,
+        before,
+        after,
+        expand_interactions,
+        verbose,
+        root,
+    } = args;
+    let selector = match (record_id, doc_id, event_id) {
+        (Some(id), None, None) => ContextSelector::record_id(id),
+        (None, Some(id), None) => ContextSelector::doc_id(id),
+        (None, None, Some(id)) => ContextSelector::event_id(id),
+        _ => {
+            return Err(anyhow!(
+                "exactly one of --record-id, --doc-id, or --event-id is required"
+            ));
+        }
+    };
+    let source = source.and_then(|value| crate::types::SourceKind::from_label(value.as_str()));
     let paths = Paths::new(root)?;
     let index = SearchIndex::open_or_create(&paths.index)?;
-    let mut records = index.records_by_session_id(&session_id)?;
-    records.sort_by(|a, b| {
-        a.turn_id
-            .cmp(&b.turn_id)
-            .then_with(|| a.ts.cmp(&b.ts))
-            .then_with(|| a.doc_id.cmp(&b.doc_id))
-    });
+    let result = context_records(
+        &index,
+        &selector.with_scope(session, source),
+        ContextOptions {
+            before,
+            after,
+            expand_interactions,
+        },
+    )?;
+    if verbose {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("{}", serde_json::to_string(&result)?);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct HydrateRequest {
+    machine: Option<String>,
+    session_id: String,
+    #[serde(default)]
+    source_path: String,
+    #[serde(default)]
+    offset: usize,
+    limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct HydrateRecordOutput {
+    #[serde(flatten)]
+    record: crate::types::Record,
+    record_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HydrateOutput {
+    machine: String,
+    session_id: String,
+    source_path: String,
+    cwd: Option<String>,
+    offset: usize,
+    total: usize,
+    next_offset: Option<usize>,
+    records: Vec<HydrateRecordOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct HydrateErrorOutput {
+    machine: String,
+    session_id: String,
+    source_path: String,
+    offset: usize,
+    error: String,
+}
+
+fn run_hydrate(input: Option<PathBuf>, root: Option<PathBuf>) -> Result<()> {
+    let mut contents = String::new();
+    let mut reader: Box<dyn Read> = match input {
+        Some(path) if path.to_string_lossy() != "-" => Box::new(std::fs::File::open(path)?),
+        _ => Box::new(std::io::stdin()),
+    };
+    reader
+        .by_ref()
+        .take(MAX_HYDRATE_INPUT_BYTES as u64 + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() > MAX_HYDRATE_INPUT_BYTES {
+        return Err(anyhow!(
+            "hydrate input exceeds maximum size of {MAX_HYDRATE_INPUT_BYTES} bytes"
+        ));
+    }
+    let mut requests = Vec::new();
+    for (line, raw) in contents.lines().enumerate() {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if raw.len() > MAX_HYDRATE_LINE_BYTES {
+            return Err(anyhow!(
+                "hydrate request line {} exceeds maximum size of {} bytes",
+                line + 1,
+                MAX_HYDRATE_LINE_BYTES
+            ));
+        }
+        let request = serde_json::from_str::<HydrateRequest>(raw)
+            .with_context(|| format!("parse hydrate request line {}", line + 1))?;
+        if request.session_id.is_empty() {
+            return Err(anyhow!(
+                "hydrate request line {} has an empty session_id",
+                line + 1
+            ));
+        }
+        if request.limit == 0 || request.limit > MAX_SESSION_PAGE_SIZE {
+            return Err(anyhow!(
+                "hydrate request line {} limit must be between 1 and {}",
+                line + 1,
+                MAX_SESSION_PAGE_SIZE
+            ));
+        }
+        requests.push(request);
+    }
+    if requests.is_empty() {
+        return Err(anyhow!("hydrate input is empty"));
+    }
+    if requests.len() > MAX_SESSION_BATCH_SIZE {
+        return Err(anyhow!(
+            "hydrate accepts at most {MAX_SESSION_BATCH_SIZE} requests"
+        ));
+    }
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let mut grouped: HashMap<String, Vec<(usize, SessionPageRequest)>> = HashMap::new();
+    for (index, request) in requests.into_iter().enumerate() {
+        let machine = request
+            .machine
+            .unwrap_or_else(|| crate::machine::LOCAL_MACHINE_ID.to_string());
+        grouped.entry(machine).or_default().push((
+            index,
+            SessionPageRequest {
+                session_id: request.session_id,
+                source_path: request.source_path,
+                offset: request.offset,
+                limit: request.limit,
+            },
+        ));
+    }
+    let total_requests = grouped.values().map(Vec::len).sum();
+    let mut output: Vec<Option<Value>> = vec![None; total_requests];
+    for (machine, batch) in grouped {
+        let page_requests: Vec<_> = batch.iter().map(|(_, request)| request.clone()).collect();
+        match batch_session_contexts(&paths, &config, &machine, &page_requests) {
+            Ok(contexts) => {
+                for ((original_index, _), context) in batch.into_iter().zip(contexts) {
+                    output[original_index] = Some(hydrate_success_value(&machine, context)?);
+                }
+            }
+            Err(batch_error) => {
+                eprintln!("Warning: hydrate machine '{machine}' failed: {batch_error}");
+                for (original_index, request) in batch {
+                    let value = if machine == crate::machine::LOCAL_MACHINE_ID {
+                        match session_page_context(&paths, &config, &machine, &request) {
+                            Ok(context) => hydrate_success_value(&machine, context)?,
+                            Err(error) => {
+                                hydrate_error_value(&machine, &request, &error.to_string())?
+                            }
+                        }
+                    } else {
+                        hydrate_error_value(&machine, &request, &batch_error.to_string())?
+                    };
+                    output[original_index] = Some(value);
+                }
+            }
+        }
+    }
+    for value in output {
+        let value = value.ok_or_else(|| anyhow!("hydrate response missing for request"))?;
+        println!("{}", value);
+    }
+    Ok(())
+}
+
+fn hydrate_success_value(
+    machine: &str,
+    context: crate::machine::SessionPageContext,
+) -> Result<Value> {
+    Ok(serde_json::to_value(HydrateOutput {
+        machine: machine.to_string(),
+        session_id: context.session_id,
+        source_path: context.source_path,
+        cwd: context.cwd,
+        offset: context.offset,
+        total: context.total,
+        next_offset: context.next_offset,
+        records: context
+            .records
+            .into_iter()
+            .map(|record| HydrateRecordOutput {
+                record_id: canonical_record_id(&record),
+                record,
+            })
+            .collect(),
+    })?)
+}
+
+fn hydrate_error_value(machine: &str, request: &SessionPageRequest, error: &str) -> Result<Value> {
+    Ok(serde_json::to_value(HydrateErrorOutput {
+        machine: machine.to_string(),
+        session_id: request.session_id.clone(),
+        source_path: request.source_path.clone(),
+        offset: request.offset,
+        error: error.to_string(),
+    })?)
+}
+
+fn run_eval_retrieval(dataset_path: PathBuf, k: usize, root: Option<PathBuf>) -> Result<()> {
+    let dataset = EvaluationDataset::read_jsonl(&dataset_path)?;
+    let paths = Paths::new(root)?;
+    let index = SearchIndex::open_or_create(&paths.index)?;
+    let mut result_lists = Vec::with_capacity(dataset.cases.len());
+    for case in &dataset.cases {
+        let scope = case
+            .cwd
+            .as_deref()
+            .map(|cwd| session_scope_for_cwd(&paths, cwd))
+            .transpose()?
+            .flatten();
+        let mut ranked = Vec::new();
+        for query in case.query_views()? {
+            let options = QueryOptions {
+                query,
+                project: None,
+                role: None,
+                tool: None,
+                session_id: None,
+                session_scope: scope.clone(),
+                source: None,
+                since: None,
+                until: None,
+                limit: k.max(20),
+            };
+            ranked.push(
+                index
+                    .search(&options)?
+                    .into_iter()
+                    .map(|(score, record)| LocatedRecord {
+                        machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
+                        score,
+                        record,
+                    })
+                    .collect(),
+            );
+        }
+        result_lists.push(fuse_ranked_queries(
+            ranked,
+            crate::retrieval_eval::DEFAULT_RRF_K,
+        ));
+    }
+    let mrr = mean_reciprocal_rank(&result_lists, &dataset.cases)?;
+    let ndcg = dataset
+        .cases
+        .iter()
+        .zip(&result_lists)
+        .map(|(case, results)| ndcg_at_k(results, &case.relevant, k))
+        .sum::<f64>()
+        / dataset.cases.len() as f64;
+    let recall = dataset
+        .cases
+        .iter()
+        .zip(&result_lists)
+        .map(|(case, results)| recall_at_k(results, &case.relevant, k))
+        .sum::<f64>()
+        / dataset.cases.len() as f64;
+    let unique_sessions = result_lists
+        .iter()
+        .map(|results| unique_sessions_at_k(results, k))
+        .sum::<usize>() as f64
+        / dataset.cases.len() as f64;
+    println!(
+        "{}",
+        serde_json::json!({
+            "cases": dataset.cases.len(),
+            "k": k,
+            "mrr": mrr,
+            "recall_at_k": recall,
+            "ndcg_at_k": ndcg,
+            "mean_unique_sessions_at_k": unique_sessions,
+        })
+    );
+    Ok(())
+}
+
+fn run_session(
+    session_id: String,
+    machine: String,
+    source_path: Option<String>,
+    offset: usize,
+    limit: Option<usize>,
+    verbose: bool,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    if session_id.is_empty() {
+        return Err(anyhow!("session_id must not be empty"));
+    }
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let records = hydrate_session_records(
+        &paths,
+        &config,
+        &machine,
+        &session_id,
+        source_path.as_deref().unwrap_or_default(),
+        offset,
+        limit,
+    )?;
     if verbose {
         for record in records {
             let ts = format_ts(record.ts);
@@ -1861,23 +2029,80 @@ fn run_session(session_id: String, verbose: bool, root: Option<PathBuf>) -> Resu
         return Ok(());
     }
     for record in records {
-        println!("{}", serde_json::to_string(&record)?);
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "machine": &machine,
+                "record_id": canonical_record_id(&record),
+                "record": record,
+            }))?
+        );
     }
     Ok(())
 }
 
-fn run_show(doc_id: u64, verbose: bool, root: Option<PathBuf>) -> Result<()> {
+fn run_show(doc_id: u64, machine: String, verbose: bool, root: Option<PathBuf>) -> Result<()> {
     let paths = Paths::new(root)?;
-    let index = SearchIndex::open_or_create(&paths.index)?;
-    let record = index
-        .get_by_doc_id(doc_id)?
-        .ok_or_else(|| anyhow!("doc_id not found"))?;
+    let config = UserConfig::load(&paths)?;
+    let record = record_by_doc_id(&paths, &config, &machine, doc_id)?;
     if verbose {
-        println!("{}", serde_json::to_string_pretty(&record)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "machine": &machine,
+                "record_id": canonical_record_id(&record),
+                "record": record,
+            }))?
+        );
         return Ok(());
     }
-    println!("{}", serde_json::to_string(&record)?);
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "machine": &machine,
+            "record_id": canonical_record_id(&record),
+            "record": record,
+        }))?
+    );
     Ok(())
+}
+
+fn hydrate_session_records(
+    paths: &Paths,
+    config: &UserConfig,
+    machine: &str,
+    session_id: &str,
+    source_path: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<Vec<crate::types::Record>> {
+    if limit.is_some_and(|limit| limit == 0 || limit > MAX_SESSION_PAGE_SIZE) {
+        return Err(anyhow!(
+            "session limit must be between 1 and {MAX_SESSION_PAGE_SIZE}"
+        ));
+    }
+    let page_limit = limit.unwrap_or(MAX_SESSION_PAGE_SIZE);
+    let mut next_offset = offset;
+    let mut records = Vec::new();
+    loop {
+        let context = session_page_context(
+            paths,
+            config,
+            machine,
+            &SessionPageRequest {
+                session_id: session_id.to_string(),
+                source_path: source_path.to_string(),
+                offset: next_offset,
+                limit: page_limit,
+            },
+        )?;
+        records.extend(context.records);
+        if limit.is_some() || context.next_offset.is_none() {
+            break;
+        }
+        next_offset = context.next_offset.expect("checked above");
+    }
+    Ok(records)
 }
 
 fn run_stats(root: Option<PathBuf>) -> Result<()> {
@@ -2229,6 +2454,88 @@ fn canonical_cwd_filter(cwd: Option<PathBuf>) -> Option<String> {
     let cwd = cwd?;
     let resolved = std::fs::canonicalize(&cwd).unwrap_or(cwd);
     Some(resolved.to_string_lossy().to_string())
+}
+
+fn session_scope_for_cwd(paths: &Paths, cwd: &str) -> Result<Option<Vec<SessionScopeKey>>> {
+    let db = analytics_path(&paths.state);
+    if !db.exists() {
+        return Ok(Some(Vec::new()));
+    }
+    let store = AnalyticsStore::open_read_only(db)?;
+    let rows = store.query_sessions_detailed(None, None, Some(cwd), None, None)?;
+    Ok(Some(
+        rows.into_iter()
+            .map(|row| SessionScopeKey {
+                source: row.source,
+                session_id: row.session_id,
+                source_path: row.source_path,
+            })
+            .collect(),
+    ))
+}
+
+struct TraceWriteArgs<'a> {
+    paths: &'a Paths,
+    queries: &'a [String],
+    query_candidate_counts: &'a [usize],
+    cwd: Option<String>,
+    results: &'a [LocatedRecord],
+    mode: &'a str,
+    machines: &'a [String],
+    failures: &'a [String],
+    started: Instant,
+    started_at_ms: u64,
+}
+
+fn write_retrieval_trace(args: TraceWriteArgs<'_>) -> Result<()> {
+    let TraceWriteArgs {
+        paths,
+        queries,
+        query_candidate_counts,
+        cwd,
+        results,
+        mode,
+        machines,
+        failures,
+        started,
+        started_at_ms,
+    } = args;
+    let trace_id = format!(
+        "{}-{}-{}",
+        started_at_ms,
+        std::process::id(),
+        TRACE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+    );
+    let queries = queries
+        .iter()
+        .enumerate()
+        .map(|(query_index, query)| TraceQuery {
+            query_index,
+            query: query.clone(),
+            candidate_count: query_candidate_counts
+                .get(query_index)
+                .copied()
+                .unwrap_or_default(),
+        })
+        .collect();
+    let candidate_count = query_candidate_counts.iter().sum();
+    let trace = RetrievalTrace::from_results(
+        RetrievalTraceMetadata {
+            trace_id: trace_id.clone(),
+            started_at_ms,
+            elapsed_ms: Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+            mode: Some(mode.to_string()),
+            queries,
+            cwd,
+            machines: machines.to_vec(),
+            candidate_count,
+            failures: failures.to_vec(),
+        },
+        results,
+    );
+    append_trace(paths, &trace)?;
+    eprintln!("retrieval trace: {trace_id}");
+    Ok(())
 }
 
 fn source_dir_of(source_path: &str) -> String {
@@ -3898,65 +4205,6 @@ fn wants_field(fields: &Option<HashSet<String>>, name: &str) -> bool {
         .unwrap_or(true)
 }
 
-fn apply_recency_to_results(
-    results: Vec<(f32, crate::types::Record)>,
-    now_ms: u64,
-    recency_weight: f32,
-    recency_half_life_days: f32,
-) -> Vec<(f32, crate::types::Record)> {
-    results
-        .into_iter()
-        .map(|(score, record)| {
-            (
-                apply_recency(
-                    score,
-                    record.ts,
-                    now_ms,
-                    recency_weight,
-                    recency_half_life_days,
-                ),
-                record,
-            )
-        })
-        .collect()
-}
-
-fn apply_post_processing(
-    mut results: Vec<(f32, crate::types::Record)>,
-    render: &RenderOptions,
-) -> Vec<(f32, crate::types::Record)> {
-    if let Some(min_score) = render.min_score {
-        results.retain(|(score, _)| *score >= min_score);
-    }
-
-    match render.sort {
-        SortBy::Score => {
-            results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        }
-        SortBy::Ts => {
-            results.sort_by_key(|result| std::cmp::Reverse(result.1.ts));
-        }
-    }
-
-    if let Some(k) = render.top_n_per_session {
-        let mut per_session: HashMap<String, usize> = HashMap::new();
-        let mut grouped = Vec::with_capacity(results.len());
-        for (score, record) in results {
-            let count = per_session.entry(record.session_id.clone()).or_insert(0);
-            if *count < k {
-                grouped.push((score, record));
-                *count += 1;
-            }
-        }
-        results = grouped;
-    }
-
-    if results.len() > render.limit {
-        results.truncate(render.limit);
-    }
-    results
-}
-
 fn apply_post_processing_located(
     mut results: Vec<LocatedRecord>,
     render: &RenderOptions,
@@ -4637,6 +4885,118 @@ arguments = {
             panic!("expected usage command");
         };
         assert_eq!(machine, ["mini"]);
+    }
+
+    #[test]
+    fn show_session_and_hydrate_accept_machine_scoped_requests() {
+        let show = Cli::try_parse_from(["memex", "show", "42", "--machine", "mini"])
+            .expect("parse machine-scoped show");
+        let Some(Commands::Show { machine, .. }) = show.command else {
+            panic!("expected show command");
+        };
+        assert_eq!(machine, "mini");
+
+        let session = Cli::try_parse_from([
+            "memex",
+            "session",
+            "session-id",
+            "--machine",
+            "mini",
+            "--source-path",
+            "/tmp/session.jsonl",
+            "--offset",
+            "500",
+            "--limit",
+            "100",
+        ])
+        .expect("parse paginated session");
+        let Some(Commands::Session {
+            machine,
+            source_path,
+            offset,
+            limit,
+            ..
+        }) = session.command
+        else {
+            panic!("expected session command");
+        };
+        assert_eq!(machine, "mini");
+        assert_eq!(source_path.as_deref(), Some("/tmp/session.jsonl"));
+        assert_eq!(offset, 500);
+        assert_eq!(limit, Some(100));
+
+        let hydrate = Cli::try_parse_from(["memex", "hydrate", "requests.jsonl"])
+            .expect("parse hydrate command");
+        let Some(Commands::Hydrate { input, .. }) = hydrate.command else {
+            panic!("expected hydrate command");
+        };
+        assert_eq!(input, Some(PathBuf::from("requests.jsonl")));
+    }
+
+    #[test]
+    fn retrieval_commands_accept_multi_query_scope_trace_context_and_eval() {
+        let search = Cli::try_parse_from([
+            "memex",
+            "search",
+            "primary",
+            "--query",
+            "alternate one",
+            "--query",
+            "alternate two",
+            "--cwd",
+            "/tmp/project",
+            "--trace",
+        ])
+        .expect("parse retrieval search options");
+        let Some(Commands::Search {
+            query,
+            additional_queries,
+            cwd,
+            trace,
+            ..
+        }) = search.command
+        else {
+            panic!("expected search command");
+        };
+        assert_eq!(query, "primary");
+        assert_eq!(additional_queries, ["alternate one", "alternate two"]);
+        assert_eq!(cwd, Some(PathBuf::from("/tmp/project")));
+        assert!(trace);
+
+        let context = Cli::try_parse_from([
+            "memex",
+            "context",
+            "--record-id",
+            "rid1_example",
+            "--before",
+            "3",
+            "--after",
+            "7",
+            "--expand-interactions",
+        ])
+        .expect("parse context command");
+        let Some(Commands::Context {
+            record_id,
+            before,
+            after,
+            expand_interactions,
+            ..
+        }) = context.command
+        else {
+            panic!("expected context command");
+        };
+        assert_eq!(record_id.as_deref(), Some("rid1_example"));
+        assert_eq!(before, 3);
+        assert_eq!(after, 7);
+        assert!(expand_interactions);
+
+        let eval = Cli::try_parse_from(["memex", "eval-retrieval", "dataset.jsonl", "--k", "50"])
+            .expect("parse retrieval evaluation command");
+        let Some(Commands::EvalRetrieval { dataset, k, .. }) = eval.command else {
+            panic!("expected eval-retrieval command");
+        };
+        assert_eq!(dataset, PathBuf::from("dataset.jsonl"));
+        assert_eq!(k, 50);
     }
 
     #[test]

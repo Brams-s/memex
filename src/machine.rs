@@ -1,9 +1,10 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, analytics_path};
 use crate::config::{MachineConfig, Paths, UserConfig, default_claude_source};
 use crate::embed::{EmbedderHandle, ModelChoice};
-use crate::index::{QueryOptions, SearchIndex};
+use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
+use crate::retrieval_eval::fuse_ranked_queries;
 use crate::types::{Record, SourceFilter};
 use crate::usage::{
     CacheWaste, CostMode, UsageQuery, UsageSummary, scan_usage, scan_usage_activity,
@@ -17,8 +18,16 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const LOCAL_MACHINE_ID: &str = "local";
+// Additive operations stay on protocol 1 so search/usage remain compatible with
+// older peers. New hydration operations require a peer that understands them;
+// callers surface an explicit RPC-response error when an older peer rejects one.
 const RPC_PROTOCOL: u32 = 1;
 const RRF_K: f32 = 60.0;
+pub const MAX_SESSION_PAGE_SIZE: usize = 500;
+pub const MAX_SESSION_BATCH_SIZE: usize = 32;
+pub const MAX_RPC_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_HYDRATE_INPUT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_HYDRATE_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -31,10 +40,18 @@ pub enum SearchMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSpec {
     pub query: String,
+    /// Additional independent query views. Older RPC peers ignore this field and use `query`.
+    #[serde(default)]
+    pub queries: Vec<String>,
     pub project: Option<String>,
     pub role: Option<String>,
     pub tool: Option<String>,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub session_scope: Option<Vec<SessionScopeKey>>,
+    /// Working-directory/repository scope resolved independently on each machine.
+    #[serde(default)]
+    pub cwd: Option<String>,
     pub source: Option<SourceFilter>,
     pub since: Option<u64>,
     pub until: Option<u64>,
@@ -54,6 +71,7 @@ impl SearchSpec {
             role: self.role.clone(),
             tool: self.tool.clone(),
             session_id: self.session_id.clone(),
+            session_scope: self.session_scope.clone(),
             source: self.source,
             since: self.since,
             until: self.until,
@@ -73,6 +91,25 @@ pub struct LocatedRecord {
 pub struct SessionContext {
     pub records: Vec<Record>,
     pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPageRequest {
+    pub session_id: String,
+    pub source_path: String,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPageContext {
+    pub session_id: String,
+    pub source_path: String,
+    pub records: Vec<Record>,
+    pub cwd: Option<String>,
+    pub offset: usize,
+    pub total: usize,
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +174,8 @@ pub struct SessionActivityPointWire {
 pub struct Federated<T> {
     pub items: Vec<T>,
     pub failures: Vec<(String, String)>,
+    /// Number of candidates collected before the final result limit was applied.
+    pub candidate_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +192,15 @@ enum RpcOperation {
     Session {
         session_id: String,
         source_path: String,
+    },
+    Show {
+        doc_id: u64,
+    },
+    SessionPage {
+        request: SessionPageRequest,
+    },
+    SessionBatch {
+        requests: Vec<SessionPageRequest>,
     },
     Index,
     Usage {
@@ -183,6 +231,15 @@ enum RpcPayload {
     },
     Session {
         context: SessionContext,
+    },
+    Record {
+        record: Box<Record>,
+    },
+    SessionPage {
+        context: SessionPageContext,
+    },
+    SessionBatch {
+        contexts: Vec<SessionPageContext>,
     },
     Index {
         records_added: usize,
@@ -333,10 +390,15 @@ pub fn federated_search(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| right.record.ts.cmp(&left.record.ts))
     });
+    let candidate_count = items.len();
     if items.len() > spec.limit {
         items.truncate(spec.limit);
     }
-    Ok(Federated { items, failures })
+    Ok(Federated {
+        items,
+        failures,
+        candidate_count,
+    })
 }
 
 pub fn federated_recent(
@@ -412,7 +474,12 @@ pub fn federated_recent(
         );
     }
     items.sort_by_key(|item| std::cmp::Reverse(item.record.ts));
-    Ok(Federated { items, failures })
+    let candidate_count = items.len();
+    Ok(Federated {
+        items,
+        failures,
+        candidate_count,
+    })
 }
 
 pub fn session_records(
@@ -456,6 +523,201 @@ pub fn session_context(
         RpcPayload::Error { message } => Err(anyhow!("session failed: {message}")),
         other => Err(anyhow!("session returned unexpected response: {other:?}")),
     }
+}
+
+pub fn record_by_doc_id(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_id: &str,
+    doc_id: u64,
+) -> Result<Record> {
+    if machine_id == LOCAL_MACHINE_ID {
+        let index = SearchIndex::open_or_create(&paths.index)?;
+        return index
+            .get_by_doc_id(doc_id)?
+            .ok_or_else(|| anyhow!("doc_id not found"));
+    }
+    let machine = config
+        .machines
+        .iter()
+        .find(|machine| machine.id == machine_id)
+        .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
+    match rpc(
+        machine,
+        RpcOperation::Show { doc_id },
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    )? {
+        RpcPayload::Record { record } => Ok(*record),
+        RpcPayload::Error { message } => Err(anyhow!("show failed: {message}")),
+        other => Err(anyhow!("show returned unexpected response: {other:?}")),
+    }
+}
+
+pub fn session_page_context(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_id: &str,
+    request: &SessionPageRequest,
+) -> Result<SessionPageContext> {
+    validate_session_page_request(request)?;
+    if machine_id == LOCAL_MACHINE_ID {
+        return session_page_context_local(paths, request);
+    }
+    let machine = config
+        .machines
+        .iter()
+        .find(|machine| machine.id == machine_id)
+        .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
+    match rpc(
+        machine,
+        RpcOperation::SessionPage {
+            request: request.clone(),
+        },
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    )? {
+        RpcPayload::SessionPage { context } => {
+            validate_session_page_context(&context, request)?;
+            Ok(context)
+        }
+        RpcPayload::Error { message } => Err(anyhow!("session page failed: {message}")),
+        other => Err(anyhow!(
+            "session page returned unexpected response: {other:?}"
+        )),
+    }
+}
+
+pub fn batch_session_contexts(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_id: &str,
+    requests: &[SessionPageRequest],
+) -> Result<Vec<SessionPageContext>> {
+    validate_session_batch(requests)?;
+    if machine_id == LOCAL_MACHINE_ID {
+        return requests
+            .iter()
+            .map(|request| session_page_context_local(paths, request))
+            .collect();
+    }
+    let machine = config
+        .machines
+        .iter()
+        .find(|machine| machine.id == machine_id)
+        .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
+    match rpc(
+        machine,
+        RpcOperation::SessionBatch {
+            requests: requests.to_vec(),
+        },
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    )? {
+        RpcPayload::SessionBatch { contexts } => {
+            if contexts.len() != requests.len() {
+                bail!(
+                    "session batch returned {} contexts for {} requests",
+                    contexts.len(),
+                    requests.len()
+                );
+            }
+            for (context, request) in contexts.iter().zip(requests) {
+                validate_session_page_context(context, request)?;
+            }
+            Ok(contexts)
+        }
+        RpcPayload::Error { message } => Err(anyhow!("session batch failed: {message}")),
+        other => Err(anyhow!(
+            "session batch returned unexpected response: {other:?}"
+        )),
+    }
+}
+
+fn session_page_context_local(
+    paths: &Paths,
+    request: &SessionPageRequest,
+) -> Result<SessionPageContext> {
+    let index = SearchIndex::open_or_create(&paths.index)?;
+    let (records, total) = records_for_session_page(&index, request)?;
+    let next_offset = (request.offset.saturating_add(records.len()) < total)
+        .then_some(request.offset.saturating_add(records.len()));
+    Ok(SessionPageContext {
+        session_id: request.session_id.clone(),
+        source_path: request.source_path.clone(),
+        records,
+        cwd: discover_cwd(
+            std::path::Path::new(&request.source_path),
+            &request.session_id,
+        ),
+        offset: request.offset,
+        total,
+        next_offset,
+    })
+}
+
+fn validate_session_page_request(request: &SessionPageRequest) -> Result<()> {
+    if request.session_id.is_empty() {
+        bail!("session page session_id must not be empty");
+    }
+    if request.limit == 0 {
+        bail!("session page limit must be greater than zero");
+    }
+    if request.limit > MAX_SESSION_PAGE_SIZE {
+        bail!(
+            "session page limit {} exceeds maximum {}",
+            request.limit,
+            MAX_SESSION_PAGE_SIZE
+        );
+    }
+    Ok(())
+}
+
+fn validate_session_batch(requests: &[SessionPageRequest]) -> Result<()> {
+    if requests.len() > MAX_SESSION_BATCH_SIZE {
+        bail!(
+            "session batch size {} exceeds maximum {}",
+            requests.len(),
+            MAX_SESSION_BATCH_SIZE
+        );
+    }
+    for request in requests {
+        validate_session_page_request(request)?;
+    }
+    Ok(())
+}
+
+fn validate_session_page_context(
+    context: &SessionPageContext,
+    request: &SessionPageRequest,
+) -> Result<()> {
+    if context.session_id != request.session_id || context.source_path != request.source_path {
+        bail!("session page response does not match its request");
+    }
+    if context.offset != request.offset {
+        bail!("session page response has an unexpected offset");
+    }
+    if context.records.len() > request.limit {
+        bail!("session page response exceeds its requested limit");
+    }
+    if context.offset > context.total {
+        if !context.records.is_empty() || context.next_offset.is_some() {
+            bail!("session page response has invalid out-of-range offset");
+        }
+        return Ok(());
+    }
+    let expected_next = context
+        .offset
+        .checked_add(context.records.len())
+        .ok_or_else(|| anyhow!("session page response has overflowing pagination metadata"))?;
+    if context.total < expected_next {
+        bail!("session page response has invalid pagination total");
+    }
+    if expected_next < context.total {
+        if context.records.is_empty() || context.next_offset != Some(expected_next) {
+            bail!("session page response has inconsistent continuation metadata");
+        }
+    } else if context.next_offset.is_some() {
+        bail!("session page response has invalid pagination metadata");
+    }
+    Ok(())
 }
 
 pub fn machine_by_id<'a>(config: &'a UserConfig, id: &str) -> Option<&'a MachineConfig> {
@@ -692,7 +954,11 @@ pub fn run_rpc_stdio(root: Option<std::path::PathBuf>) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let mut input = Vec::new();
-    std::io::stdin().read_to_end(&mut input)?;
+    let mut stdin = std::io::stdin().take(MAX_RPC_REQUEST_BYTES as u64 + 1);
+    stdin.read_to_end(&mut input)?;
+    if input.len() > MAX_RPC_REQUEST_BYTES {
+        bail!("RPC request exceeds maximum size of {MAX_RPC_REQUEST_BYTES} bytes");
+    }
     let request: RpcRequest =
         serde_json::from_slice(&input).context("invalid memex RPC request")?;
     let response = if request.protocol != RPC_PROTOCOL {
@@ -746,6 +1012,29 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
                     cwd: discover_cwd(std::path::Path::new(&source_path), &session_id),
                 },
             })
+        }
+        RpcOperation::Show { doc_id } => {
+            let index = SearchIndex::open_or_create(&paths.index)?;
+            let record = index
+                .get_by_doc_id(doc_id)?
+                .ok_or_else(|| anyhow!("doc_id not found"))?;
+            Ok(RpcPayload::Record {
+                record: Box::new(record),
+            })
+        }
+        RpcOperation::SessionPage { request } => {
+            validate_session_page_request(&request)?;
+            Ok(RpcPayload::SessionPage {
+                context: session_page_context_local(paths, &request)?,
+            })
+        }
+        RpcOperation::SessionBatch { requests } => {
+            validate_session_batch(&requests)?;
+            let contexts = requests
+                .iter()
+                .map(|request| session_page_context_local(paths, request))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(RpcPayload::SessionBatch { contexts })
         }
         RpcOperation::Index => {
             let report = index_local(paths, config, false)?;
@@ -966,7 +1255,32 @@ fn search_local(
         ensure_local_index(paths, config)?;
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
-    let options = spec.query_options();
+    if !spec.queries.is_empty() {
+        let mut ranked = Vec::with_capacity(spec.queries.len() + 1);
+        for query in std::iter::once(spec.query.clone()).chain(spec.queries.iter().cloned()) {
+            let mut one = spec.clone();
+            one.query = query;
+            one.queries.clear();
+            ranked.push(
+                search_local(paths, config, &one, false)?
+                    .into_iter()
+                    .map(|(score, record)| LocatedRecord {
+                        machine: LOCAL_MACHINE_ID.to_string(),
+                        score,
+                        record,
+                    })
+                    .collect(),
+            );
+        }
+        return Ok(fuse_ranked_queries(ranked, RRF_K)
+            .into_iter()
+            .map(|result| (result.score, result.record))
+            .collect());
+    }
+    let mut options = spec.query_options();
+    if let Some(cwd) = spec.cwd.as_deref() {
+        options.session_scope = Some(session_scope_for_cwd(paths, cwd)?);
+    }
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let mut results = match spec.mode {
         SearchMode::Lexical => index.search(&options)?,
@@ -990,7 +1304,12 @@ fn search_local(
                 .next()
                 .ok_or_else(|| anyhow!("embedding missing"))?;
             let mut records = Vec::new();
-            for (doc_id, distance) in vector.search(&embedding, spec.limit)? {
+            let vector_limit = if options.session_scope.is_some() {
+                vector.len()
+            } else {
+                spec.limit
+            };
+            for (doc_id, distance) in vector.search(&embedding, vector_limit)? {
                 if let Some(record) = index.get_by_doc_id(doc_id)?
                     && matches_filters(&record, &options)
                 {
@@ -1023,7 +1342,12 @@ fn search_local(
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("embedding missing"))?;
-            let semantic = vector.search(&embedding, candidate_limit)?;
+            let semantic_limit = if options.session_scope.is_some() {
+                vector.len()
+            } else {
+                candidate_limit
+            };
+            let semantic = vector.search(&embedding, semantic_limit)?;
             let mut records = HashMap::new();
             let mut scores = HashMap::<u64, f32>::new();
             for (rank, (_, record)) in lexical.into_iter().enumerate() {
@@ -1069,6 +1393,23 @@ fn search_local(
     results.truncate(spec.limit);
     apply_project_grouping(paths, &mut results, spec.project_grouping);
     Ok(results)
+}
+
+fn session_scope_for_cwd(paths: &Paths, cwd: &str) -> Result<Vec<SessionScopeKey>> {
+    let db = analytics_path(&paths.state);
+    if !db.exists() {
+        return Ok(Vec::new());
+    }
+    let store = AnalyticsStore::open_read_only(db)?;
+    Ok(store
+        .query_sessions_detailed(None, None, Some(cwd), None, None)?
+        .into_iter()
+        .map(|row| SessionScopeKey {
+            source: row.source,
+            session_id: row.session_id,
+            source_path: row.source_path,
+        })
+        .collect())
 }
 
 fn lexical_results(
@@ -1212,6 +1553,51 @@ fn records_for_session(
             .then_with(|| left.doc_id.cmp(&right.doc_id))
     });
     Ok(records)
+}
+
+fn records_for_session_page(
+    index: &SearchIndex,
+    request: &SessionPageRequest,
+) -> Result<(Vec<Record>, usize)> {
+    if request.source_path.is_empty() {
+        return index.records_by_session_id_page(
+            &request.session_id,
+            request.offset,
+            request.limit,
+        );
+    }
+
+    // The index page collector can page by session but not by source path.
+    // Scan bounded index pages while retaining only the requested output page,
+    // so a source-qualified request cannot materialize the whole trajectory.
+    let mut scan_offset = 0usize;
+    let mut matched = 0usize;
+    let mut records = Vec::with_capacity(request.limit);
+    loop {
+        let (page, total) = index.records_by_session_id_page(
+            &request.session_id,
+            scan_offset,
+            MAX_SESSION_PAGE_SIZE,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+        for record in page {
+            if record.source_path != request.source_path {
+                continue;
+            }
+            if matched >= request.offset && records.len() < request.limit {
+                records.push(record);
+            }
+            matched = matched.saturating_add(1);
+        }
+        scan_offset = scan_offset
+            .saturating_add(MAX_SESSION_PAGE_SIZE.min(total.saturating_sub(scan_offset)));
+        if scan_offset >= total {
+            break;
+        }
+    }
+    Ok((records, matched))
 }
 
 fn discover_cwd(path: &std::path::Path, session_id: &str) -> Option<String> {
@@ -1459,10 +1845,13 @@ mod tests {
     fn search_spec(mode: SearchMode) -> SearchSpec {
         SearchSpec {
             query: "query readiness".to_string(),
+            queries: Vec::new(),
             project: None,
             role: None,
             tool: None,
             session_id: None,
+            session_scope: None,
+            cwd: None,
             source: None,
             since: None,
             until: None,
@@ -1473,6 +1862,36 @@ mod tests {
             min_score: None,
             project_grouping: None,
         }
+    }
+
+    fn test_record(doc_id: u64, session_id: &str, source_path: &str, turn_id: u32) -> Record {
+        Record {
+            source: SourceKind::Codex,
+            doc_id,
+            ts: doc_id,
+            project: "memex".to_string(),
+            session_id: session_id.to_string(),
+            turn_id,
+            role: "assistant".to_string(),
+            text: format!("record {doc_id}"),
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            links: RecordLinks::default(),
+            source_path: source_path.to_string(),
+        }
+    }
+
+    fn write_test_index(paths: &Paths, records: &[Record]) {
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        for record in records {
+            index.add_record(&mut writer, record).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
     }
 
     #[test]
@@ -1553,6 +1972,156 @@ mod tests {
             assert_eq!(result.items.len(), 1);
             assert_eq!(result.items[0].record.doc_id, 1);
         }
+    }
+
+    #[test]
+    fn local_show_page_and_batch_hydration_preserve_machine_selectors() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        let records = vec![
+            test_record(1, "session", "a.jsonl", 1),
+            test_record(2, "session", "a.jsonl", 2),
+            test_record(3, "session", "b.jsonl", 3),
+        ];
+        write_test_index(&paths, &records);
+
+        let config = UserConfig::default();
+        assert_eq!(
+            record_by_doc_id(&paths, &config, LOCAL_MACHINE_ID, 2)
+                .unwrap()
+                .source_path,
+            "a.jsonl"
+        );
+
+        let page = session_page_context(
+            &paths,
+            &config,
+            LOCAL_MACHINE_ID,
+            &SessionPageRequest {
+                session_id: "session".to_string(),
+                source_path: "a.jsonl".to_string(),
+                offset: 1,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(
+            page.records
+                .iter()
+                .map(|record| record.doc_id)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(page.next_offset, None);
+
+        let contexts = batch_session_contexts(
+            &paths,
+            &config,
+            LOCAL_MACHINE_ID,
+            &[
+                SessionPageRequest {
+                    session_id: "session".to_string(),
+                    source_path: "a.jsonl".to_string(),
+                    offset: 0,
+                    limit: 1,
+                },
+                SessionPageRequest {
+                    session_id: "session".to_string(),
+                    source_path: "b.jsonl".to_string(),
+                    offset: 0,
+                    limit: 1,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].records[0].doc_id, 1);
+        assert_eq!(contexts[1].records[0].doc_id, 3);
+    }
+
+    #[test]
+    fn session_hydration_limits_are_enforced_before_rpc() {
+        let request = SessionPageRequest {
+            session_id: "session".to_string(),
+            source_path: String::new(),
+            offset: 0,
+            limit: MAX_SESSION_PAGE_SIZE + 1,
+        };
+        assert!(validate_session_page_request(&request).is_err());
+
+        let requests = vec![
+            SessionPageRequest {
+                limit: 1,
+                ..request.clone()
+            };
+            MAX_SESSION_BATCH_SIZE + 1
+        ];
+        assert!(validate_session_batch(&requests).is_err());
+    }
+
+    #[test]
+    fn session_hydration_validation_rejects_empty_ids_and_inconsistent_pages() {
+        assert!(
+            validate_session_page_request(&SessionPageRequest {
+                session_id: String::new(),
+                source_path: String::new(),
+                offset: 0,
+                limit: 1,
+            })
+            .is_err()
+        );
+
+        let request = SessionPageRequest {
+            session_id: "session".to_string(),
+            source_path: String::new(),
+            offset: 1,
+            limit: 2,
+        };
+        let records = vec![test_record(1, "session", "source", 1)];
+
+        assert!(
+            validate_session_page_context(
+                &SessionPageContext {
+                    session_id: request.session_id.clone(),
+                    source_path: request.source_path.clone(),
+                    records: records.clone(),
+                    cwd: None,
+                    offset: request.offset,
+                    total: 4,
+                    next_offset: Some(4),
+                },
+                &request,
+            )
+            .is_err()
+        );
+
+        assert!(
+            validate_session_page_context(
+                &SessionPageContext {
+                    session_id: request.session_id.clone(),
+                    source_path: request.source_path.clone(),
+                    records,
+                    cwd: None,
+                    offset: 5,
+                    total: 4,
+                    next_offset: Some(6),
+                },
+                &request,
+            )
+            .is_err()
+        );
+
+        let valid = SessionPageContext {
+            session_id: request.session_id.clone(),
+            source_path: request.source_path.clone(),
+            records: vec![test_record(1, "session", "source", 1)],
+            cwd: None,
+            offset: 1,
+            total: 4,
+            next_offset: Some(2),
+        };
+        assert!(validate_session_page_context(&valid, &request).is_ok());
     }
 
     #[test]
