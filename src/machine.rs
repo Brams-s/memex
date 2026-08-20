@@ -4,7 +4,6 @@ use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
-use crate::retrieval_eval::fuse_ranked_queries;
 use crate::types::{Record, SourceFilter};
 use crate::usage::{
     CacheWaste, CostMode, UsageQuery, UsageSummary, scan_usage, scan_usage_activity,
@@ -40,9 +39,6 @@ pub enum SearchMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSpec {
     pub query: String,
-    /// Additional independent query views. Older RPC peers ignore this field and use `query`.
-    #[serde(default)]
-    pub queries: Vec<String>,
     pub project: Option<String>,
     pub role: Option<String>,
     pub tool: Option<String>,
@@ -1255,28 +1251,6 @@ fn search_local(
         ensure_local_index(paths, config)?;
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
-    if !spec.queries.is_empty() {
-        let mut ranked = Vec::with_capacity(spec.queries.len() + 1);
-        for query in std::iter::once(spec.query.clone()).chain(spec.queries.iter().cloned()) {
-            let mut one = spec.clone();
-            one.query = query;
-            one.queries.clear();
-            ranked.push(
-                search_local(paths, config, &one, false)?
-                    .into_iter()
-                    .map(|(score, record)| LocatedRecord {
-                        machine: LOCAL_MACHINE_ID.to_string(),
-                        score,
-                        record,
-                    })
-                    .collect(),
-            );
-        }
-        return Ok(fuse_ranked_queries(ranked, RRF_K)
-            .into_iter()
-            .map(|result| (result.score, result.record))
-            .collect());
-    }
     let mut options = spec.query_options();
     if let Some(cwd) = spec.cwd.as_deref() {
         options.session_scope = Some(session_scope_for_cwd(paths, cwd)?);
@@ -1793,6 +1767,13 @@ fn matches_filters(record: &Record, options: &QueryOptions) -> bool {
             .session_id
             .as_ref()
             .is_none_or(|session| record.session_id == *session)
+        && options.session_scope.as_ref().is_none_or(|scope| {
+            scope.iter().any(|key| {
+                key.source == record.source
+                    && key.session_id == record.session_id
+                    && key.source_path == record.source_path
+            })
+        })
         && options
             .source
             .is_none_or(|source| source.matches(record.source))
@@ -1845,7 +1826,6 @@ mod tests {
     fn search_spec(mode: SearchMode) -> SearchSpec {
         SearchSpec {
             query: "query readiness".to_string(),
-            queries: Vec::new(),
             project: None,
             role: None,
             tool: None,
@@ -2122,6 +2102,28 @@ mod tests {
             next_offset: Some(2),
         };
         assert!(validate_session_page_context(&valid, &request).is_ok());
+    }
+
+    #[test]
+    fn record_filters_enforce_exact_session_scope() {
+        let record = test_record(1, "session", "source.jsonl", 1);
+        let mut options = search_spec(SearchMode::Semantic).query_options();
+        options.session_scope = Some(vec![SessionScopeKey {
+            source: record.source,
+            session_id: record.session_id.clone(),
+            source_path: record.source_path.clone(),
+        }]);
+        assert!(matches_filters(&record, &options));
+
+        options.session_scope = Some(Vec::new());
+        assert!(!matches_filters(&record, &options));
+
+        options.session_scope = Some(vec![SessionScopeKey {
+            source: record.source,
+            session_id: record.session_id.clone(),
+            source_path: "other.jsonl".to_string(),
+        }]);
+        assert!(!matches_filters(&record, &options));
     }
 
     #[test]

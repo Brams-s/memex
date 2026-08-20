@@ -1398,7 +1398,6 @@ fn run_search(
     for (query_index, query) in queries.iter().enumerate() {
         let spec = SearchSpec {
             query: query.clone(),
-            queries: Vec::new(),
             project: options.project.clone(),
             role: options.role.clone(),
             tool: options.tool.clone(),

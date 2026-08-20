@@ -384,7 +384,6 @@ fn identifier_set(record: &Record) -> HashSet<String> {
         record.links.event_id.as_deref(),
         record.links.parent_event_id.as_deref(),
         record.links.logical_parent_event_id.as_deref(),
-        record.links.parent_session_id.as_deref(),
         record.links.parent_tool_use_id.as_deref(),
         record.links.source_tool_use_id.as_deref(),
         record.links.source_tool_assistant_uuid.as_deref(),
@@ -702,6 +701,42 @@ mod tests {
                 .filter(|item| item.record.text == "linked")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn interaction_expansion_does_not_join_on_parent_session_id() {
+        let mut anchor = record(1, 1, "anchor");
+        anchor.links.event_id = Some("anchor-event".to_string());
+        anchor.links.parent_session_id = Some("parent-session".to_string());
+
+        let mut linked = record(2, 2, "linked");
+        linked.links.parent_event_id = Some("anchor-event".to_string());
+        linked.links.parent_session_id = Some("parent-session".to_string());
+
+        let mut unrelated = record(3, 3, "unrelated");
+        unrelated.links.event_id = Some("unrelated-event".to_string());
+        unrelated.links.parent_session_id = Some("parent-session".to_string());
+
+        let index = indexed(&[anchor, linked, unrelated]);
+        let result = context_records(
+            &index,
+            &ContextSelector::event_id("anchor-event"),
+            ContextOptions {
+                before: 0,
+                after: 0,
+                expand_interactions: true,
+            },
+        )
+        .expect("context");
+
+        assert_eq!(
+            result
+                .records
+                .iter()
+                .map(|item| item.record.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["anchor", "linked"]
         );
     }
 }

@@ -5335,7 +5335,6 @@ fn run_search_request(
                 &request.machines,
                 &SearchSpec {
                     query: request.query.clone(),
-                    queries: Vec::new(),
                     project: tantivy_project,
                     role: None,
                     tool: None,
