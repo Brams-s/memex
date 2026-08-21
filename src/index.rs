@@ -62,7 +62,6 @@ pub struct SearchIndex {
 const GENERATIONS_DIR: &str = "generations";
 const CURRENT_FILE: &str = "CURRENT";
 const GENERATION_LEASE_FILE: &str = ".lease";
-const MAX_RETAINED_LEASED_GENERATIONS: usize = 16;
 const CONTINUOUS_MERGE_BATCH_SEGMENTS: usize = 128;
 const CONTINUOUS_MERGE_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
@@ -169,27 +168,6 @@ impl SearchIndex {
         resolve_current_generation(dir)
             .is_some_and(|generation| generation.join("meta.json").exists())
             || dir.join("meta.json").exists()
-    }
-
-    pub fn offline_gc_required(dir: &Path) -> Result<bool> {
-        if dir.join("meta.json").is_file() {
-            return Ok(true);
-        }
-        let generations = dir.join(GENERATIONS_DIR);
-        if !generations.is_dir() {
-            return Ok(false);
-        }
-        let mut unleased = 0usize;
-        for entry in fs::read_dir(generations)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir()
-                && !entry.file_name().to_string_lossy().starts_with('.')
-                && !entry.path().join(GENERATION_LEASE_FILE).is_file()
-            {
-                unleased += 1;
-            }
-        }
-        Ok(unleased > 0)
     }
 
     pub fn garbage_collect_generations_offline(
@@ -468,6 +446,7 @@ impl SearchIndex {
         atomic_write_current(&pending.index_root, &pending.generation_name)?;
         pending.published.store(true, AtomicOrdering::Release);
         prune_superseded_generations(&pending.index_root, &pending.generation_name)?;
+        prune_legacy_index_files(&pending.index_root)?;
         Ok(())
     }
 
@@ -893,29 +872,47 @@ fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> 
             continue;
         }
 
-        // Generations created before lease support may still be used by an older Memex process.
-        // Leave them for an explicit offline cleanup instead of guessing that they are unreferenced.
-        let Some(_lease) = try_lock_generation_exclusive(&entry.path())? else {
-            continue;
+        let lease_path = entry.path().join(GENERATION_LEASE_FILE);
+        let _lease = if lease_path.is_file() {
+            let Some(lease) = try_lock_generation_exclusive(&entry.path())? else {
+                continue;
+            };
+            Some(lease)
+        } else {
+            // Pre-lease generations cannot advertise readers. On Unix, removing their directory
+            // is safe even if an older process still has segment files open or memory-mapped. On
+            // platforms that prohibit deleting open files, leave the generation for a later pass.
+            None
         };
-        fs::remove_dir_all(entry.path()).with_context(|| {
-            format!(
-                "prune superseded index generation {}",
-                entry.path().display()
-            )
-        })?;
+        if let Err(error) = fs::remove_dir_all(entry.path())
+            && error.kind() != io::ErrorKind::PermissionDenied
+        {
+            return Err(error).with_context(|| {
+                format!(
+                    "prune superseded index generation {}",
+                    entry.path().display()
+                )
+            });
+        }
     }
     sync_directory(&generations)?;
-    let retained = fs::read_dir(&generations)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().join(GENERATION_LEASE_FILE).is_file())
-        .count();
-    if retained > MAX_RETAINED_LEASED_GENERATIONS {
-        bail!(
-            "refusing to continue indexing: {retained} leased index generations remain (limit \
-             {MAX_RETAINED_LEASED_GENERATIONS}); close stale Memex readers and retry"
-        );
+    Ok(())
+}
+
+fn prune_legacy_index_files(index_root: &Path) -> Result<()> {
+    for entry in fs::read_dir(index_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || entry.file_name() == CURRENT_FILE {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(entry.path())
+            && error.kind() != io::ErrorKind::PermissionDenied
+        {
+            return Err(error)
+                .with_context(|| format!("prune legacy index file {}", entry.path().display()));
+        }
     }
+    sync_directory(index_root)?;
     Ok(())
 }
 
@@ -1493,6 +1490,73 @@ mod tests {
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
             .count();
         assert_eq!(generation_count, 1);
+    }
+
+    #[test]
+    fn normal_indexing_reclaims_pre_lease_generations_automatically() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("first generation");
+        let mut writer = first.writer().expect("first writer");
+        first
+            .add_record(&mut writer, &test_record(1, "preserved"))
+            .expect("add record");
+        writer.commit().expect("commit first");
+        writer.wait_merging_threads().expect("finish first writer");
+        first.publish_generation().expect("publish first");
+        let current = resolve_current_generation(tmp.path()).expect("current generation");
+
+        for generation in 0..300 {
+            let stale = tmp
+                .path()
+                .join(GENERATIONS_DIR)
+                .join(format!("pre-lease-{generation:03}"));
+            clone_generation(&current, &stale).expect("clone pre-lease generation");
+            let lease = stale.join(GENERATION_LEASE_FILE);
+            if lease.exists() {
+                fs::remove_file(lease).expect("remove generation lease");
+            }
+        }
+
+        let refresh = SearchIndex::open_or_create_for_continuous_ingest(tmp.path())
+            .expect("continuous indexing must not require manual GC");
+        refresh
+            .publish_generation()
+            .expect("normal publication must reclaim pre-lease generations");
+
+        let published = SearchIndex::open_or_create(tmp.path()).expect("published index");
+        assert_eq!(published.doc_count().expect("document count"), 1);
+        assert_eq!(search_text_count(&published, "preserved"), 1);
+        let generations = fs::read_dir(tmp.path().join(GENERATIONS_DIR))
+            .expect("generation directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .count();
+        assert_eq!(generations, 1);
+    }
+
+    #[test]
+    fn normal_indexing_migrates_flat_legacy_index_automatically() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let legacy = SearchIndex::open_or_create_with_policy(tmp.path(), StaleSchemaPolicy::Error)
+            .expect("legacy flat index");
+        let mut writer = legacy.writer().expect("legacy writer");
+        legacy
+            .add_record(&mut writer, &test_record(1, "preserved"))
+            .expect("add record");
+        writer.commit().expect("commit legacy index");
+        writer.wait_merging_threads().expect("finish legacy writer");
+        drop(legacy);
+
+        let refresh = SearchIndex::open_or_create_for_continuous_ingest(tmp.path())
+            .expect("continuous indexing must migrate a flat index");
+        refresh
+            .publish_generation()
+            .expect("publish migrated generation");
+
+        assert!(!tmp.path().join("meta.json").exists());
+        let published = SearchIndex::open_or_create(tmp.path()).expect("published index");
+        assert_eq!(published.doc_count().expect("document count"), 1);
+        assert_eq!(search_text_count(&published, "preserved"), 1);
     }
 
     #[test]

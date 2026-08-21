@@ -1218,12 +1218,6 @@ fn run_index(
         std::fs::remove_dir_all(&paths.root)?;
     }
     paths.ensure_dirs()?;
-    if continuous && SearchIndex::offline_gc_required(&paths.index)? {
-        return Err(anyhow!(
-            "continuous indexing is disabled because pre-lease index generations require cleanup; \
-             stop Memex readers, then run `memex index-gc --offline`"
-        ));
-    }
     let index = if continuous {
         SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
     } else {
