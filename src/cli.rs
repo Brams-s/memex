@@ -3807,7 +3807,7 @@ fn print_service_web_ui_status(output: &str) {
     if service_output_has_arg(output, "--web-ui") || output.contains(" --web-ui") {
         let listen =
             service_output_arg_value(output, "--web-listen").unwrap_or(crate::web::DEFAULT_LISTEN);
-        if web_ui_is_listening(listen) {
+        if web_ui_is_healthy(listen) {
             println!("web UI: http://{listen}");
         } else {
             println!("web UI: unavailable (configured at http://{listen})");
@@ -3828,17 +3828,64 @@ fn web_ui_addresses(listen: &str) -> Result<Vec<std::net::SocketAddr>> {
     Ok(addresses)
 }
 
-fn web_ui_is_listening(listen: &str) -> bool {
+fn web_ui_is_healthy(listen: &str) -> bool {
     web_ui_addresses(listen).is_ok_and(|addresses| {
-        addresses
-            .iter()
-            .any(|address| TcpStream::connect_timeout(address, Duration::from_millis(100)).is_ok())
+        addresses.iter().any(|address| {
+            let Ok(mut stream) = TcpStream::connect_timeout(address, Duration::from_millis(100))
+            else {
+                return false;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .ok();
+            stream
+                .set_write_timeout(Some(Duration::from_millis(500)))
+                .ok();
+            if write!(
+                stream,
+                "GET /healthz HTTP/1.1\r\nHost: {listen}\r\nConnection: close\r\n\r\n"
+            )
+            .is_err()
+            {
+                return false;
+            }
+
+            let mut response = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while response.len() < 4096 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        response.extend_from_slice(&chunk[..read]);
+                        if is_memex_health_response(&response) {
+                            return true;
+                        }
+                    }
+                    Err(_) => return false,
+                }
+            }
+            is_memex_health_response(&response)
+        })
     })
+}
+
+fn is_memex_health_response(response: &[u8]) -> bool {
+    let Ok(response) = std::str::from_utf8(response) else {
+        return false;
+    };
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    headers
+        .lines()
+        .next()
+        .is_some_and(|status| status.ends_with(" 200 OK"))
+        && body == "ok"
 }
 
 fn wait_for_web_ui(listen: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    while !web_ui_is_listening(listen) {
+    while !web_ui_is_healthy(listen) {
         if Instant::now() >= deadline {
             return Err(anyhow!(
                 "Web UI did not start listening at http://{listen} within {} seconds",
@@ -4896,12 +4943,35 @@ mod tests {
     }
 
     #[test]
-    fn web_ui_readiness_detects_bound_listener() {
+    fn web_ui_readiness_requires_memex_health_response() {
+        let (listen, server) = serve_one_test_response(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+
+        wait_for_web_ui(&listen, Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn web_ui_readiness_rejects_unrelated_tcp_listener() {
+        let (listen, server) = serve_one_test_response(
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+        );
+
+        assert!(!web_ui_is_healthy(&listen));
+        server.join().unwrap();
+    }
+
+    fn serve_one_test_response(response: &'static str) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let listen = listener.local_addr().unwrap().to_string();
-
-        wait_for_web_ui(&listen, Duration::from_millis(100)).unwrap();
-        assert!(web_ui_is_listening(&listen));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (listen, server)
     }
 
     #[test]
