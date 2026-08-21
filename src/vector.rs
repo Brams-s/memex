@@ -232,9 +232,10 @@ fn save_metadata(path: &Path, metadata: &VectorMetadata) -> Result<()> {
 
 fn load_doc_ids(path: &Path) -> Result<HashSet<u64>> {
     let bytes = fs::read(path)?;
-    let ids: Vec<u64> = bytes
-        .chunks_exact(8)
-        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    let (chunks, _) = bytes.as_chunks::<8>();
+    let ids: Vec<u64> = chunks
+        .iter()
+        .map(|bytes| u64::from_le_bytes(*bytes))
         .collect();
     Ok(ids.into_iter().collect())
 }

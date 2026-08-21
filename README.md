@@ -358,6 +358,28 @@ memex index-service disable
 
 `index-service` reads config defaults (mode, interval, log paths). Flags override.
 
+### Reclaiming obsolete index generations
+
+After an upgrade, normal indexing automatically migrates a legacy index and removes obsolete
+pre-lease generations. It preserves the committed Tantivy segments without rebuilding or reparsing
+conversation history. No user action is required.
+
+For diagnostics or to reclaim space immediately without waiting for the next index run, stop the
+background service and close TUI/Web readers, then preview and run GC:
+
+```bash
+memex index-service disable
+memex index-gc --dry-run
+memex index-gc --offline
+memex index-service enable --web-ui # or restore the mode you previously used
+```
+
+`index-gc` validates the committed index, hard-links only its live Tantivy segments into a clean
+generation, atomically switches `CURRENT`, validates the document count again, and then removes
+unreachable generations. It does not rebuild the index and does not rewrite live segment data.
+The explicit command retains an `--offline` acknowledgement because it performs cleanup without a
+normal index publication.
+
 On Linux, creates systemd user units in `~/.config/systemd/user/`. On macOS, creates a launchd plist in `~/.memex/`.
 On successful enable, memex writes `auto_index_on_search = false` to config when that setting is absent, so searches do not duplicate daemon work. Explicit user config is preserved.
 

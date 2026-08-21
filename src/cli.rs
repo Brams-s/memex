@@ -165,6 +165,18 @@ EXAMPLES:
         #[command(flatten)]
         index: IndexArgs,
     },
+    /// Reclaim unreachable immutable index generations without rebuilding
+    IndexGc {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Report what would be removed without changing the index
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm the index service and all Memex readers are stopped
+        #[arg(long)]
+        offline: bool,
+    },
     /// Generate embeddings for semantic search (requires existing index)
     Embed {
         /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
@@ -818,12 +830,17 @@ pub fn run() -> Result<()> {
             } else if web_ui || web_listen.is_some() {
                 return Err(anyhow!("--web-ui requires --watch"));
             } else {
-                run_index_args(&index, false)?;
+                run_index_args(&index, false, false)?;
             }
         }
         Commands::Reindex { index } => {
-            run_index_args(&index, true)?;
+            run_index_args(&index, true, false)?;
         }
+        Commands::IndexGc {
+            root,
+            dry_run,
+            offline,
+        } => run_index_gc(root, dry_run, offline)?,
         Commands::Embed { model, root } => {
             run_embed(model, root)?;
         }
@@ -1122,19 +1139,19 @@ pub fn run() -> Result<()> {
 }
 
 fn run_index_loop(index: &IndexArgs, interval_secs: u64, web_listen: Option<String>) -> Result<()> {
-    run_index_args(index, false)?;
+    run_index_args(index, false, true)?;
     let _web_thread = web_listen
         .as_deref()
         .map(|listen| crate::web::spawn(index.root.clone(), listen))
         .transpose()?;
     loop {
         std::thread::sleep(Duration::from_secs(interval_secs));
-        run_index_args(index, false)?;
+        run_index_args(index, false, true)?;
         std::io::stdout().flush().ok();
     }
 }
 
-fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
+fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
     run_index(
         index.source.clone(),
         index.include_agents,
@@ -1152,6 +1169,7 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
         index.root.clone(),
         index.exclude.clone(),
         reindex,
+        continuous,
         index.diagnostics,
     )
 }
@@ -1174,6 +1192,7 @@ fn run_index(
     root: Option<PathBuf>,
     mut excludes: Vec<String>,
     reindex: bool,
+    continuous: bool,
     print_diagnostics: bool,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
@@ -1199,7 +1218,11 @@ fn run_index(
         std::fs::remove_dir_all(&paths.root)?;
     }
     paths.ensure_dirs()?;
-    let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+    let index = if continuous {
+        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
+    } else {
+        SearchIndex::open_or_create_for_ingest(&paths.index)?
+    };
 
     let opts = IngestOptions {
         claude_source: source.unwrap_or_else(default_claude_source),
@@ -1239,6 +1262,30 @@ fn run_index(
         println!(
             "parser diagnostics:\n{}",
             serde_json::to_string_pretty(&report.diagnostics)?
+        );
+    }
+    Ok(())
+}
+
+fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<()> {
+    if !dry_run && !offline {
+        return Err(anyhow!(
+            "index GC requires offline confirmation; stop the Memex index service and all Memex \
+             readers, then rerun with `--offline` (or use `--dry-run`)"
+        ));
+    }
+    let paths = Paths::new(root)?;
+    let _lease = IngestLease::acquire(&paths, "index-gc", INGEST_LEASE_TIMEOUT)?;
+    let report = SearchIndex::garbage_collect_generations_offline(&paths.index, dry_run)?;
+    if report.dry_run {
+        println!(
+            "would remove {} unreachable generations and {} legacy index files; no rebuild required",
+            report.generations_removed, report.legacy_files_removed
+        );
+    } else {
+        println!(
+            "removed {} unreachable generations and {} legacy index files; retained the committed index without rebuilding",
+            report.generations_removed, report.legacy_files_removed
         );
     }
     Ok(())
