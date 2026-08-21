@@ -1108,6 +1108,7 @@ fn writer_loop(
 
     analytics.flush()?;
     writer.commit()?;
+    index.maybe_compact_continuous_segments(&mut writer)?;
     if embeddings {
         if !embed_buffer.is_empty() {
             embedded_count += flush_embeddings(
