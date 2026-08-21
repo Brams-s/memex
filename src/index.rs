@@ -87,6 +87,7 @@ struct PendingGeneration {
     generation_name: String,
     replaces_published_generation: bool,
     published: AtomicBool,
+    _staging_lease: GenerationLease,
 }
 
 impl Drop for PendingGeneration {
@@ -231,6 +232,18 @@ impl SearchIndex {
                 exclusive_leases.push(lease);
             }
         }
+        for workdir in &abandoned_workdirs {
+            if workdir.join(GENERATION_LEASE_FILE).is_file() {
+                let lease = try_lock_generation_exclusive(workdir)?.ok_or_else(|| {
+                    anyhow!(
+                        "index generation work directory {} is still in use; close all Memex \
+                         readers and writers and retry",
+                        workdir.display()
+                    )
+                })?;
+                exclusive_leases.push(lease);
+            }
+        }
 
         let expected = validate_committed_generation(&source)?;
         let temp = tempfile::Builder::new()
@@ -322,6 +335,8 @@ impl SearchIndex {
         } else {
             fs::create_dir_all(&staging_dir)?;
         }
+        create_generation_lease_file(&staging_dir)?;
+        let staging_lease = acquire_generation_lease(&staging_dir)?;
 
         let mut index =
             Self::open_or_create_with_policy(&staging_dir, StaleSchemaPolicy::Recreate)?;
@@ -331,6 +346,7 @@ impl SearchIndex {
             generation_name,
             replaces_published_generation: current.is_some(),
             published: AtomicBool::new(false),
+            _staging_lease: staging_lease,
         }));
         index.suppress_automatic_merges = suppress_automatic_merges;
         Ok(index)
@@ -912,6 +928,17 @@ fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> 
             continue;
         }
         if is_abandoned_generation_workdir(&name) {
+            // Only automatically remove workdirs created by lease-aware versions. An older
+            // Memex process can retain a live writable staging index after releasing its ingest
+            // lease, so an unleased workdir is not proof that the owner is dead. Explicit offline
+            // GC may remove those after the user confirms all readers and writers are stopped.
+            let lease_path = entry.path().join(GENERATION_LEASE_FILE);
+            if !lease_path.is_file() || name_text.starts_with(".gc-") {
+                continue;
+            }
+            let Some(_lease) = try_lock_generation_exclusive(&entry.path())? else {
+                continue;
+            };
             fs::remove_dir_all(entry.path()).with_context(|| {
                 format!(
                     "remove abandoned index generation work directory {}",
@@ -1499,6 +1526,7 @@ mod tests {
             .index
             .searchable_segment_ids()
             .expect("segment ids")[0];
+        drop(first);
 
         let stale_generation = tmp.path().join(GENERATIONS_DIR).join("stale-generation");
         clone_generation(&original, &stale_generation).expect("clone stale generation");
@@ -1574,6 +1602,8 @@ mod tests {
             .join(GENERATIONS_DIR)
             .join(".00000000000000000000000000000001-00000002.tmp");
         clone_generation(&current, &abandoned_staging).expect("clone abandoned staging generation");
+        create_generation_lease_file(&abandoned_staging)
+            .expect("create abandoned staging generation lease");
 
         for generation in 0..300 {
             let stale = tmp
@@ -1586,6 +1616,7 @@ mod tests {
                 fs::remove_file(lease).expect("remove generation lease");
             }
         }
+        drop(first);
 
         let refresh = SearchIndex::open_or_create_for_continuous_ingest(tmp.path())
             .expect("continuous indexing must not require manual GC");
@@ -1603,6 +1634,45 @@ mod tests {
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
             .count();
         assert_eq!(generations, 1);
+    }
+
+    #[test]
+    fn normal_indexing_preserves_staging_generation_with_live_owner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let live = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("live staging index");
+        let live_staging = live
+            .pending_generation
+            .as_ref()
+            .expect("pending generation")
+            .staging_dir
+            .clone();
+        let mut writer = live.writer().expect("live writer");
+        live.add_record(&mut writer, &test_record(1, "still searchable"))
+            .expect("add live record");
+        writer.commit().expect("commit live staging index");
+
+        let refresh =
+            SearchIndex::open_or_create_for_ingest(tmp.path()).expect("background refresh");
+        refresh
+            .publish_generation()
+            .expect("publish background refresh");
+
+        assert!(live_staging.exists(), "live staging generation was pruned");
+        assert_eq!(live.doc_count().expect("live staging document count"), 1);
+        assert_eq!(search_text_count(&live, "still searchable"), 1);
+
+        drop(refresh);
+        let error = SearchIndex::garbage_collect_generations_offline(tmp.path(), false)
+            .expect_err("offline GC must preserve a staging generation with a live owner");
+        assert!(error.to_string().contains("work directory"));
+        assert!(live_staging.exists(), "offline GC pruned live staging");
+
+        drop(writer);
+        drop(live);
+        assert!(
+            !live_staging.exists(),
+            "released staging generation was retained"
+        );
     }
 
     #[test]
@@ -1790,6 +1860,8 @@ mod tests {
         assert_eq!(old_reader.doc_count().expect("old reader count"), 1);
 
         drop(old_reader);
+        drop(first);
+        drop(second);
         let third = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("third generation");
         third.publish_generation().expect("publish third");
         assert!(
