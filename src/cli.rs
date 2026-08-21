@@ -34,6 +34,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
@@ -1139,16 +1140,29 @@ pub fn run() -> Result<()> {
 }
 
 fn run_index_loop(index: &IndexArgs, interval_secs: u64, web_listen: Option<String>) -> Result<()> {
-    run_index_args(index, false, true)?;
-    let _web_thread = web_listen
-        .as_deref()
-        .map(|listen| crate::web::spawn(index.root.clone(), listen))
-        .transpose()?;
+    let _web_thread = initialize_index_loop(
+        || run_index_args(index, false, true),
+        || {
+            web_listen
+                .as_deref()
+                .map(|listen| crate::web::spawn(index.root.clone(), listen))
+                .transpose()
+        },
+    )?;
     loop {
         std::thread::sleep(Duration::from_secs(interval_secs));
         run_index_args(index, false, true)?;
         std::io::stdout().flush().ok();
     }
+}
+
+fn initialize_index_loop<T>(
+    index_once: impl FnOnce() -> Result<()>,
+    start_web: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let web = start_web()?;
+    index_once()?;
+    Ok(web)
 }
 
 fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
@@ -3300,6 +3314,7 @@ fn run_index_service_enable(
     result?;
     disable_auto_index_on_search_by_default(&paths, &config)?;
     if web_ui {
+        wait_for_web_ui(&web_listen, Duration::from_secs(5))?;
         println!("web UI: http://{web_listen}");
     }
     Ok(())
@@ -3792,10 +3807,47 @@ fn print_service_web_ui_status(output: &str) {
     if service_output_has_arg(output, "--web-ui") || output.contains(" --web-ui") {
         let listen =
             service_output_arg_value(output, "--web-listen").unwrap_or(crate::web::DEFAULT_LISTEN);
-        println!("web UI: http://{listen}");
+        if web_ui_is_listening(listen) {
+            println!("web UI: http://{listen}");
+        } else {
+            println!("web UI: unavailable (configured at http://{listen})");
+        }
     } else {
         println!("web UI: disabled");
     }
+}
+
+fn web_ui_addresses(listen: &str) -> Result<Vec<std::net::SocketAddr>> {
+    let addresses = listen
+        .to_socket_addrs()
+        .with_context(|| format!("resolve Web UI listener {listen}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(anyhow!("Web UI listener {listen} resolved to no addresses"));
+    }
+    Ok(addresses)
+}
+
+fn web_ui_is_listening(listen: &str) -> bool {
+    web_ui_addresses(listen).is_ok_and(|addresses| {
+        addresses
+            .iter()
+            .any(|address| TcpStream::connect_timeout(address, Duration::from_millis(100)).is_ok())
+    })
+}
+
+fn wait_for_web_ui(listen: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !web_ui_is_listening(listen) {
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "Web UI did not start listening at http://{listen} within {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
 }
 
 fn run_index_service_disable_launchd(
@@ -4822,6 +4874,34 @@ mod tests {
         );
         assert!(args.contains(&"--web-ui".to_string()));
         assert!(args.contains(&"--watch".to_string()));
+    }
+
+    #[test]
+    fn index_loop_starts_web_before_initial_indexing() {
+        let events = std::cell::RefCell::new(Vec::new());
+
+        initialize_index_loop(
+            || {
+                events.borrow_mut().push("index");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("web");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*events.borrow(), ["web", "index"]);
+    }
+
+    #[test]
+    fn web_ui_readiness_detects_bound_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+
+        wait_for_web_ui(&listen, Duration::from_millis(100)).unwrap();
+        assert!(web_ui_is_listening(&listen));
     }
 
     #[test]
