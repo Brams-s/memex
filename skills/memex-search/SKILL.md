@@ -1,6 +1,6 @@
 ---
 name: memex-search
-description: Retrieve and reconstruct prior agent work from memex history. Use when the user refers to a previous session, decision, fix, investigation, file, command, error, or project; wants analogous prior work; asks what happened before; or needs evidence from Claude/Codex/Cursor/OpenCode/Pi/Oh My Pi/OpenClaw/Copilot history. Adapt retrieval effort to the question, use multiple query views for ambiguous requests, reformulate from retrieved evidence, and fetch only the context needed to answer.
+description: Search prior agent-session history with memex when a request depends on earlier work, decisions, investigations, fixes, commands, errors, or project context, including details lost or summarized across context-compaction boundaries. Invoke proactively to recover exact evidence, resume prior work, avoid repeating work, or find an analogous solution.
 allowed-tools: Bash(memex:*)
 ---
 
