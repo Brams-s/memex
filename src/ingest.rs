@@ -1240,7 +1240,7 @@ pub fn ingest_all(
 
     let recover_vectors = pending_recovery
         .as_ref()
-        .is_some_and(|pending| pending.vector_publication && pending.session_scopes.is_empty());
+        .is_some_and(|pending| pending.vector_publication);
     let pending_ready_scope_recovery = pending_recovery.as_ref().is_some_and(|pending| {
         pending.session_scopes.iter().any(|scope| {
             matches!(
@@ -2932,6 +2932,47 @@ mod tests {
     }
 
     #[test]
+    fn vector_recovery_runs_when_pending_session_scopes_are_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = save_search_records(
+            &paths,
+            &[record(1, "user", "first"), record(2, "assistant", "second")],
+        );
+        index
+            .publish_generation_if_uninitialized()
+            .expect("publish initial lexical generation");
+        let mut vectors = VectorIndex::open_or_create(&paths.vectors, 256, Some("potion"))
+            .expect("create interrupted vectors");
+        vectors.add(1, &vec![0.0; 256]).expect("add live vector");
+        vectors.add(99, &vec![0.0; 256]).expect("add stale vector");
+        vectors.save().expect("save interrupted vectors");
+        PendingIngest {
+            next_doc_id: 3,
+            source_paths: Vec::new(),
+            session_scopes: vec![SessionScope {
+                source_path: "/unavailable/opencode.db".to_string(),
+                session_id: "deferred-session".to_string(),
+            }],
+            vector_publication: true,
+        }
+        .save(&pending_ingest_path(&paths))
+        .expect("save pending vector publication with deferred scope");
+
+        let index =
+            SearchIndex::open_or_create_for_ingest(&paths.index).expect("recovery generation");
+        let lease = ingest_lease(&paths);
+        let options = ingest_options(false, ModelChoice::Potion);
+        ingest_all(&paths, &index, &options, &lease).expect("finish vector recovery");
+
+        let vectors = VectorIndex::inventory(&paths.vectors)
+            .expect("vector inventory")
+            .expect("vectors");
+        assert_eq!(vectors.doc_ids, HashSet::from([1, 2]));
+    }
+
+    #[test]
     fn parser_pool_leaves_global_rayon_available_under_backpressure() {
         let parser_pool = build_parser_thread_pool(2).expect("build parser pool");
         let (tx, rx) = bounded::<usize>(1);
@@ -3587,7 +3628,7 @@ mod tests {
 "#,
         )
         .expect("write unrelated source");
-        options.claude_source = unrelated_source;
+        options.claude_sources = vec![unrelated_source];
         PendingIngest {
             next_doc_id: 1,
             source_paths: Vec::new(),
